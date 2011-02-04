@@ -269,7 +269,7 @@ QStatus ProxyBusObject::AddChild(const ProxyBusObject& child)
                 ch.push_back(child);
                 return ER_OK;
             } else {
-                ProxyBusObject ro(*bus, serviceName.c_str(), item.c_str());
+                ProxyBusObject ro(*bus, serviceName.c_str(), item.c_str(), sessionId);
                 ch.push_back(ro);
                 cur = &ch.back();
             }
@@ -355,6 +355,7 @@ QStatus ProxyBusObject::MethodCallAsync(const InterfaceDescription::Member& meth
     }
     status = msg->CallMsg(method.signature,
                           serviceName,
+                          sessionId,
                           path,
                           method.iface->GetName(),
                           method.name,
@@ -448,6 +449,7 @@ QStatus ProxyBusObject::MethodCall(const InterfaceDescription::Member& method,
     }
     status = msg->CallMsg(method.signature,
                           serviceName,
+                          sessionId,
                           path,
                           method.iface->GetName(),
                           method.name,
@@ -662,11 +664,12 @@ ProxyBusObject::~ProxyBusObject()
     }
 }
 
-ProxyBusObject::ProxyBusObject(BusAttachment& bus, const char* service, const char* path) :
+ProxyBusObject::ProxyBusObject(BusAttachment& bus, const char* service, const char* path, SessionId sessionId) :
     bus(&bus),
     components(new Components),
     path(path),
-    serviceName(service)
+    serviceName(service),
+    sessionId(sessionId)
 {
     /* The Peer interface is implicitly defined for all objects */
     AddInterface(org::freedesktop::DBus::Peer::InterfaceName);
