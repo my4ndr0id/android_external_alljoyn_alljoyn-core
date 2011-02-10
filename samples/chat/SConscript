@@ -26,6 +26,8 @@ if env['OS'] == 'android':
     env.Install(clientDistDir, Dir('android/src').srcnode())
     env.Install(clientDistDir, Dir('android/res').srcnode())
 elif env['OS'] == 'linux':
+    env.Program('chat', ['linux/chat.cc'])
+    env.Install('$DISTDIR/bin', ['chat'])
     env.Install(clientDistDir, env.Glob('linux/*'))
 
 
