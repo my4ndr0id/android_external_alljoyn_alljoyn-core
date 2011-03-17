@@ -1036,7 +1036,7 @@ bool BusAttachment::Internal::CallAcceptListeners(const char* sessionName, Sessi
     list<BusListener*>::iterator it = listeners.begin();
     bool isAccepted = false;
     while (it != listeners.end()) {
-        bool answer = (*it)->AcceptSession(sessionName, id, joiner, qos);
+        bool answer = (*it)->AcceptSessionJoiner(sessionName, id, joiner, qos);
         if (answer) {
             isAccepted = true;
         }
@@ -1044,6 +1044,18 @@ bool BusAttachment::Internal::CallAcceptListeners(const char* sessionName, Sessi
     }
     listenersLock.Unlock();
     return isAccepted;
+}
+
+void BusAttachment::Internal::CallJoinedListeners(const char* sessionName, SessionId id, const char* joiner)
+{
+    /* Call all listeners. */
+    listenersLock.Lock();
+    list<BusListener*>::iterator it = listeners.begin();
+    while (it != listeners.end()) {
+        (*it)->SessionJoined(sessionName, id, joiner);
+        ++it;
+    }
+    listenersLock.Unlock();
 }
 
 }
