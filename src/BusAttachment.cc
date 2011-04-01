@@ -891,6 +891,12 @@ QStatus BusAttachment::GetSessionFd(SessionId sessionId, SocketFd& sockFd)
         status = reply->GetArgs("h", &sockFd);
         if (status == ER_OK) {
             status = qcc::SocketDup(sockFd, sockFd);
+            if (status == ER_OK) {
+                status = qcc::SetBlocking(sockFd, false);
+                if (status != ER_OK) {
+                    qcc::Close(sockFd);
+                }
+            }
         }
     } else {
         String errMsg;
