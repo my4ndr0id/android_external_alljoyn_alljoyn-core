@@ -742,6 +742,7 @@ ProxyBusObject::ProxyBusObject(const ProxyBusObject& other)
     serviceName = other.serviceName;
     sessionId = other.sessionId;
     hasProperties = other.hasProperties;
+    b2bEp = other.b2bEp;
     if (other.components) {
         *components = *other.components;
     }
@@ -755,6 +756,7 @@ ProxyBusObject& ProxyBusObject::operator=(const ProxyBusObject& other)
         path = other.path;
         serviceName = other.serviceName;
         sessionId = other.sessionId;
+        b2bEp = other.b2bEp;
         if (other.components) {
             *components = *other.components;
         }
