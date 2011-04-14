@@ -694,6 +694,9 @@ QStatus BusAttachment::FindAdvertisedName(const char* namePrefix)
             case ALLJOYN_FINDADVERTISEDNAME_REPLY_FAILED:
                 status = ER_ALLJOYN_FINDADVERTISEDNAME_REPLY_FAILED;
                 break;
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
+                break;
             }
         }
     } else {
@@ -730,6 +733,10 @@ QStatus BusAttachment::CancelFindAdvertisedName(const char* namePrefix)
                 break;
             case ALLJOYN_CANCELFINDADVERTISEDNAME_REPLY_FAILED:
                 status = ER_ALLJOYN_CANCELFINDADVERTISEDNAME_REPLY_FAILED;
+                break;
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
+                break;
             }
         }
     } else {
@@ -770,6 +777,9 @@ QStatus BusAttachment::AdvertiseName(const char* name, TransportMask transports)
             case ALLJOYN_ADVERTISENAME_REPLY_FAILED:
                 status = ER_ALLJOYN_ADVERTISENAME_REPLY_FAILED;
                 break;
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
+                break;
             }
         }
     } else {
@@ -809,6 +819,9 @@ QStatus BusAttachment::CancelAdvertiseName(const char* name, TransportMask trans
                 break;
             case ALLJOYN_ADVERTISENAME_REPLY_FAILED:
                 status = ER_ALLJOYN_ADVERTISENAME_REPLY_FAILED;
+                break;
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
                 break;
             }
         }
@@ -978,6 +991,9 @@ QStatus BusAttachment::JoinSession(const char* sessionHost, SessionPort sessionP
             case ALLJOYN_JOINSESSION_REPLY_FAILED:
                 status = ER_ALLJOYN_JOINSESSION_REPLY_FAILED;
                 break;
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
+                break;
             }
         }
     } else {
@@ -1014,6 +1030,9 @@ QStatus BusAttachment::LeaveSession(const SessionId& sessionId)
                 break;
             case ALLJOYN_LEAVESESSION_REPLY_FAILED:
                 status = ER_ALLJOYN_LEAVESESSION_REPLY_FAILED;
+                break;
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
                 break;
             }
         }
