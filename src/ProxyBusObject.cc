@@ -549,7 +549,7 @@ QStatus ProxyBusObject::MethodCall(const InterfaceDescription::Member& method,
                 status = ER_BUS_METHOD_CALL_ABORTED;
                 goto MethodCallExit;
             } else {
-                localEndpoint.UnRegisterReplyHandler(serial);
+                localEndpoint.UnregisterReplyHandler(serial);
             }
         }
     }
