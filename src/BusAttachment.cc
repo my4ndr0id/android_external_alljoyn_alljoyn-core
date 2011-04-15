@@ -800,7 +800,7 @@ QStatus BusAttachment::CancelAdvertiseName(const char* name, TransportMask trans
     }
 
     Message reply(*this);
-    MsgArg args[1];
+    MsgArg args[2];
     size_t numArgs = ArraySize(args);
 
     MsgArg::Set(args, numArgs, "sq", name, transports);
@@ -1049,6 +1049,7 @@ QStatus BusAttachment::LeaveSession(const SessionId& sessionId)
 
 QStatus BusAttachment::GetSessionFd(SessionId sessionId, SocketFd& sockFd)
 {
+    QCC_DbgTrace(("BusAttachment::GetSessionFd sessionId:%d", sessionId));
     if (!IsConnected()) {
         return ER_BUS_NOT_CONNECTED;
     }
