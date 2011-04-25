@@ -2018,7 +2018,6 @@ void AllJoynObj::ExchangeNamesSignalHandler(const InterfaceDescription::Member* 
      */
     if (madeChanges) {
         b2bEndpointsLock.Lock();
-        bool isRemarshaled = false;
         map<qcc::StringMapKey, RemoteEndpoint*>::const_iterator bit = b2bEndpoints.find(msg->GetRcvEndpointName());
         map<qcc::StringMapKey, RemoteEndpoint*>::iterator it = b2bEndpoints.begin();
         while (it != b2bEndpoints.end()) {
