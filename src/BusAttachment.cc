@@ -592,6 +592,10 @@ QStatus BusAttachment::RequestName(const char* requestedName, uint32_t flags)
             case DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER:
                 status = ER_DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER;
                 break;
+
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
+                break;
             }
         }
     } else {
@@ -633,6 +637,10 @@ QStatus BusAttachment::ReleaseName(const char* name)
 
             case DBUS_RELEASE_NAME_REPLY_NOT_OWNER:
                 status = ER_DBUS_RELEASE_NAME_REPLY_NOT_OWNER;
+                break;
+                                                
+            default:
+                status = ER_BUS_UNEXPECTED_DISPOSITION;
                 break;
             }
         }
@@ -950,6 +958,11 @@ QStatus BusAttachment::BindSessionPort(SessionPort& sessionPort, const SessionOp
                 status = ER_ALLJOYN_BINDSESSIONPORT_REPLY_ALREADY_EXISTS;
                 break;
 
+            case ALLJOYN_BINDSESSIONPORT_REPLY_INVALID_OPTS:
+                status = ER_ALLJOYN_BINDSESSIONPORT_REPLY_INVALID_OPTS;
+                break;
+
+            default:
             case ALLJOYN_BINDSESSIONPORT_REPLY_FAILED:
                 status = ER_ALLJOYN_BINDSESSIONPORT_REPLY_FAILED;
                 break;
