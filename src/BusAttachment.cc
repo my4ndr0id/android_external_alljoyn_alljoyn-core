@@ -638,7 +638,7 @@ QStatus BusAttachment::ReleaseName(const char* name)
             case DBUS_RELEASE_NAME_REPLY_NOT_OWNER:
                 status = ER_DBUS_RELEASE_NAME_REPLY_NOT_OWNER;
                 break;
-                                                
+
             default:
                 status = ER_BUS_UNEXPECTED_DISPOSITION;
                 break;
