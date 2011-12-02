@@ -81,6 +81,23 @@ qcc::String _Message::ToString() const
     return ToString(msgArgs, numMsgArgs);
 }
 
+HeaderFields::HeaderFields(const HeaderFields& other)
+{
+    for (size_t i = 0; i < ArraySize(field); ++i) {
+        field[i] = other.field[i];
+    }
+}
+
+HeaderFields& HeaderFields::operator=(const HeaderFields& other)
+{
+    if (this != &other) {
+        for (size_t i = 0; i < ArraySize(field); ++i) {
+            field[i] = other.field[i];
+        }
+    }
+    return *this;
+}
+
 const AllJoynTypeId HeaderFields::FieldType[] = {
     ALLJOYN_INVALID,     /* ALLJOYN_HDR_FIELD_INVALID - not allowed  */
     ALLJOYN_OBJECT_PATH, /* ALLJOYN_HDR_FIELD_PATH                   */
@@ -169,7 +186,7 @@ qcc::String _Message::Description() const
         break;
 
     case MESSAGE_SIGNAL:
-        outStr += " ";
+        outStr = outStr + "[" + U32ToString(msgHeader.serialNum) + "] ";
         if (hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].typeId == ALLJOYN_STRING) {
             outStr = outStr + hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.str + ".";
         }
@@ -260,17 +277,60 @@ QStatus _Message::GetArgs(const char* signature, ...)
     return status;
 }
 
-_Message::_Message(BusAttachment& bus) : bus(bus)
+_Message::_Message(BusAttachment& bus) :
+    bus(bus),
+    endianSwap(false),
+    msgBuf(NULL),
+    msgArgs(NULL),
+    numMsgArgs(0),
+    ttl(0),
+    handles(NULL),
+    numHandles(0),
+    encrypt(false)
 {
     msgHeader.msgType = MESSAGE_INVALID;
     msgHeader.endian = myEndian;
-    endianSwap = false;
-    msgBuf = NULL;
-    msgArgs = NULL;
-    numMsgArgs = 0;
-    ttl = 0;
-    handles = NULL;
-    numHandles = 0;
+}
+
+_Message::_Message(const _Message& other)
+    : bus(other.bus),
+    endianSwap(other.endianSwap),
+    msgHeader(other.msgHeader),
+    msgBuf(other.msgBuf ? new uint64_t[other.bufSize / 8] : NULL),
+    msgArgs((other.numMsgArgs && other.msgArgs) ? new MsgArg[other.numMsgArgs] : NULL),
+    numMsgArgs(other.numMsgArgs),
+    bufSize(other.bufSize),
+    bufEOD((other.msgBuf && other.bufEOD) ? ((uint8_t*)msgBuf) + (other.bufEOD - ((uint8_t*)other.msgBuf)) : NULL),
+    bufPos((other.msgBuf && other.bufPos) ? ((uint8_t*)msgBuf) + (other.bufPos - ((uint8_t*)other.msgBuf)) : NULL),
+    bodyPtr((other.msgBuf && other.bodyPtr) ? ((uint8_t*)msgBuf) + (other.bodyPtr - ((uint8_t*)other.msgBuf)) : NULL),
+    ttl(other.ttl),
+    timestamp(other.timestamp),
+    replySignature(other.replySignature),
+    authMechanism(other.authMechanism),
+    rcvEndpointName(other.rcvEndpointName),
+    handles(other.numHandles ? new qcc::SocketFd[other.numHandles] : NULL),
+    numHandles(other.numHandles),
+    encrypt(other.encrypt),
+    hdrFields(other.hdrFields)
+{
+    // Copy msgBuf
+    if (msgBuf) {
+        ::memcpy(msgBuf, other.msgBuf, bufSize);
+    }
+
+    // Copy msgArgs
+    if (msgArgs) {
+        for (size_t i = 0; i < numMsgArgs; ++i) {
+            msgArgs[i] = other.msgArgs[i];
+        }
+    }
+
+    // Copy handles
+    if (handles) {
+        for (size_t i = 0; i < numHandles; ++i) {
+            SocketDup(other.handles[i], handles[i]);
+        }
+    }
 }
 
 _Message::~_Message(void)
@@ -313,8 +373,8 @@ QStatus _Message::ReMarshal(const char* senderName, bool newSerial)
      * Padding the end of the buffer ensures we can unmarshal a few bytes beyond the end of the
      * message reducing the places where we need to check for bufEOD when unmarshaling the body.
      */
-    size_t allocSize = sizeof(msgHeader) + ((((msgHeader.headerLen + 7) & ~7) + msgHeader.bodyLen + 7) & ~7) + 8;
-    msgBuf = new uint64_t[allocSize / 8];
+    bufSize = sizeof(msgHeader) + ((((msgHeader.headerLen + 7) & ~7) + msgHeader.bodyLen + 7) & ~7) + 8;
+    msgBuf = new uint64_t[bufSize / 8];
     bufPos = (uint8_t*)msgBuf;
     memcpy(bufPos, &msgHeader, sizeof(msgHeader));
     bufPos += sizeof(msgHeader);
@@ -337,15 +397,15 @@ QStatus _Message::ReMarshal(const char* senderName, bool newSerial)
      */
     if (msgHeader.bodyLen != 0) {
         memcpy(bufPos, bodyPtr, msgHeader.bodyLen);
-        bodyPtr = bufPos;
     }
+    bodyPtr = bufPos;
     bufPos += msgHeader.bodyLen;
     bufEOD = bufPos;
     /*
      * Zero fill the pad at the end of the buffer
      */
-    assert((size_t)(bufEOD - (uint8_t*)msgBuf) < allocSize);
-    memset(bufEOD, 0, (uint8_t*)msgBuf + allocSize - bufEOD);
+    assert((size_t)(bufEOD - (uint8_t*)msgBuf) < bufSize);
+    memset(bufEOD, 0, (uint8_t*)msgBuf + bufSize - bufEOD);
     delete [] savBuf;
     return ER_OK;
 }
@@ -394,6 +454,8 @@ void _Message::ClearHeader()
         }
         delete [] handles;
         handles = NULL;
+        encrypt = false;
+        authMechanism.clear();
     }
 }
 

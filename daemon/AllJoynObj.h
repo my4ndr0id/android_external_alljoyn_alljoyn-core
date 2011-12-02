@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <qcc/String.h>
+#include <qcc/StringUtil.h>
 #include <qcc/StringMapKey.h>
 #include <qcc/Thread.h>
 #include <qcc/time.h>
@@ -40,8 +41,10 @@
 #include "Transport.h"
 #include "VirtualEndpoint.h"
 
-
 namespace ajn {
+
+/** Forward Declaration */
+class BusController;
 
 /**
  * BusObject responsible for implementing the standard AllJoyn methods at org.alljoyn.Bus
@@ -54,10 +57,11 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
     /**
      * Constructor
      *
-     * @param bus        Bus to associate with org.freedesktop.DBus message handler.
-     * @param router     The DaemonRouter associated with the bus.
+     * @param bus            Bus to associate with org.freedesktop.DBus message handler.
+     * @param router         The DaemonRouter associated with the bus.
+     * @param busController  Controller that created this object.
      */
-    AllJoynObj(Bus& bus);
+    AllJoynObj(Bus& bus, BusController* busController);
 
     /**
      * Destructor
@@ -210,6 +214,36 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
     void GetSessionFd(const InterfaceDescription::Member* member, Message& msg);
 
     /**
+     * Respond to a bus request to set the link timeout for a given session.
+     *
+     * The input Message (METHOD_CALL) is expected to contain the following parameters:
+     *   sessionId      uint32    A session id that identifies an existing streaming session.
+     *   reqLinkTimeout uint32    Requested max number of seconds that an unresponsive comm link
+     *                            will be monitored before delcaring the link dead via SessionLost.
+     *
+     * The output Message (METHOD_REPLY) contains the following parameters:
+     *   resultCode     uint32    ALLJOYN_SETLINKTIMEOUT_REPLY_* value.
+     *   actLinkTimeout uint32    Actual link timeout value.
+     *
+     * @param member  Member.
+     * @param msg     The incoming message.
+     */
+    void SetLinkTimeout(const InterfaceDescription::Member* member, Message& msg);
+
+    /**
+     * Add an alias to a Unix User ID
+     * The input Message (METHOD_CALL) is expected to contain the following parameter
+     *   aliasUID      uint32    The alias ID
+     *
+     * The output Message (METHOD_REPLY) contains the following parameters:
+     *   resultCode    uint32    ALLJOYN_ALIASUNIXUSER_REPLY_* value.
+     *
+     * @param member  Member.
+     * @param msg     The incoming message.
+     */
+    void AliasUnixUser(const InterfaceDescription::Member* member, Message& msg);
+
+    /**
      * Add a new Bus-to-bus endpoint.
      *
      * @param endpoint  Bus-to-bus endpoint to add.
@@ -318,6 +352,18 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
      */
     void BusConnectionLost(const qcc::String& busAddr);
 
+    /**
+     * Get reference to the daemon router object
+     */
+    DaemonRouter& GetDaemonRouter() { return router; }
+
+    /**
+     * Called to check whether have enough permissions to use designated transports.
+     * @param   sender        The sender's well-known name string
+     * @param   transports    The transport mask
+     * @param   callerName    The caller that invokes this check
+     */
+    QStatus CheckTransportsPermission(qcc::String& sender, TransportMask& transports, const char*);
   private:
     Bus& bus;                             /**< The bus */
     DaemonRouter& router;                 /**< The router */
@@ -328,6 +374,7 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
     const InterfaceDescription::Member* foundNameSignal;   /**< org.alljoyn.Bus.FoundName signal */
     const InterfaceDescription::Member* lostAdvNameSignal; /**< org.alljoyn.Bus.LostAdvertisdName signal */
     const InterfaceDescription::Member* sessionLostSignal; /**< org.alljoyn.Bus.SessionLost signal */
+    const InterfaceDescription::Member* mpSessionChangedSignal;  /**< org.alljoyn.Bus.MPSessionChanged signal */
 
     /** Map of open connectSpecs to local endpoint name(s) that require the connection. */
     std::multimap<qcc::String, qcc::String> connectMap;
@@ -337,6 +384,9 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
 
     /** Map of active discovery names to requesting local endpoint name(s) */
     std::multimap<qcc::String, qcc::String> discoverMap;
+
+    /** Map of discovery names to forbidden transports (due to lack of permissions) of local endpoint */
+    std::multimap<qcc::String, std::pair<TransportMask, qcc::String> > transForbidMap;
 
     /** Map of discovered bus names (protected by discoverMapLock) */
     struct NameMapEntry {
@@ -365,16 +415,18 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
         qcc::SocketFd fd;
         RemoteEndpoint* streamingEp;
         std::vector<qcc::String> memberNames;
+        bool isInitializing;
         SessionMapEntry() :
             id(0),
             sessionPort(0),
             opts(),
             fd(-1),
-            streamingEp(NULL) { }
+            streamingEp(NULL),
+            isInitializing(false) { }
     };
     std::multimap<std::pair<qcc::String, SessionId>, SessionMapEntry> sessionMap;  /**< Map (endpointName,sessionId) to session info */
 
-    const qcc::GUID& guid;                               /**< Global GUID of this daemon */
+    const qcc::GUID128& guid;                               /**< Global GUID of this daemon */
 
     const InterfaceDescription::Member* exchangeNamesSignal;   /**< org.alljoyn.Daemon.ExchangeNames signal member */
     const InterfaceDescription::Member* detachSessionSignal;   /**< org.alljoyn.Daemon.DetachSession signal member */
@@ -399,7 +451,11 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
     /** JoinSessionThread handles a JoinSession request from a local client on a separate thread */
     class JoinSessionThread : public qcc::Thread, public qcc::ThreadListener {
       public:
-        JoinSessionThread(AllJoynObj& ajObj, const Message& msg) : Thread("JoinSessionThread"), ajObj(ajObj), msg(msg) { }
+        JoinSessionThread(AllJoynObj& ajObj, const Message& msg, bool isJoin) :
+            qcc::Thread(qcc::String("JoinS-") + qcc::U32ToString(IncrementAndFetch(&jstCount))),
+            ajObj(ajObj),
+            msg(msg),
+            isJoin(isJoin) { }
 
         void ThreadExit(Thread* thread);
 
@@ -407,13 +463,19 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
         qcc::ThreadReturn STDCALL Run(void* arg);
 
       private:
+        static int jstCount;
+        qcc::ThreadReturn STDCALL RunJoin();
+        qcc::ThreadReturn STDCALL RunAttach();
+
         AllJoynObj& ajObj;
         Message msg;
+        bool isJoin;
     };
 
     std::vector<JoinSessionThread*> joinSessionThreads;  /**< List of outstanding join session requests */
     qcc::Mutex joinSessionThreadsLock;                   /**< Lock that protects joinSessionThreads */
     bool isStopping;                                     /**< True while waiting for threads to exit */
+    BusController* busController;                        /**< BusController that created this BusObject */
 
     /**
      * Acquire AllJoynObj locks.
@@ -503,6 +565,16 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
      * @param       entry    SessionMapEntry that was lost.
      */
     void SendSessionLost(const SessionMapEntry& entry);
+
+    /**
+     * Utility method used to send MPSessionChanged signal to locally attached endpoint.
+     *
+     * @param   sessionId   The sessionId.
+     * @param   name        Unique name of session member that changed.
+     * @param   isAdd       true iff member added.
+     * @param   dest        Local destination for MPSessionChanged.
+     */
+    void SendMPSessionChanged(SessionId sessionId, const char* name, bool isAdd, const char* dest);
 
     /**
      * Utility method used to invoke GetSessionInfo remote method.
@@ -622,6 +694,20 @@ class AllJoynObj : public BusObject, public NameListener, public TransportListen
      * @param id        Session id.
      */
     void RemoveSessionRefs(BusEndpoint& endpoint, SessionId id);
+
+    /**
+     * Utility function used to clean up the session map when a virtual endpoint with a
+     * given b2b endpoint leaves a session.
+     *
+     * This utility is used when the given B2B ep has closed for some reason and we
+     * need to clean any virtual endpoints that might have been using that b2b ep
+     * from the sessionMap
+     *
+     * @param vep       Virtual that should be cleaned from sessionMap if it routes
+     *                  through b2bEp for a given session.
+     * @param b2bEp     B2B endpoint that vep must route through in order to be cleaned.
+     */
+    void RemoveSessionRefs(const VirtualEndpoint& vep, const RemoteEndpoint& b2bEp);
 };
 
 }

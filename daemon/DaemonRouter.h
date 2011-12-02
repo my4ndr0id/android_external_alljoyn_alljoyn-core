@@ -34,6 +34,7 @@
 #include "Router.h"
 #include "NameTable.h"
 #include "RuleTable.h"
+#include "PermissionDB.h"
 
 namespace ajn {
 
@@ -63,7 +64,7 @@ class DaemonRouter : public Router {
      *
      * @param busController   The bus controller.
      */
-    void SetBusController(BusController& busController) { this->busController = &busController; }
+    void SetBusController(BusController* busController) { this->busController = busController; }
 
     /**
      * Add a bus name listener.
@@ -84,7 +85,7 @@ class DaemonRouter : public Router {
      *
      * @param guid   GUID of bus associated with this router.
      */
-    void SetGlobalGUID(const qcc::GUID& guid) { nameTable.SetGUID(guid); }
+    void SetGlobalGUID(const qcc::GUID128& guid) { nameTable.SetGUID(guid); }
 
     /**
      * Generate a unique endpoint name.
@@ -235,6 +236,16 @@ class DaemonRouter : public Router {
     }
 
     /**
+     * Get all the unique names that are in queue for the same alias (well-known) name
+     *
+     * @param[in] busName (well-known) name
+     * @param[out] names vecter of uniqueNames in queue for the
+     */
+    void GetQueuedNames(const qcc::String& busName, std::vector<qcc::String>& names)
+    {
+        nameTable.GetQueuedNames(busName, names);
+    }
+    /**
      * Set (or clear) a virtual alias.
      * A virtual alias is a well-known bus name for a virtual endpoint.
      * Virtual aliases differ from regular aliases in that the local bus controller
@@ -264,24 +275,26 @@ class DaemonRouter : public Router {
     /**
      * Add a session route.
      *
-     * @param  src       Unique name of route source.
-     * @param  id        Session Id.
-     * @param  destEp    BusEndpoint of route destination.
-     * @param  b2bEp     [IN/OUT] If passed in as NULL, attemp to use qosHint to choose b2bEp and return selected b2bEp.
-     * @param  optsHint  Optional session options constraint for selection of b2bEp if not explicitly specified.
+     * @param  id          Session Id.
+     * @param  srcEp       Route source endpoint.
+     * @param  srcB2bEp    Source B2B endpoint. (NULL if srcEp is not virtual).
+     * @param  destEp      BusEndpoint of route destination.
+     * @param  destB2bEp   [IN/OUT] If passed in as NULL, attempt to use qosHint to choose destB2bEp and return selected ep.
+     * @param  optsHint    Optional session options constraint for selection of destB2bEp if not explicitly specified.
      * @return  ER_OK if successful.
      */
-    QStatus AddSessionRoute(const char* src, SessionId id, BusEndpoint& destEp, RemoteEndpoint*& b2bEp, SessionOpts* optsHint = NULL);
+    QStatus AddSessionRoute(SessionId id, BusEndpoint& srcEp, RemoteEndpoint* srcB2bEp, BusEndpoint& destEp,
+                            RemoteEndpoint*& destB2bEp, SessionOpts* optsHint = NULL);
 
     /**
      * Remove a (single) session route.
      *
-     * @param  src     Unique name of route source.
      * @param  id      Session Id.
+     * @param  srcEp   BusEndpoint of route source.
      * @param  destEp  BusEndpoint of route destination.
      * @return  ER_OK if successful.
      */
-    QStatus RemoveSessionRoute(const char* src, SessionId id, BusEndpoint& destEp);
+    QStatus RemoveSessionRoute(SessionId id, BusEndpoint& srcEp, BusEndpoint& destEp);
 
     /**
      * Remove existing session routes.
@@ -293,13 +306,15 @@ class DaemonRouter : public Router {
      */
     void RemoveSessionRoutes(const char* uniqueName, SessionId id);
 
+    PermissionDB& GetPermissionDB() { return permDb; }
   private:
     LocalEndpoint* localEndpoint;   /**< The local endpoint */
     RuleTable ruleTable;            /**< Routing rule table */
     NameTable nameTable;            /**< BusName to transport lookupl table */
     BusController* busController;   /**< The bus controller used with this router */
+    PermissionDB permDb;            /**< Permission security information cache */
 
-    std::vector<RemoteEndpoint*> m_b2bEndpoints;  /**< Collection of Bus-to-bus endpoints */
+    std::set<RemoteEndpoint*> m_b2bEndpoints;  /**< Collection of Bus-to-bus endpoints */
     qcc::Mutex m_b2bEndpointsLock;       /**< Lock that protects m_b2bEndpoints */
 
     /** Session multicast destination map */

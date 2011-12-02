@@ -23,15 +23,19 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#undef org_alljoyn_bus_samples_simpleclient_Client_DIALOG_CONNECT
-#define org_alljoyn_bus_samples_simpleclient_Client_DIALOG_CONNECT 1L
+#undef org_alljoyn_bus_samples_simpleclient_Client_BUSNAMEITEM_ADD
+#define org_alljoyn_bus_samples_simpleclient_Client_BUSNAMEITEM_ADD 1L
+#undef org_alljoyn_bus_samples_simpleclient_Client_BUSNAMEITEM_REMOVE
+#define org_alljoyn_bus_samples_simpleclient_Client_BUSNAMEITEM_REMOVE 2L
+#undef org_alljoyn_bus_samples_simpleclient_Client_BUSNAMEITEM_DISCONNECT
+#define org_alljoyn_bus_samples_simpleclient_Client_BUSNAMEITEM_DISCONNECT 3L
 /*
  * Class:     org_alljoyn_bus_samples_simpleclient_Client
  * Method:    simpleOnCreate
- * Signature: ()I
+ * Signature: (Ljava/lang/String;)I
  */
 JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_simpleOnCreate
-    (JNIEnv *, jobject);
+    (JNIEnv *, jobject, jstring);
 
 /*
  * Class:     org_alljoyn_bus_samples_simpleclient_Client
@@ -44,26 +48,26 @@ JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_simpleOn
 /*
  * Class:     org_alljoyn_bus_samples_simpleclient_Client
  * Method:    simplePing
- * Signature: (Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+ * Signature: (ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;
  */
 JNIEXPORT jstring JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_simplePing
-    (JNIEnv *, jobject, jstring, jstring);
+    (JNIEnv *, jobject, jint, jstring, jstring);
 
 /*
  * Class:     org_alljoyn_bus_samples_simpleclient_Client
- * Method:    connect
- * Signature: (Ljava/lang/String;)Z
+ * Method:    joinSession
+ * Signature: (Ljava/lang/String;)I
  */
-JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_connect
+JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_joinSession
     (JNIEnv *, jobject, jstring);
 
 /*
  * Class:     org_alljoyn_bus_samples_simpleclient_Client
- * Method:    disconnect
- * Signature: (Ljava/lang/String;)Z
+ * Method:    leaveSession
+ * Signature: (I)Z
  */
-JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_disconnect
-    (JNIEnv *, jobject, jstring);
+JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleclient_Client_leaveSession
+    (JNIEnv *, jobject, jint);
 
 #ifdef __cplusplus
 }

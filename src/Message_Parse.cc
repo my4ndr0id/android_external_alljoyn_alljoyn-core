@@ -281,7 +281,6 @@ QStatus _Message::ParseStruct(MsgArg* arg, const char*& sigPtr)
     arg->typeId = ALLJOYN_STRUCT;
     QStatus status = SignatureUtils::ParseContainerSignature(*arg, sigPtr);
     if (status != ER_OK) {
-        arg->typeId = ALLJOYN_INVALID;
         QCC_LogError(status, ("ParseStruct error in signature\n"));
         return status;
     }
@@ -294,7 +293,6 @@ QStatus _Message::ParseStruct(MsgArg* arg, const char*& sigPtr)
 
     arg->v_struct.members = new MsgArg[arg->v_struct.numMembers];
     arg->flags |= MsgArg::OwnsArgs;
-    arg->typeId = ALLJOYN_STRUCT;
     for (uint32_t i = 0; i < arg->v_struct.numMembers; ++i) {
         status = ParseValue(&arg->v_struct.members[i], memberSig);
         if (status != ER_OK) {
@@ -328,7 +326,6 @@ QStatus _Message::ParseDictEntry(MsgArg* arg,
 
         QCC_DbgPrintf(("ParseDictEntry at pos:%d", bufPos - bodyPtr));
 
-        arg->typeId = ALLJOYN_DICT_ENTRY;
         arg->v_dictEntry.key = new MsgArg();
         arg->v_dictEntry.val = new MsgArg();
         arg->flags |= MsgArg::OwnsArgs;
@@ -346,12 +343,16 @@ QStatus _Message::ParseVariant(MsgArg* arg)
     QStatus status;
 
     arg->typeId = ALLJOYN_VARIANT;
+    arg->v_variant.val = NULL;
+
     size_t len = (size_t)(*((uint8_t*)bufPos));
     const char* sigPtr = (char*)(++bufPos);
 
     bufPos += len;
 
-    if (*bufPos++ != 0) {
+    if (bufPos >= bufEOD) {
+        status = ER_BUS_BAD_LENGTH;
+    } else if (*bufPos++ != 0) {
         status = ER_BUS_BAD_SIGNATURE;
     } else {
         arg->v_variant.val = new MsgArg();
@@ -375,7 +376,9 @@ QStatus _Message::ParseSignature(MsgArg* arg)
     arg->v_signature.len = (size_t)(*((uint8_t*)bufPos));
     arg->v_signature.sig = (char*)(++bufPos);
     bufPos += arg->v_signature.len;
-    if (*bufPos++ != 0) {
+    if (bufPos >= bufEOD) {
+        status = ER_BUS_BAD_LENGTH;
+    } else if (*bufPos++ != 0) {
         status = ER_BUS_NOT_NUL_TERMINATED;
     } else {
         arg->typeId = ALLJOYN_SIGNATURE;
@@ -388,6 +391,7 @@ QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
 {
     QStatus status = ER_OK;
 
+    arg->Clear();
     switch (AllJoynTypeId typeId = (AllJoynTypeId)(*sigPtr++)) {
     case ALLJOYN_BYTE:
         arg->v_byte = *bufPos++;
@@ -544,7 +548,7 @@ QStatus _Message::UnmarshalArgs(const qcc::String& expectedSignature, const char
         return status;
     }
     if (msgHeader.bodyLen == 0) {
-        if (!expectedSignature.empty() && expectedSignature != WildCardSignature) {
+        if (*sig || (!expectedSignature.empty() && expectedSignature != WildCardSignature)) {
             status = ER_BUS_BAD_BODY_LEN;
             QCC_LogError(status, ("Expected a message body with signature %s", sig));
             return status;
@@ -555,8 +559,7 @@ QStatus _Message::UnmarshalArgs(const qcc::String& expectedSignature, const char
         size_t hdrLen = bodyPtr - (uint8_t*)msgBuf;
         PeerState peerState = bus.GetInternal().GetPeerStateTable()->GetPeerState(GetSender());
         KeyBlob key;
-        KeyBlob nonce;
-        status = peerState->GetKeyAndNonce(key, nonce, broadcast ? PEER_GROUP_KEY : PEER_SESSION_KEY);
+        status = peerState->GetKey(key, broadcast ? PEER_GROUP_KEY : PEER_SESSION_KEY);
         if (status != ER_OK) {
             QCC_LogError(status, ("Unable to decrypt message"));
             /*
@@ -567,25 +570,11 @@ QStatus _Message::UnmarshalArgs(const qcc::String& expectedSignature, const char
         }
         QCC_DbgHLPrintf(("Decrypting messge from %s", GetSender()));
         /*
-         * Make the nonce unique for this message.
-         */
-        nonce.Xor((uint8_t*)(&msgHeader.serialNum), sizeof(msgHeader.serialNum));
-        /*
-         * If the message header is compressed a hash of the compressed header fields is xor'd with
-         * the nonce. This is to prevent a security attack where an attacker provides a bogus
-         * expansion rule.
-         */
-        if (msgHeader.flags & ALLJOYN_FLAG_COMPRESSED) {
-            KeyBlob hdrHash;
-            ajn::Crypto::HashHeaderFields(hdrFields, hdrHash);
-            nonce ^= hdrHash;
-        }
-        /*
          * Decryption will typically make the body length slightly smaller because the encryption
          * algorithm adds appends a MAC block to the end of the encrypted data.
          */
         size_t bodyLen = msgHeader.bodyLen;
-        status = ajn::Crypto::Decrypt(key, (uint8_t*)msgBuf, hdrLen, bodyLen, nonce);
+        status = ajn::Crypto::Decrypt(*this, key, (uint8_t*)msgBuf, hdrLen, bodyLen);
         if (status != ER_OK) {
             goto ExitUnmarshalArgs;
         }
@@ -841,7 +830,6 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
 {
     QStatus status;
     size_t pktSize;
-    size_t allocSize;
     uint8_t* endOfHdr;
     qcc::SocketFd fdList[qcc::SOCKET_MAX_FILE_DESCRIPTORS];
     size_t maxFds = endpoint.GetFeatures().handlePassing ? ArraySize(fdList) : 0;
@@ -928,8 +916,8 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
      * Padding the end of the buffer ensures we can unmarshal a few bytes beyond the end of the
      * message reducing the places where we need to check for bufEOD when unmarshaling the body.
      */
-    allocSize = sizeof(msgHeader) + ((pktSize + 7) & ~7) + 8;
-    msgBuf = new uint64_t[allocSize / 8];
+    bufSize = sizeof(msgHeader) + ((pktSize + 7) & ~7) + sizeof(uint64_t);
+    msgBuf = new uint64_t[bufSize / 8];
     /*
      * Copy header into the buffer
      */
@@ -940,7 +928,7 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
     /*
      * Zero fill the pad at the end of the buffer
      */
-    memset(bufEOD, 0, (uint8_t*)msgBuf + allocSize - bufEOD);
+    memset(bufEOD, 0, (uint8_t*)msgBuf + bufSize - bufEOD);
 
     QCC_DbgPrintf(("Msg type:%d headerLen: %d Attempting to read %d bytes", msgHeader.msgType, msgHeader.headerLen, pktSize));
 
@@ -954,7 +942,9 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
     while (bufPos < endOfHdr) {
         bufPos = AlignPtr(bufPos, 8);
         AllJoynFieldType fieldId = (*bufPos >= ArraySize(FieldTypeMapping)) ? ALLJOYN_HDR_FIELD_UNKNOWN : FieldTypeMapping[*bufPos];
-        const char* sigPtr = (char*)(++bufPos);
+        if (++bufPos > endOfHdr) {
+            break;
+        }
         /*
          * An invalid field type is an error
          */
@@ -962,15 +952,14 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
             status = ER_BUS_BAD_HEADER_FIELD;
             goto ExitUnmarshal;
         }
+        size_t sigLen = (size_t)(*bufPos++);
+        const char* sigPtr = (char*)(bufPos);
         /*
          * Skip over the signature
          */
-        size_t sigLen = *sigPtr++;
-        bufPos += 2 + sigLen;
+        bufPos += 1 + sigLen;
         if (bufPos > endOfHdr) {
-            status = ER_BUS_BAD_HEADER_LEN;
-            QCC_LogError(status, ("Unmarshal bad header length %d != %d\n", bufPos - (uint8_t*)msgBuf, msgHeader.headerLen));
-            goto ExitUnmarshal;
+            break;
         }
         if (fieldId == ALLJOYN_HDR_FIELD_UNKNOWN) {
             MsgArg unknownHdr;
@@ -1160,7 +1149,9 @@ ExitUnmarshal:
         delete [] msgBuf;
         msgBuf = NULL;
         ClearHeader();
-        QCC_LogError(status, ("Failed to unmarshal message"));
+        if (status != ER_SOCK_OTHER_END_CLOSED) {
+            QCC_LogError(status, ("Failed to unmarshal message received on %s", endpoint.GetUniqueName().c_str()));
+        }
     }
     return status;
 }
@@ -1204,8 +1195,8 @@ QStatus _Message::AddExpansionRule(uint32_t token, const MsgArg* expansionArg)
         switch (fieldId) {
         case ALLJOYN_HDR_FIELD_PATH:
             expFields.field[fieldId].typeId = ALLJOYN_OBJECT_PATH;
-            expFields.field[fieldId].v_string.str = variant->v_variant.val->v_string.str;
-            expFields.field[fieldId].v_string.len = variant->v_variant.val->v_string.len;
+            expFields.field[fieldId].v_objPath.str = variant->v_variant.val->v_string.str;
+            expFields.field[fieldId].v_objPath.len = variant->v_variant.val->v_string.len;
             break;
 
         case ALLJOYN_HDR_FIELD_INTERFACE:

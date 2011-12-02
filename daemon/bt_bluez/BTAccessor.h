@@ -30,6 +30,7 @@
 #include <qcc/XmlElement.h>
 
 #include <alljoyn/BusAttachment.h>
+#include <alljoyn/BusListener.h>
 #include <alljoyn/MessageReceiver.h>
 #include <alljoyn/ProxyBusObject.h>
 
@@ -37,6 +38,7 @@
 #include "BlueZUtils.h"
 #include "BTController.h"
 #include "BTNodeDB.h"
+#include "BTNodeInfo.h"
 #include "BTTransport.h"
 #include "RemoteEndpoint.h"
 
@@ -45,7 +47,7 @@
 
 namespace ajn {
 
-class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListener {
+class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListener, public BusListener {
   public:
     /**
      * Constructor
@@ -141,23 +143,11 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
      * that information.
      *
      * @param alljoyn   BusAttachment that will be connected to the resulting endpoint
-     * @param connAddr  Bluetooth device address where the real connection will go
-     * @param devAddr   Bluetooth device address of the device desired to be reached
      *
      * @return  A newly instatiated remote endpoint for the Bluetooth connection (NULL indicates a failure)
      */
     RemoteEndpoint* Connect(BusAttachment& alljoyn,
-                            const BTBusAddress& connAddr,
-                            const BTBusAddress& devAddr);
-
-    /**
-     * Disconnect from the specified remote Bluetooth device.
-     *
-     * @param bdAddr    Bluetooth device address to disconnect from
-     *
-     * @return  ER_OK if successful
-     */
-    QStatus Disconnect(const BTBusAddress& addr);
+                            const BTNodeInfo& node);
 
     /**
      * Perform an SDP queary on the specified device to get the bus information.
@@ -179,12 +169,40 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
      */
     qcc::Event* GetL2CAPConnectEvent() { return l2capEvent; }
 
+    /**
+     * This looks up the low level Bluetooth connection information for the
+     * connection with the specified device and indicates if our role for that
+     * connection is master or slave.
+     *
+     * @param addr          Bluetooth device address for the connection of interest.
+     * @param master[out]   - 'true' if we are master of the connection with addr
+     *                      - 'false' if we are slave of the connection with addr
+     *
+     * @return  ER_OK if successful; an error will be returned if there is no
+     *          connection with the specified device
+     */
+    QStatus IsMaster(const BDAddress& addr, bool& master) const;
+
+    /**
+     * This function forces a role switch in the HCI device so that we become
+     * master of the connection with the specified device.
+     *
+     * @param addr  Bluetooth device address for the connection of interest
+     * @param role  Requested Bluetooth connection role
+     */
+    void RequestBTRole(const BDAddress& addr, bt::BluetoothRole role);
+
+    bool IsEIRCapable() const { return true; }
+
+
   private:
 
     struct DispatchInfo;
 
     void ConnectBlueZ();
     void DisconnectBlueZ();
+
+    void NameOwnerChanged(const char* busName, const char* previousOwner, const char* newOwner);
 
     /* Adapter management functions */
     QStatus EnumerateAdapters();
@@ -211,6 +229,15 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
     void DeviceFoundSignalHandler(const InterfaceDescription::Member* member,
                                   const char* sourcePath,
                                   Message& msg);
+    void DeviceCreatedSignalHandler(const InterfaceDescription::Member* member,
+                                    const char* sourcePath,
+                                    Message& msg);
+    void DeviceRemovedSignalHandler(const InterfaceDescription::Member* member,
+                                    const char* sourcePath,
+                                    Message& msg);
+    void DevicePropertyChangedSignalHandler(const InterfaceDescription::Member* member,
+                                            const char* sourcePath,
+                                            Message& msg);
 
     /* support */
     QStatus FillAdapterAddress(bluez::AdapterObject& adapter);
@@ -221,6 +248,7 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
     static bool FindAllJoynUUID(const MsgArg* uuids,
                                 size_t listSize,
                                 uint32_t& uuidRev);
+    void ExpireFoundDevices(bool all);
     static QStatus ProcessSDPXML(qcc::XmlParseContext& xmlctx,
                                  uint32_t* uuidRev,
                                  BDAddress* connAddr,
@@ -231,42 +259,51 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
                                                 uint32_t remoteVersion);
     QStatus GetDeviceObjPath(const BDAddress& bdAddr,
                              qcc::String& devObjPath);
-    QStatus DiscoveryControl(const InterfaceDescription::Member& method);
+    QStatus DiscoveryControl(bool start);
+    QStatus DiscoveryControl(const InterfaceDescription::Member* method);
     QStatus SetDiscoverabilityProperty();
 
     bluez::AdapterObject GetAdapterObject(const qcc::String& adapterObjPath) const
     {
         bluez::AdapterObject adapter;
         assert(!adapter->IsValid());
-        adapterLock.Lock();
+        adapterLock.Lock(MUTEX_CONTEXT);
         AdapterMap::const_iterator it(adapterMap.find(adapterObjPath));
         if (it != adapterMap.end()) {
             adapter = it->second;
         }
-        adapterLock.Unlock();
+        adapterLock.Unlock(MUTEX_CONTEXT);
         return adapter;
     }
 
     bluez::AdapterObject GetDefaultAdapterObject() const
     {
-        adapterLock.Lock();
+        adapterLock.Lock(MUTEX_CONTEXT);
         bluez::AdapterObject adapter(defaultAdapterObj);
-        adapterLock.Unlock();
+        adapterLock.Unlock(MUTEX_CONTEXT);
         return adapter;
     }
 
     bluez::AdapterObject GetAnyAdapterObject() const
     {
-        adapterLock.Lock();
+        adapterLock.Lock(MUTEX_CONTEXT);
         bluez::AdapterObject adapter(anyAdapterObj);
-        adapterLock.Unlock();
+        adapterLock.Unlock(MUTEX_CONTEXT);
         return adapter;
     }
 
     qcc::Alarm DispatchOperation(DispatchInfo* op, uint32_t delay = 0)
     {
         qcc::Alarm alarm(delay, this, 0, (void*)op);
-        bzBus.GetInternal().GetDispatcher().AddAlarm(alarm);
+        timer.AddAlarm(alarm);
+        return alarm;
+    }
+
+    qcc::Alarm DispatchOperation(DispatchInfo* op, uint64_t triggerTime)
+    {
+        qcc::Timespec ts(triggerTime);
+        qcc::Alarm alarm(ts, this, 0, (void*)op);
+        timer.AddAlarm(alarm);
         return alarm;
     }
 
@@ -281,14 +318,13 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
       public:
         FoundInfo() :
             uuidRev(bt::INVALID_UUIDREV),
-            timestamp(0)
+            timeout(0)
         { }
         uint32_t uuidRev;
-        uint32_t timestamp;
-        qcc::Alarm alarm;
+        uint64_t timeout;
     };
     typedef std::map<BDAddress, FoundInfo> FoundInfoMap;
-
+    typedef std::multimap<uint64_t, BDAddress> FoundInfoExpireMap;
 
     struct DispatchInfo {
         typedef enum {
@@ -297,7 +333,9 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
             ADAPTER_ADDED,
             ADAPTER_REMOVED,
             DEFAULT_ADAPTER_CHANGED,
-            DEVICE_FOUND
+            DEVICE_FOUND,
+            EXPIRE_DEVICE_FOUND,
+            FLUSH_FOUND_EXPIRATIONS
         } DispatchTypes;
         DispatchTypes operation;
 
@@ -315,9 +353,10 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
     struct DeviceDispatchInfo : public DispatchInfo {
         BDAddress addr;
         uint32_t uuidRev;
+        bool eirCapable;
 
-        DeviceDispatchInfo(DispatchTypes operation, const BDAddress& addr, uint32_t uuidRev) :
-            DispatchInfo(operation), addr(addr), uuidRev(uuidRev) { }
+        DeviceDispatchInfo(DispatchTypes operation, const BDAddress& addr, uint32_t uuidRev, bool eirCapable) :
+            DispatchInfo(operation), addr(addr), uuidRev(uuidRev), eirCapable(eirCapable) { }
     };
 
     struct MsgDispatchInfo : public DispatchInfo {
@@ -331,6 +370,7 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
 
     BusAttachment bzBus;
     const qcc::String busGuid;
+    qcc::String connectArgs;
 
     ProxyBusObject bzManagerObj;
     bluez::AdapterObject defaultAdapterObj;
@@ -344,14 +384,22 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
 
     mutable qcc::Mutex deviceLock; // Generic lock for device related objects, maps, etc.
     FoundInfoMap foundDevices;  // Map of found AllJoyn devices w/ UUID-Rev and expire time.
+    FoundInfoExpireMap foundExpirations;
+    qcc::Timer timer;
+    qcc::Alarm expireAlarm;
+    qcc::Alarm stopAdAlarm;
     BDAddressSet ignoreAddrs;
+
+    std::set<qcc::StringMapKey> createdDevices;  // Set of devices we created
 
     bool bluetoothAvailable;
     bool discoverable;
-    bool discoveryActive;
+    int32_t discoveryCtrl;
 
     qcc::SocketFd l2capLFd;
     qcc::Event* l2capEvent;
+
+    uint32_t cod;
 
     struct {
         struct {

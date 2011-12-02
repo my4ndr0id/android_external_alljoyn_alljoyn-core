@@ -52,12 +52,12 @@ using namespace qcc;
 
 namespace ajn {
 
-/*
- * Mutex to serialize all authentications.
- */
-qcc::Mutex AllJoynPeerObj::clientLock;
+static const uint32_t PEER_AUTH_VERSION = 0x00010000;
 
-AllJoynPeerObj::AllJoynPeerObj(BusAttachment& bus) : BusObject(bus, org::alljoyn::Bus::Peer::ObjectPath, false), requestThread(*this)
+AllJoynPeerObj::AllJoynPeerObj(BusAttachment& bus) :
+    BusObject(bus, org::alljoyn::Bus::Peer::ObjectPath, false),
+    AlarmListener(),
+    dispatcher("PeerObjDispatcher", true, 3)
 {
     /* Add org.alljoyn.Bus.Peer.HeaderCompression interface */
     {
@@ -91,41 +91,34 @@ AllJoynPeerObj::AllJoynPeerObj(BusAttachment& bus) : BusObject(bus, org::alljoyn
 QStatus AllJoynPeerObj::Start()
 {
     bus.RegisterBusListener(*this);
+    dispatcher.Start();
     return ER_OK;
 }
 
 QStatus AllJoynPeerObj::Stop()
 {
-    if (requestThread.IsRunning()) {
-        return requestThread.Stop();
-    } else {
-        return ER_OK;
-    }
+    dispatcher.Stop();
+    return ER_OK;
 }
 
 QStatus AllJoynPeerObj::Join()
 {
-    QStatus status = requestThread.Join();
-
-    lock.Lock();
+    lock.Lock(MUTEX_CONTEXT);
     std::map<qcc::String, SASLEngine*>::iterator iter = conversations.begin();
     while (iter != conversations.end()) {
         delete iter->second;
         ++iter;
     }
     conversations.clear();
-    lock.Unlock();
+    lock.Unlock(MUTEX_CONTEXT);
 
+    dispatcher.Join();
     bus.UnregisterBusListener(*this);
-    return status;
+    return ER_OK;
 }
 
 AllJoynPeerObj::~AllJoynPeerObj()
 {
-    if (requestThread.IsRunning()) {
-        requestThread.Stop();
-        requestThread.Join();
-    }
 }
 
 QStatus AllJoynPeerObj::Init()
@@ -160,7 +153,12 @@ void AllJoynPeerObj::GetExpansion(const InterfaceDescription::Member* member, Me
 QStatus AllJoynPeerObj::RequestHeaderExpansion(Message& msg, RemoteEndpoint* sender)
 {
     assert(sender == bus.GetInternal().GetRouter().FindEndpoint(msg->GetRcvEndpointName()));
-    return requestThread.QueueRequest(msg, EXPAND_HEADER, sender->GetRemoteName());
+    return DispatchRequest(msg, EXPAND_HEADER, sender->GetRemoteName());
+}
+
+QStatus AllJoynPeerObj::RequestAuthentication(Message& msg, RemoteEndpoint* endpoint)
+{
+    return DispatchRequest(msg, AUTHENTICATE_PEER, endpoint->GetUniqueName());
 }
 
 /**
@@ -256,7 +254,6 @@ void AllJoynPeerObj::ExchangeGroupKeys(const InterfaceDescription::Member* membe
     QStatus status;
     PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
     KeyBlob key;
-    KeyBlob nonce;
 
     /*
      * We expect to know the peer that is making this method call
@@ -265,21 +262,19 @@ void AllJoynPeerObj::ExchangeGroupKeys(const InterfaceDescription::Member* membe
         StringSource src(msg->GetArg(0)->v_scalarArray.v_byte, msg->GetArg(0)->v_scalarArray.numElements);
         status = key.Load(src);
         if (status == ER_OK) {
-            status = nonce.Load(src);
-        }
-        if (status == ER_OK) {
             /*
-             * Tag the group key with the auth mechanism used by ExchangeGroupKeys then store it.
+             * Tag the group key with the auth mechanism used by ExchangeGroupKeys. Group keys
+             * are inherently directional - only initiator encrypts with the group key. We set
+             * the role to NO_ROLE otherwise senders can't decrypt their own broadcast messages.
              */
-            key.SetTag(msg->GetAuthMechanism());
-            peerStateTable->GetPeerState(msg->GetSender())->SetKeyAndNonce(key, nonce, PEER_GROUP_KEY);
+            key.SetTag(msg->GetAuthMechanism(), KeyBlob::NO_ROLE);
+            peerStateTable->GetPeerState(msg->GetSender())->SetKey(key, PEER_GROUP_KEY);
             /*
              * Return the local group key.
              */
-            peerStateTable->GetGroupKeyAndNonce(key, nonce);
+            peerStateTable->GetGroupKey(key);
             StringSink snk;
             key.Store(snk);
-            nonce.Store(snk);
             MsgArg replyArg("ay", snk.GetString().size(), snk.GetString().data());
             MethodReply(msg, &replyArg, 1);
         }
@@ -293,7 +288,8 @@ void AllJoynPeerObj::ExchangeGroupKeys(const InterfaceDescription::Member* membe
 
 void AllJoynPeerObj::ExchangeGuids(const InterfaceDescription::Member* member, Message& msg)
 {
-    qcc::GUID remotePeerGuid(msg->GetArg(0)->v_string.str);
+    qcc::GUID128 remotePeerGuid(msg->GetArg(0)->v_string.str);
+    uint32_t version = msg->GetArg(1)->v_uint32;
     qcc::String localGuidStr = bus.GetInternal().GetKeyStore().GetGuid();
     if (!localGuidStr.empty()) {
         PeerState peerState = bus.GetInternal().GetPeerStateTable()->GetPeerState(msg->GetSender());
@@ -304,8 +300,14 @@ void AllJoynPeerObj::ExchangeGuids(const InterfaceDescription::Member* member, M
          * Associate the remote peer GUID with the sender peer state.
          */
         peerState->SetGuid(remotePeerGuid);
-        MsgArg replyArg("s", localGuidStr.c_str());
-        MethodReply(msg, &replyArg, 1);
+        if (version == PEER_AUTH_VERSION) {
+            MsgArg replyArgs[2];
+            replyArgs[0].Set("s", localGuidStr.c_str());
+            replyArgs[1].Set("u", PEER_AUTH_VERSION);
+            MethodReply(msg, replyArgs, ArraySize(replyArgs));
+        } else {
+            MethodReply(msg, ER_BUS_PEER_AUTH_VERSION_MISMATCH);
+        }
     } else {
         MethodReply(msg, ER_BUS_NO_PEER_GUID);
     }
@@ -317,7 +319,12 @@ void AllJoynPeerObj::ExchangeGuids(const InterfaceDescription::Member* member, M
 #define VERIFIER_LEN  12
 #define NONCE_LEN     28
 
-QStatus AllJoynPeerObj::KeyGen(PeerState& peerState, String seed, qcc::String& verifier)
+/*
+ * Limit session key lifetime to 2 days.
+ */
+#define SESSION_KEY_EXPIRATION (60 * 60 * 24 * 2)
+
+QStatus AllJoynPeerObj::KeyGen(PeerState& peerState, String seed, qcc::String& verifier, KeyBlob::Role role)
 {
     QStatus status;
     KeyStore& keyStore = bus.GetInternal().GetKeyStore();
@@ -325,27 +332,30 @@ QStatus AllJoynPeerObj::KeyGen(PeerState& peerState, String seed, qcc::String& v
     KeyBlob masterSecret;
 
     status = keyStore.GetKey(peerState->GetGuid(), masterSecret);
+    if ((status == ER_OK) && masterSecret.HasExpired()) {
+        status = ER_BUS_KEY_EXPIRED;
+    }
     if (status == ER_OK) {
-        size_t keylen = Crypto_AES::AES128_SIZE + ajn::Crypto::NonceBytes + VERIFIER_LEN;
+        size_t keylen = Crypto_AES::AES128_SIZE + VERIFIER_LEN;
         uint8_t* keymatter = new uint8_t[keylen];
         /*
-         * Session key and other key matter is generated using the procedure described in RFC 5246
+         * Session key is generated using the procedure described in RFC 5246
          */
         Crypto_PseudorandomFunction(masterSecret, label, seed, keymatter, keylen);
         KeyBlob sessionKey(keymatter, Crypto_AES::AES128_SIZE, KeyBlob::AES);
-        KeyBlob nonce(keymatter + Crypto_AES::AES128_SIZE, ajn::Crypto::NonceBytes, KeyBlob::GENERIC);
         /*
          * Tag the session key with auth mechanism tag from the master secret
          */
-        sessionKey.SetTag(masterSecret.GetTag());
+        sessionKey.SetTag(masterSecret.GetTag(), role);
+        sessionKey.SetExpiration(SESSION_KEY_EXPIRATION);
         /*
-         * Store session key and nonce in the peer state.
+         * Store session key in the peer state.
          */
-        peerState->SetKeyAndNonce(sessionKey, nonce, PEER_SESSION_KEY);
+        peerState->SetKey(sessionKey, PEER_SESSION_KEY);
         /*
          * Return verifier string
          */
-        verifier = BytesToHexString(keymatter + Crypto_AES::AES128_SIZE + ajn::Crypto::NonceBytes, VERIFIER_LEN);
+        verifier = BytesToHexString(keymatter + Crypto_AES::AES128_SIZE, VERIFIER_LEN);
         delete [] keymatter;
         QCC_DbgHLPrintf(("KeyGen verifier %s", verifier.c_str()));
     }
@@ -360,8 +370,8 @@ void AllJoynPeerObj::GenSessionKey(const InterfaceDescription::Member* member, M
 {
     QStatus status;
     PeerState peerState = bus.GetInternal().GetPeerStateTable()->GetPeerState(msg->GetSender());
-    qcc::GUID remotePeerGuid(msg->GetArg(0)->v_string.str);
-    qcc::GUID localPeerGuid(msg->GetArg(1)->v_string.str);
+    qcc::GUID128 remotePeerGuid(msg->GetArg(0)->v_string.str);
+    qcc::GUID128 localPeerGuid(msg->GetArg(1)->v_string.str);
     /*
      * Check that target GUID is our GUID.
      */
@@ -370,7 +380,7 @@ void AllJoynPeerObj::GenSessionKey(const InterfaceDescription::Member* member, M
     } else {
         qcc::String nonce = RandHexString(NONCE_LEN);
         qcc::String verifier;
-        status = KeyGen(peerState, msg->GetArg(2)->v_string.str + nonce, verifier);
+        status = KeyGen(peerState, msg->GetArg(2)->v_string.str + nonce, verifier, KeyBlob::RESPONDER);
         if (status == ER_OK) {
             MsgArg replyArgs[2];
             replyArgs[0].Set("s", nonce.c_str());
@@ -385,7 +395,7 @@ void AllJoynPeerObj::GenSessionKey(const InterfaceDescription::Member* member, M
 void AllJoynPeerObj::AuthAdvance(Message& msg)
 {
     QStatus status = ER_OK;
-    ajn::SASLEngine* sasl;
+    ajn::SASLEngine* sasl = NULL;
     ajn::SASLEngine::AuthState authState;
     qcc::String outStr;
     qcc::String sender = msg->GetSender();
@@ -397,10 +407,10 @@ void AllJoynPeerObj::AuthAdvance(Message& msg)
      *
      * Check for existing conversation and allocate a new SASL engine if we need one
      */
-    lock.Lock();
+    lock.Lock(MUTEX_CONTEXT);
     sasl = conversations[sender];
     conversations.erase(sender);
-    lock.Unlock();
+    lock.Unlock(MUTEX_CONTEXT);
 
     if (!sasl) {
         sasl = new SASLEngine(bus, ajn::AuthMechanism::CHALLENGER, peerAuthMechanisms.c_str(), sender.c_str(), peerAuthListener);
@@ -426,50 +436,40 @@ void AllJoynPeerObj::AuthAdvance(Message& msg)
         status = sasl->GetMasterSecret(masterSecret);
         mech = sasl->GetMechanism();
         if (status == ER_OK) {
-            qcc::GUID remotePeerGuid(sasl->GetRemoteId());
+            qcc::GUID128 remotePeerGuid(sasl->GetRemoteId());
             /* Tag the master secret with the auth mechanism used to generate it */
-            masterSecret.SetTag(mech);
+            masterSecret.SetTag(mech, KeyBlob::RESPONDER);
             status = keyStore.AddKey(remotePeerGuid, masterSecret);
         }
         /*
          * Report the succesful authentication to allow application to clear UI etc.
          */
-        if ((status == ER_OK) && peerAuthListener) {
-            peerAuthListener->AuthenticationComplete(mech.c_str(), sender.c_str(), true /* success */);
+        if (status == ER_OK) {
+            peerAuthListener.AuthenticationComplete(mech.c_str(), sender.c_str(), true /* success */);
         }
-        /*
-         * All done with this SASL engine.
-         */
         delete sasl;
-        sasl = NULL;
     }
     if (status != ER_OK) {
         /*
          * Report the failed authentication to allow application to clear UI etc.
          */
-        if (peerAuthListener) {
-            peerAuthListener->AuthenticationComplete(mech.c_str(), sender.c_str(), false /* failure */);
-        }
-        /*
-         * All done with this SASL engine.
-         */
-        delete sasl;
-        sasl = NULL;
+        peerAuthListener.AuthenticationComplete(mech.c_str(), sender.c_str(), false /* failure */);
         /*
          * Let remote peer know the authentication failed.
          */
         MethodReply(msg, status);
+        delete sasl;
     } else {
+        /*
+         * If we are not done put the SASL engine back
+         */
+        if (authState != SASLEngine::ALLJOYN_AUTH_SUCCESS) {
+            lock.Lock(MUTEX_CONTEXT);
+            conversations[sender] = sasl;
+            lock.Unlock(MUTEX_CONTEXT);
+        }
         MsgArg replyMsg("s", outStr.c_str());
         MethodReply(msg, &replyMsg, 1);
-    }
-    /*
-     * If we are not done put the sasl engine on the conversations list.
-     */
-    if (sasl) {
-        lock.Lock();
-        conversations[sender] = sasl;
-        lock.Unlock();
     }
 }
 
@@ -486,19 +486,31 @@ void AllJoynPeerObj::AuthChallenge(const ajn::InterfaceDescription::Member* memb
      * Authentication may involve user interaction or be computationally expensive so cannot be
      * allowed to block the read thread.
      */
-    QStatus status = requestThread.QueueRequest(msg, AUTH_CHALLENGE);
+    QStatus status = DispatchRequest(msg, AUTH_CHALLENGE);
     if (status != ER_OK) {
         MethodReply(msg, status);
+    }
+}
+
+void AllJoynPeerObj::ForceAuthentication(const qcc::String& busName)
+{
+    PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
+    if (peerStateTable->IsKnownPeer(busName)) {
+        lock.Lock(MUTEX_CONTEXT);
+        PeerState peerState = peerStateTable->GetPeerState(busName);
+        peerState->ClearKeys();
+        bus.ClearKeys(peerState->GetGuid().ToString());
+        lock.Unlock(MUTEX_CONTEXT);
     }
 }
 
 /*
  * A long timeout to allow for possible PIN entry
  */
-#define AUTH_TIMEOUT      60000
+#define AUTH_TIMEOUT      120000
 #define DEFAULT_TIMEOUT   10000
 
-QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool forceAuth)
+QStatus AllJoynPeerObj::AuthenticatePeer(AllJoynMessageType msgType, const qcc::String& busName, bool wait)
 {
     QStatus status;
     ajn::SASLEngine::AuthState authState;
@@ -509,24 +521,35 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
     if (ifc == NULL) {
         return ER_BUS_NO_SUCH_INTERFACE;
     }
-
-    /*
-     * Clear the keys if we are forcing authentication.
-     */
-    if (forceAuth) {
-        peerState->ClearKeys();
-    }
-    /*
-     * Simply return if the peer is already secured.
-     */
-    if (peerState->IsSecure()) {
-        return ER_OK;
-    }
     /*
      * Cannot authenticate if we don't have an authentication mechanism
      */
     if (peerAuthMechanisms.empty()) {
         return ER_BUS_NO_AUTHENTICATION_MECHANISM;
+    }
+    /*
+     * Return if the peer is already secured.
+     */
+    if (peerState->IsSecure()) {
+        return ER_OK;
+    }
+    /*
+     * Check if this peer is already being authenticated. This check won't catch authentications
+     * that use different names for the same peer, but we catch those below when we using the
+     * unique name. Worst case we end up making a redundant ExchangeGuids method call.
+     */
+    if (msgType != MESSAGE_SIGNAL) {
+        lock.Lock(MUTEX_CONTEXT);
+        if (peerState->GetAuthEvent()) {
+            if (wait) {
+                Event::Wait(*peerState->GetAuthEvent(), lock);
+                return peerState->IsSecure() ? ER_OK : ER_AUTH_FAIL;
+            } else {
+                lock.Unlock(MUTEX_CONTEXT);
+                return ER_WOULDBLOCK;
+            }
+        }
+        lock.Unlock(MUTEX_CONTEXT);
     }
 
     ProxyBusObject remotePeerObj(bus, busName.c_str(), org::alljoyn::Bus::Peer::ObjectPath, 0);
@@ -538,12 +561,14 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
      * master secret or if we have to start an authentication conversation.
      */
     qcc::String localGuidStr = bus.GetInternal().GetKeyStore().GetGuid();
-    MsgArg arg("s", localGuidStr.c_str());
+    MsgArg args[2];
+    args[0].Set("s", localGuidStr.c_str());
+    args[1].Set("u", PEER_AUTH_VERSION);
     Message replyMsg(bus);
-    status = remotePeerObj.MethodCall(*(ifc->GetMember("ExchangeGuids")), &arg, 1, replyMsg, DEFAULT_TIMEOUT);
+    status = remotePeerObj.MethodCall(*(ifc->GetMember("ExchangeGuids")), args, ArraySize(args), replyMsg, DEFAULT_TIMEOUT);
     if (status != ER_OK) {
         /*
-         * ER_BUS_REPLY_IS_ERROR_MESSAGE has a specific meaning in the public API an should not be
+         * ER_BUS_REPLY_IS_ERROR_MESSAGE has a specific meaning in the public API and should not be
          * propogated to the caller from this context.
          */
         if (status == ER_BUS_REPLY_IS_ERROR_MESSAGE) {
@@ -560,61 +585,85 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
     /*
      * Extract the remote guid from the message
      */
-    qcc::GUID remotePeerGuid(replyMsg->GetArg(0)->v_string.str);
+    qcc::GUID128 remotePeerGuid(replyMsg->GetArg(0)->v_string.str);
+    uint32_t version = replyMsg->GetArg(1)->v_uint32;
     qcc::String remoteGuidStr = remotePeerGuid.ToString();
+
+    if (version != PEER_AUTH_VERSION) {
+        status = ER_BUS_PEER_AUTH_VERSION_MISMATCH;
+        QCC_LogError(status, ("ExchangeGuids expected %u got %u", PEER_AUTH_VERSION, version));
+        return status;
+    }
 
     QCC_DbgHLPrintf(("ExchangeGuids Local %s", localGuidStr.c_str()));
     QCC_DbgHLPrintf(("ExchangeGuids Remote %s", remoteGuidStr.c_str()));
     /*
-     * Serialize authentication conversations
-     */
-    clientLock.Lock();
-    /*
      * Now we have the unique bus name in the reply try again to find out if we have a session key
-     * for this peer. Do this after we have obtained the lock in case another thread has done an
-     * authentication since we last checked for the session key above.
+     * for this peer.
      */
     peerState = peerStateTable->GetPeerState(sender, busName);
     peerState->SetGuid(remotePeerGuid);
     /*
-     * Clear the keys if we are forcing authentication.
-     */
-    if (forceAuth) {
-        peerState->ClearKeys();
-    }
-    /*
-     * We can now return if the peer is secured.
+     * We can now return if the peer is authenticated.
      */
     if (peerState->IsSecure()) {
-        clientLock.Unlock();
         return ER_OK;
+    }
+    /*
+     * Check again if the peer is being authenticated on another thread. We need to do this because
+     * the check above may have used a well-known-namme and now we know the unique name.
+     */
+    lock.Lock(MUTEX_CONTEXT);
+    if (peerState->GetAuthEvent()) {
+        if (wait) {
+            Event::Wait(*peerState->GetAuthEvent(), lock);
+            return peerState->IsSecure() ? ER_OK : ER_AUTH_FAIL;
+        } else {
+            lock.Unlock(MUTEX_CONTEXT);
+            return ER_WOULDBLOCK;
+        }
     }
     /*
      * The bus allows a peer to send signals and make method calls to itself. If we are securing the
      * local peer we obviously don't need to authenticate but we must initialize a peer state object
      * with a session key and group key.
      */
-    if (remoteGuidStr == localGuidStr) {
+    if (bus.GetUniqueName() == sender) {
+        assert(remoteGuidStr == localGuidStr);
         QCC_DbgHLPrintf(("Securing local peer to itself"));
         KeyBlob key;
-        KeyBlob nonce;
         /* Use the local peer's GROUP key */
-        peerStateTable->GetGroupKeyAndNonce(key, nonce);
-        key.SetTag("SELF");
-        peerState->SetKeyAndNonce(key, nonce, PEER_GROUP_KEY);
-        /* Allocate a random session key and related nonce */
+        peerStateTable->GetGroupKey(key);
+        key.SetTag("SELF", KeyBlob::NO_ROLE);
+        peerState->SetKey(key, PEER_GROUP_KEY);
+        /* Allocate a random session key - no role because we are both INITIATOR and RESPONDER */
         key.Rand(Crypto_AES::AES128_SIZE, KeyBlob::AES);
-        nonce.Rand(32, KeyBlob::GENERIC);
-        key.SetTag("SELF");
-        peerState->SetKeyAndNonce(key, nonce, PEER_SESSION_KEY);
+        key.SetTag("SELF", KeyBlob::NO_ROLE);
+        peerState->SetKey(key, PEER_SESSION_KEY);
         /* Record in the peer state that this peer is the local peer */
         peerState->isLocalPeer = true;
-        clientLock.Unlock();
+        /* We are still holding the lock */
+        lock.Unlock(MUTEX_CONTEXT);
         return ER_OK;
     }
+    /*
+     * Signals don't trigger authentications so if the remote peer is not authenticated or in the
+     * process or being authenticated we return an error status which will cause a security
+     * violation notification back to the application.
+     */
+    if (msgType == MESSAGE_SIGNAL) {
+        /* We are still holding the lock */
+        lock.Unlock(MUTEX_CONTEXT);
+        return ER_BUS_DESTINATION_NOT_AUTHENTICATED;
+    }
+    /*
+     * Other threads authenticating the same peer will block on this event until the authentication completes.
+     */
+    qcc::Event authEvent;
+    peerState->SetAuthEvent(&authEvent);
+    lock.Unlock(MUTEX_CONTEXT);
 
-    assert(!peerState->isLocalPeer);
-
+    KeyStore& keyStore = bus.GetInternal().GetKeyStore();
     bool firstPass = true;
     do {
         /*
@@ -623,9 +672,21 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
          * session key on the first pass we start an authentication conversation to establish a new
          * master secret.
          */
-        if (!bus.GetInternal().GetKeyStore().HasKey(remotePeerGuid)) {
-            status = ER_AUTH_FAIL;
-        } else {
+        if (!keyStore.HasKey(remotePeerGuid)) {
+            /*
+             * If the key store is shared try reloading in case another application has already
+             * authenticated this peer.
+             */
+            if (keyStore.IsShared()) {
+                keyStore.Reload();
+                if (!keyStore.HasKey(remotePeerGuid)) {
+                    status = ER_AUTH_FAIL;
+                }
+            } else {
+                status = ER_AUTH_FAIL;
+            }
+        }
+        if (status == ER_OK) {
             /*
              * Generate a random string - this is the local half of the seed string.
              */
@@ -643,7 +704,7 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
                 /*
                  * The response completes the seed string so we can generate the session key.
                  */
-                status = KeyGen(peerState, nonce + replyMsg->GetArg(0)->v_string.str, verifier);
+                status = KeyGen(peerState, nonce + replyMsg->GetArg(0)->v_string.str, verifier, KeyBlob::INITIATOR);
                 if ((status == ER_OK) && (verifier != replyMsg->GetArg(1)->v_string.str)) {
                     status = ER_AUTH_FAIL;
                 }
@@ -653,7 +714,8 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
             break;
         }
         /*
-         * Initiaize the SASL engine as responder (i.e. client)
+         * Initiaize the SASL engine as responder (i.e. client) this terminology seems backwards but
+         * is the terminology used by the DBus specification.
          */
         SASLEngine sasl(bus, ajn::AuthMechanism::RESPONDER, peerAuthMechanisms, busName.c_str(), peerAuthListener);
         sasl.SetLocalId(localGuidStr);
@@ -672,12 +734,11 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
                 status = sasl.Advance(inStr, outStr, authState);
                 if (authState == SASLEngine::ALLJOYN_AUTH_SUCCESS) {
                     KeyBlob masterSecret;
-                    KeyStore& keyStore = bus.GetInternal().GetKeyStore();
                     mech = sasl.GetMechanism();
                     status = sasl.GetMasterSecret(masterSecret);
                     if (status == ER_OK) {
                         /* Tag the master secret with the auth mechanism used to generate it */
-                        masterSecret.SetTag(mech);
+                        masterSecret.SetTag(mech, KeyBlob::INITIATOR);
                         status = keyStore.AddKey(remotePeerGuid, masterSecret);
                     }
                 }
@@ -694,38 +755,29 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
     if (status == ER_OK) {
         Message replyMsg(bus);
         KeyBlob key;
-        KeyBlob nonce;
         StringSink snk;
-        peerStateTable->GetGroupKeyAndNonce(key, nonce);
+        peerStateTable->GetGroupKey(key);
         key.Store(snk);
-        nonce.Store(snk);
         MsgArg arg("ay", snk.GetString().size(), snk.GetString().data());
         status = remotePeerObj.MethodCall(*(ifc->GetMember("ExchangeGroupKeys")), &arg, 1, replyMsg, DEFAULT_TIMEOUT, ALLJOYN_FLAG_ENCRYPTED);
         if (status == ER_OK) {
             StringSource src(replyMsg->GetArg(0)->v_scalarArray.v_byte, replyMsg->GetArg(0)->v_scalarArray.numElements);
             status = key.Load(src);
             if (status == ER_OK) {
-                status = nonce.Load(src);
-            }
-            if (status == ER_OK) {
                 /*
-                 * Tag the group key with the auth mechanism used by ExchangeGroupKeys
+                 * Tag the group key with the auth mechanism used by ExchangeGroupKeys. Group keys
+                 * are inherently directional - only initiator encrypts with the group key. We set
+                 * the role to NO_ROLE otherwise senders can't decrypt their own broadcast messages.
                  */
-                key.SetTag(replyMsg->GetAuthMechanism());
-                peerState->SetKeyAndNonce(key, nonce, PEER_GROUP_KEY);
+                key.SetTag(replyMsg->GetAuthMechanism(), KeyBlob::NO_ROLE);
+                peerState->SetKey(key, PEER_GROUP_KEY);
             }
         }
     }
     /*
      * Report the authentication completion to allow application to clear UI etc.
      */
-    if (peerAuthListener) {
-        peerAuthListener->AuthenticationComplete(mech.c_str(), sender.c_str(), status == ER_OK);
-    }
-    /*
-     * All done, release the lock
-     */
-    clientLock.Unlock();
+    peerAuthListener.AuthenticationComplete(mech.c_str(), sender.c_str(), status == ER_OK);
     /*
      * ER_BUS_REPLY_IS_ERROR_MESSAGE has a specific meaning in the public API an should not be
      * propogated to the caller from this context.
@@ -733,79 +785,134 @@ QStatus AllJoynPeerObj::SecurePeerConnection(const qcc::String& busName, bool fo
     if (status == ER_BUS_REPLY_IS_ERROR_MESSAGE) {
         status = ER_AUTH_FAIL;
     }
+    /*
+     * Release any other threads waiting on the result of this authentication.
+     */
+    lock.Lock(MUTEX_CONTEXT);
+    peerState->SetAuthEvent(NULL);
+    while (authEvent.GetNumBlockedThreads() > 0) {
+        authEvent.SetEvent();
+        qcc::Sleep(10);
+    }
+    lock.Unlock(MUTEX_CONTEXT);
     return status;
 }
 
-QStatus AllJoynPeerObj::RequestThread::QueueRequest(Message& msg, RequestType reqType, const qcc::String data)
+QStatus AllJoynPeerObj::AuthenticatePeerAsync(const qcc::String& busName)
 {
-    QCC_DbgHLPrintf(("QueueRequest %s", msg->Description().c_str()));
-    lock.Lock();
-    bool wasEmpty = queue.empty();
-    Request req = { msg, reqType, data };
-    queue.push(req);
-    lock.Unlock();
-    if (wasEmpty) {
-        if (IsRunning()) {
-            Stop();
-            Join();
-        }
-        return Start();
-    } else {
-        return ER_OK;
-    }
+    Message invalidMsg(bus);
+    return DispatchRequest(invalidMsg, SECURE_CONNECTION, busName);
 }
 
-qcc::ThreadReturn AllJoynPeerObj::RequestThread::Run(void* args)
+QStatus AllJoynPeerObj::DispatchRequest(Message& msg, RequestType reqType, const qcc::String data)
+{
+    QStatus status;
+    QCC_DbgHLPrintf(("DispatchRequest %s", msg->Description().c_str()));
+    lock.Lock(MUTEX_CONTEXT);
+    if (dispatcher.IsRunning()) {
+        Request* req = new Request(msg, reqType, data);
+        Alarm alarm(0, this, 0, reinterpret_cast<void*>(req));
+        status = dispatcher.AddAlarm(alarm);
+        if (status != ER_OK) {
+            delete req;
+        }
+    } else {
+        status = ER_BUS_STOPPING;
+    }
+    lock.Unlock(MUTEX_CONTEXT);
+    return status;
+}
+
+void AllJoynPeerObj::AlarmTriggered(const Alarm& alarm, QStatus reason)
 {
     QStatus status;
 
-    while (!IsStopping()) {
-        lock.Lock();
-        Request& req(queue.front());
-        QCC_DbgHLPrintf(("Dequeue request %d for %s", req.reqType, req.msg->Description().c_str()));
-        lock.Unlock();
-        if (!IsStopping()) {
-            switch (req.reqType) {
-            case SECURE_PEER:
-                status = peerObj.SecurePeerConnection(req.msg->GetSender());
-                if (status != ER_OK) {
-                    if (peerObj.peerAuthListener) {
-                        peerObj.peerAuthListener->SecurityViolation(status, req.msg);
+    QCC_DbgHLPrintf(("AllJoynPeerObj::AlarmTriggered"));
+    Request* req = static_cast<Request*>(alarm.GetContext());
+
+    switch (req->reqType) {
+    case AUTHENTICATE_PEER:
+        /*
+         * Push the message onto a queue of messages to be encrypted and forwarded in order when
+         * the authentication completes.
+         */
+        lock.Lock(MUTEX_CONTEXT);
+        msgsPendingAuth.push_back(req->msg);
+        lock.Unlock(MUTEX_CONTEXT);
+        /*
+         * Extend timeouts so reply handlers don't expire while waiting for authentication to complete
+         */
+        if (req->msg->GetType() == MESSAGE_METHOD_CALL) {
+            bus.GetInternal().GetLocalEndpoint().ExtendReplyHandlerTimeout(req->msg->GetCallSerial(), AUTH_TIMEOUT);
+        }
+        status = AuthenticatePeer(req->msg->GetType(), req->msg->GetDestination(), false);
+        if (status != ER_WOULDBLOCK) {
+            PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
+            /*
+             * Check each message that is queued waiting for an authentication to complete
+             * to see if this is the authentication the message was waiting for.
+             */
+            lock.Lock(MUTEX_CONTEXT);
+            std::deque<Message>::iterator iter = msgsPendingAuth.begin();
+            while (iter != msgsPendingAuth.end()) {
+                Message msg = *iter;
+                if (peerStateTable->IsAlias(msg->GetDestination(), req->msg->GetDestination())) {
+                    if (status != ER_OK) {
+                        /*
+                         * If the failed message was a method call push an error response.
+                         */
+                        if (req->msg->GetType() == MESSAGE_METHOD_CALL) {
+                            Message reply(bus);
+                            reply->ErrorMsg(status, req->msg->GetCallSerial());
+                            bus.GetInternal().GetLocalEndpoint().PushMessage(reply);
+                        }
+                    } else {
+                        bus.GetInternal().GetRouter().PushMessage(msg, bus.GetInternal().GetLocalEndpoint());
                     }
+                    iter = msgsPendingAuth.erase(iter);
                 } else {
-                    peerObj.bus.GetInternal().GetLocalEndpoint().PushMessage(req.msg);
+                    iter++;
                 }
-                break;
-
-            case AUTH_CHALLENGE:
-                peerObj.AuthAdvance(req.msg);
-                break;
-
-            case ACCEPT_SESSION:
-                peerObj.AcceptSession(NULL, req.msg);
-                break;
-
-            case EXPAND_HEADER:
-                peerObj.ExpandHeader(req.msg, req.data);
-                break;
+            }
+            lock.Unlock(MUTEX_CONTEXT);
+            /*
+             * Report a single error for the message the triggered the authentication
+             */
+            if (status != ER_OK) {
+                peerAuthListener.SecurityViolation(status, req->msg);
             }
         }
-        lock.Lock();
-        queue.pop();
-        bool isEmpty = queue.empty();
-        lock.Unlock();
-        if (isEmpty) {
-            break;
+        break;
+
+    case AUTH_CHALLENGE:
+        AuthAdvance(req->msg);
+        break;
+
+    case ACCEPT_SESSION:
+        AcceptSession(NULL, req->msg);
+        break;
+
+    case EXPAND_HEADER:
+        ExpandHeader(req->msg, req->data);
+        break;
+
+    case SECURE_CONNECTION:
+        status = AuthenticatePeer(req->msg->GetType(), req->data, true);
+        if (status != ER_OK) {
+            peerAuthListener.SecurityViolation(status, req->msg);
         }
+        break;
     }
-    return 0;
+    delete req;
+    QCC_DbgHLPrintf(("AllJoynPeerObj::AlarmTriggered - exiting"));
+    return;
 }
 
 void AllJoynPeerObj::HandleSecurityViolation(Message& msg, QStatus status)
 {
     PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
 
-    QCC_DbgHLPrintf(("HandleSecurityViolation %s %s", QCC_StatusText(status), msg->Description().c_str()));
+    QCC_DbgTrace(("HandleSecurityViolation %s %s", QCC_StatusText(status), msg->Description().c_str()));
 
     if (status == ER_BUS_MESSAGE_DECRYPTION_FAILED) {
         PeerState peerState = peerStateTable->GetPeerState(msg->GetSender());
@@ -819,18 +926,18 @@ void AllJoynPeerObj::HandleSecurityViolation(Message& msg, QStatus status)
             peerState->ClearKeys();
         } else if (msg->IsBroadcastSignal()) {
             /*
-             * Try to secure the connection back to the sender.
+             * Encrypted broadcast signals are silently ignored
              */
-            if (requestThread.QueueRequest(msg, SECURE_PEER) == ER_OK) {
-                status = ER_OK;
-            }
+            QCC_DbgHLPrintf(("Discarding encrypted broadcast signal"));
+            status = ER_OK;
         }
     }
     /*
      * Report the security violation
      */
-    if ((status != ER_OK) && peerAuthListener) {
-        peerAuthListener->SecurityViolation(status, msg);
+    if (status != ER_OK) {
+        QCC_DbgTrace(("Reporting security violation %s for %s", QCC_StatusText(status), msg->Description().c_str()));
+        peerAuthListener.SecurityViolation(status, msg);
     }
 }
 
@@ -848,21 +955,32 @@ void AllJoynPeerObj::NameOwnerChanged(const char* busName, const char* previousO
         /*
          * We are no longer in an authentication conversation with this peer.
          */
-        lock.Lock();
+        lock.Lock(MUTEX_CONTEXT);
         delete conversations[busName];
         conversations.erase(busName);
-        lock.Unlock();
+        lock.Unlock(MUTEX_CONTEXT);
     }
 }
 
 void AllJoynPeerObj::AcceptSession(const InterfaceDescription::Member* member, Message& msg)
 {
     QStatus status;
-    /*
-     * Use the request thread.
-     */
+
     if (member) {
-        status = requestThread.QueueRequest(msg, ACCEPT_SESSION);
+        /*
+         * Reenter on the BusAttachment dispatcher thread.
+         */
+        lock.Lock(MUTEX_CONTEXT);
+        if (dispatcher.IsRunning()) {
+            Request* req = new Request(msg, ACCEPT_SESSION, "");
+            status = bus.GetInternal().Dispatch(*this, reinterpret_cast<void*>(req), 0);
+            if (status != ER_OK) {
+                delete req;
+            }
+        } else {
+            status = ER_BUS_STOPPING;
+        }
+        lock.Unlock(MUTEX_CONTEXT);
         if (status != ER_OK) {
             MethodReply(msg, status);
         }

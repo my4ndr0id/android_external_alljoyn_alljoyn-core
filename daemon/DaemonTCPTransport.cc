@@ -42,6 +42,10 @@
 using namespace std;
 using namespace qcc;
 
+const uint32_t TCP_LINK_TIMEOUT_PROBE_ATTEMPTS       = 1;
+const uint32_t TCP_LINK_TIMEOUT_PROBE_RESPONSE_DELAY = 10;
+const uint32_t TCP_LINK_TIMEOUT_MIN_LINK_TIMEOUT     = 40;
+
 namespace ajn {
 
 /*
@@ -58,14 +62,18 @@ class DaemonTCPEndpoint : public RemoteEndpoint {
         SUCCEEDED
     };
 
-    DaemonTCPEndpoint(DaemonTCPTransport* transport, BusAttachment& bus, bool incoming,
-                      const qcc::String connectSpec, qcc::SocketFd sock, const qcc::IPAddress& ipAddr, uint16_t port)
-        :
-        RemoteEndpoint(bus, incoming, connectSpec, m_stream, "tcp"),
+    DaemonTCPEndpoint(DaemonTCPTransport* transport,
+                      BusAttachment& bus,
+                      bool incoming,
+                      const qcc::String connectSpec,
+                      qcc::SocketFd sock,
+                      const qcc::IPAddress& ipAddr,
+                      uint16_t port)
+        : RemoteEndpoint(bus, incoming, connectSpec, m_stream, "tcp"),
         m_transport(transport),
         m_state(INITIALIZED),
         m_tStart(qcc::Timespec(0)),
-        m_authThread(),
+        m_authThread(this, transport),
         m_stream(sock),
         m_ipAddr(ipAddr),
         m_port(port),
@@ -83,12 +91,33 @@ class DaemonTCPEndpoint : public RemoteEndpoint {
     bool IsSuddenDisconnect() { return m_wasSuddenDisconnect; }
     void SetSuddenDisconnect(bool val) { m_wasSuddenDisconnect = val; }
 
-  private:
-    class AuthThread : public qcc::Thread {
-        qcc::ThreadReturn STDCALL Run(void* arg);
+    QStatus SetLinkTimeout(uint32_t& linkTimeout)
+    {
+        QStatus status = ER_OK;
+        if (linkTimeout > 0) {
+            uint32_t to = max(linkTimeout, TCP_LINK_TIMEOUT_MIN_LINK_TIMEOUT);
+            to -= TCP_LINK_TIMEOUT_PROBE_RESPONSE_DELAY * TCP_LINK_TIMEOUT_PROBE_ATTEMPTS;
+            status = RemoteEndpoint::SetLinkTimeout(to, TCP_LINK_TIMEOUT_PROBE_RESPONSE_DELAY, TCP_LINK_TIMEOUT_PROBE_ATTEMPTS);
+            if ((status == ER_OK) && (to > 0)) {
+                linkTimeout = to + TCP_LINK_TIMEOUT_PROBE_RESPONSE_DELAY * TCP_LINK_TIMEOUT_PROBE_ATTEMPTS;
+            }
 
+        } else {
+            RemoteEndpoint::SetLinkTimeout(0, 0, 0);
+        }
+        return status;
+    }
+
+  private:
+    class AuthThread : public qcc::Thread, public qcc::ThreadListener {
       public:
-        AuthThread() : Thread("auth") { }
+        AuthThread(DaemonTCPEndpoint* conn, DaemonTCPTransport* trans) : Thread("auth"), m_conn(conn), m_transport(trans) { }
+      private:
+        virtual qcc::ThreadReturn STDCALL Run(void* arg);
+        virtual void ThreadExit(qcc::Thread* thread);
+
+        DaemonTCPEndpoint* m_conn;
+        DaemonTCPTransport* m_transport;
     };
 
     DaemonTCPTransport* m_transport;  /**< The server holding the connection */
@@ -103,14 +132,13 @@ class DaemonTCPEndpoint : public RemoteEndpoint {
 
 QStatus DaemonTCPEndpoint::Authenticate(void)
 {
+    QCC_DbgTrace(("DaemonTCPEndpoint::Authenticate()"));
     /*
      * Start the authentication thread.  The first parameter is the pointer to
-     * the connection object and the second parameter is the listener.  The
-     * listener must be NULL since nobody must care if this thread exits.  If
-     * the authentication process succeeds, our thread will set up the listener
-     * for the resulting RemoteEndpoint threads.
+     * the connection object and the second parameter is the thread listener.
+     * The listener allows the thead exit routine to be hooked.
      */
-    QStatus status = m_authThread.Start(this, NULL);
+    QStatus status = m_authThread.Start(this, &m_authThread);
     if (status != ER_OK) {
         m_state = FAILED;
     }
@@ -119,13 +147,66 @@ QStatus DaemonTCPEndpoint::Authenticate(void)
 
 void DaemonTCPEndpoint::Abort(void)
 {
+    QCC_DbgTrace(("DaemonTCPEndpoint::Abort()"));
     m_authThread.Stop();
-    m_authThread.Join();
+}
+
+void DaemonTCPEndpoint::AuthThread::ThreadExit(qcc::Thread* thread)
+{
+    QCC_DbgTrace(("DaemonTCPEndpoint::ThreadExit()"));
+
+    /*
+     * An authentication thread has stopped for some reason.  This can happen
+     * for a number of reasons, as seen in DaemonTCPEndpoint::Auththread::Run(),
+     * or as a result of a thread-related Stop().  If the thread completed
+     * successfully, it will have removed its associated connection from the
+     * m_authList and put it on the m_endpointList.  This transfers the
+     * responsibility for the DaemonTCPEndpoint data structure and its threads
+     * to the endpoint list.  During this transfer, the transport Tx and Rx
+     * threads are spun up and so their ThreadExit functions can take over.  It
+     * is assumed here to be imossible for that transfer of responsibility to
+     * "half-happen."
+     *
+     * An area of concern is in the server accept loop, where it can reach into
+     * the m_authList and abort authentications that are taking too long.  It
+     * does this by calling Stop().  This will wake up the thead and we'll get
+     * called here.  We'll then delete the connection out from under the server,
+     * so it is going to have to be careful about what it does; but that's the
+     * server's problem not ours.
+     *
+     * So, if there has been a failure, or we are stopping because the thread has
+     * been explicitly asked to stop, we will find our m_conn on the m_authList
+     * and so we need to do something here about cleaning up the DaemonTCPEndpoint
+     * data structure.
+     *
+     * So what we have to do is to look for m_conn on the m_authList and if we
+     * find it, remove it and delete it, then fade away.  If it is not there,
+     * then reponsibility has been successfully transferred to the Tx adn Rx
+     * threads and we must not touch our m_conn.
+     */
+    assert(m_conn);
+    m_conn->m_transport->m_endpointListLock.Lock(MUTEX_CONTEXT);
+    list<DaemonTCPEndpoint*>::iterator i = find(m_conn->m_transport->m_authList.begin(), m_conn->m_transport->m_authList.end(), m_conn);
+    if (i != m_conn->m_transport->m_authList.end()) {
+        delete *i;
+        m_conn->m_transport->m_authList.erase(i);
+    }
+    m_conn->m_transport->m_endpointListLock.Unlock(MUTEX_CONTEXT);
 }
 
 void* DaemonTCPEndpoint::AuthThread::Run(void* arg)
 {
+    QCC_DbgTrace(("DaemonTCPEndpoint::AuthThread::Run()"));
+
     DaemonTCPEndpoint* conn = reinterpret_cast<DaemonTCPEndpoint*>(arg);
+
+    /*
+     * An m_conn was plumbed into the associated AuthThread to allow for
+     * ThreadExit to do useful work.  Make sure that these two values are
+     * consistent.
+     */
+    assert(conn == m_conn);
+
     conn->m_state = AUTHENTICATING;
 
     /*
@@ -155,7 +236,7 @@ void* DaemonTCPEndpoint::AuthThread::Run(void* arg)
      * If we are running an authentication process, we are probably ultimately
      * blocked on a socket.  We expect that if the server is asked to shut
      * down, it will run through its list of authenticating connections and
-     * Abort() each one.  That will cause a thread Stop() which should unblock
+     * Stop() each one.  That will cause a thread Stop() which should unblock
      * all of the reads and return an error which will eventually pop out here
      * with an authentication failure.
      *
@@ -176,6 +257,7 @@ void* DaemonTCPEndpoint::AuthThread::Run(void* arg)
     if ((status != ER_OK) || (nbytes != 1) || (byte != 0)) {
         conn->m_stream.Close();
         conn->m_state = FAILED;
+        QCC_LogError(status, ("Failed to read first byte from stream"));
         return (void*)ER_FAIL;
     }
 
@@ -194,19 +276,10 @@ void* DaemonTCPEndpoint::AuthThread::Run(void* arg)
         return (void*)status;
     }
 
-    /* Authentication succeeded, crank up the transport. */
-    conn->SetListener(conn->m_transport);
-    status = conn->Start();
-    if (status != ER_OK) {
-        conn->m_stream.Close();
-        conn->m_state = FAILED;
-        QCC_LogError(status, ("Failed to start TCP endpoint"));
-        return (void*)status;
-    }
-
-    /* Tell the server that the authentication succeeded and that the connection is up. */
+    /* Tell the server that the authentication succeeded and that it can bring the connection up. */
     conn->m_state = SUCCEEDED;
     conn->m_transport->Authenticated(conn);
+    QCC_DbgTrace(("DaemonTCPEndpoint::AuthThread::Run(): Returning"));
     return (void*)status;
 }
 
@@ -214,6 +287,7 @@ void* DaemonTCPEndpoint::AuthThread::Run(void* arg)
 DaemonTCPTransport::DaemonTCPTransport(BusAttachment& bus)
     : Thread("DaemonTCPTransport"), m_bus(bus), m_ns(0), m_stopping(false), m_listener(0), m_foundCallback(m_listener)
 {
+    QCC_DbgTrace(("DaemonTCPTransport::DaemonTCPTransport()"));
     /*
      * We know we are daemon code, so we'd better be running with a daemon
      * router.  This is assumed elsewhere.
@@ -223,33 +297,126 @@ DaemonTCPTransport::DaemonTCPTransport(BusAttachment& bus)
 
 DaemonTCPTransport::~DaemonTCPTransport()
 {
+    QCC_DbgTrace(("DaemonTCPTransport::~DaemonTCPTransport()"));
     Stop();
     Join();
+    delete m_ns;
+    m_ns = 0;
 }
 
 void DaemonTCPTransport::Authenticated(DaemonTCPEndpoint* conn)
 {
-    QCC_DbgTrace(("TCPTransport::Authenticated()"));
-    m_endpointListLock.Lock();
+    QCC_DbgTrace(("DaemonTCPTransport::Authenticated()"));
+
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
+
+    /*
+     * If Authenticated() is being called, it is as a result of an
+     * authentication thread deciding to do so.  This means it is running.  The
+     * only places a connection may be removed from the m_authList is in the
+     * case of a failed thread start, the thread exit function or here.  Since
+     * the thead must be running to call us here, we must find the conn in the
+     * m_authList or someone isn't playing by the rules.
+     */
     list<DaemonTCPEndpoint*>::iterator i = find(m_authList.begin(), m_authList.end(), conn);
-    assert(i != m_authList.end() && "TCPTransportBase::Authenticated(): Can't find connection");
+    assert(i != m_authList.end() && "DaemonTCPTransport::Authenticated(): Can't find connection");
+
+    /*
+     * We now transfer the responsibility for the connection data structure
+     * to the m_endpointList.
+     */
     m_authList.erase(i);
     m_endpointList.push_back(conn);
-    m_endpointListLock.Unlock();
+
+    /*
+     * The responsibility for the connection data structure has been transferred
+     * to the m_endpointList.  Before leaving we have to spin up the connection
+     * threads which will actually assume the responsibility.  If the Start()
+     * succeeds, those threads have it, but if Start() fails, we still do; and
+     * there's not much we can do but give up.
+     */
+    conn->SetListener(this);
+    QStatus status = conn->Start();
+    if (status != ER_OK) {
+        i = find(m_endpointList.begin(), m_endpointList.end(), conn);
+        assert(i != m_authList.end() && "DaemonTCPTransport::Authenticated(): Can't find connection");
+        m_authList.erase(i);
+        delete conn;
+        QCC_LogError(status, ("DaemonTCPTransport::Authenticated(): Failed to start TCP endpoint"));
+    }
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 }
 
 QStatus DaemonTCPTransport::Start()
 {
+    QCC_DbgTrace(("DaemonTCPTransport::Start()"));
+
+    /*
+     * We rely on the status of the server accept thead as the primary
+     * gatekeeper.
+     *
+     * A true response from IsRunning tells us that the server accept thread is
+     * STARTED, RUNNING or STOPPING.
+     *
+     * When a thread is created it is in state INITIAL.  When an actual tread is
+     * spun up as a result of Start(), it becomes STARTED.  Just before the
+     * user's Run method is called, the thread becomes RUNNING.  If the Run
+     * method exits, the thread becomes STOPPING.  When the thread is Join()ed
+     * it becomes DEAD.
+     *
+     * IsRunning means that someone has called Thread::Start() and the process
+     * has progressed enough that the thread has begun to execute.  If we get
+     * multiple Start() calls calls on multiple threads, this test may fail to
+     * detect multiple starts in a failsafe way and we may end up with multiple
+     * server accept threads running.  We assume that since Start() requests
+     * come in from our containing transport list it will not allow concurrent
+     * start requests.
+     */
+    if (IsRunning()) {
+        QCC_LogError(ER_BUS_BUS_ALREADY_STARTED, ("DaemonTCPTransport::Start(): Already started"));
+        return ER_BUS_BUS_ALREADY_STARTED;
+    }
+
+    /*
+     * In order to pass the IsRunning() gate above, there must be no server
+     * accept thread running.  Running includes a thread that has been asked to
+     * stop but has not been Join()ed yet.  So we know that there is no thread
+     * and that either a Start() has never happened, or a Start() followed by a
+     * Stop() and a Join() has happened.  Since Join() does a Thread::Join and
+     * then deletes the name service, it is possible that a Join() done on one
+     * thread is done enough to pass the gate above, but has not yet finished
+     * deleting the name service instance when a Start() comes in on another
+     * thread.  Because of this (rare and unusual) possibility we also check the
+     * name service instance and return an error if we find it non-zero.  If the
+     * name service is NULL, the Stop() and Join() is totally complete and we
+     * can safely proceed.
+     */
+    if (m_ns != NULL) {
+        QCC_LogError(ER_BUS_BUS_ALREADY_STARTED, ("DaemonTCPTransport::Start(): Name service already started"));
+        return ER_BUS_BUS_ALREADY_STARTED;
+    }
+
+    m_ns = new NameService;
+    assert(m_ns);
+
     m_stopping = false;
 
     /*
-     * Start up an instance of the lightweight name service and tell it what
-     * GUID we think we are and whether or not to advertise over IPv4 and or
-     * IPv6
+     * We have a configuration item that controls whether or not to use IPv4
+     * broadcasts, so we need to check it now and give it to the name service as
+     * we bring it up.
      */
-    m_ns = new NameService;
+    bool disable = false;
+    if (ConfigDB::GetConfigDB()->GetProperty(NameService::MODULE_NAME, NameService::BROADCAST_PROPERTY) == "true") {
+        disable = true;
+    }
+
+    /*
+     * Get the guid from the bus attachment which will act as the globally unique
+     * ID of the daemon.
+     */
     qcc::String guidStr = m_bus.GetInternal().GetGlobalGUID().ToString();
-    QStatus status = m_ns->Init(guidStr, true, true);
+    QStatus status = m_ns->Init(guidStr, true, true, disable);
     if (status != ER_OK) {
         QCC_LogError(status, ("DaemonTCPTransport::Start(): Error starting name service"));
         return status;
@@ -259,20 +426,36 @@ QStatus DaemonTCPTransport::Start()
      * Tell the name service to call us back on our FoundCallback method when
      * we hear about a new well-known bus name.
      */
-    assert(m_ns);
     m_ns->SetCallback(
         new CallbackImpl<FoundCallback, void, const qcc::String&, const qcc::String&, std::vector<qcc::String>&, uint8_t>
             (&m_foundCallback, &FoundCallback::Found));
 
     /*
-     * Start the server accept loop through the thread base class
+     * Start the server accept loop through the thread base class.  This will
+     * close or open the IsRunning() gate we use to control access to our
+     * public API.
      */
     return Thread::Start();
 }
 
 QStatus DaemonTCPTransport::Stop(void)
 {
+    QCC_DbgTrace(("DaemonTCPTransport::Stop()"));
+
+    /*
+     * It is legal to call Stop() more than once, so it must be possible to
+     * call Stop() on a stopped transport.
+     */
     m_stopping = true;
+
+    /*
+     * Tell the name service to stop calling us back if it's there (we may get
+     * called more than once in the chain of destruction) so the pointer is not
+     * required to be non-NULL.
+     */
+    if (m_ns) {
+        m_ns->SetCallback(NULL);
+    }
 
     /*
      * Tell the server accept loop thread to shut down through the thead
@@ -284,38 +467,62 @@ QStatus DaemonTCPTransport::Stop(void)
         return status;
     }
 
-    m_endpointListLock.Lock();
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
 
     /*
-     * Ask any running endpoints to shut down and exit their threads.
+     * Ask any authenticating endpoints to shut down and exit their threads.  By its
+     * presence on the m_authList, we know that the endpoint is authenticating and
+     * the authentication thread has responsibility for dealing with the endpoint
+     * data structure.  We call Abort() to stop that thread from running.  The
+     * endpoint Rx and Tx threads will not be running yet.
+     */
+    for (list<DaemonTCPEndpoint*>::iterator i = m_authList.begin(); i != m_authList.end(); ++i) {
+        (*i)->Abort();
+    }
+
+    /*
+     * Ask any running endpoints to shut down and exit their threads.  By its
+     * presence on the m_endpointList, we know that authentication is compete and
+     * the Rx and Tx threads have responsibility for dealing with the endpoint
+     * data structure.  We call Stop() to stop those threads from running.  Since
+     * the connnection is on the m_endpointList, we know that the authentication
+     * thread has handed off responsibility.
      */
     for (list<DaemonTCPEndpoint*>::iterator i = m_endpointList.begin(); i != m_endpointList.end(); ++i) {
         (*i)->Stop();
     }
 
-    /*
-     * Ask any authenticating endpoints to shut down and exit their threads.
-     * Note the use of Meyers' idiom for deleting iterators while iterating
-     * and be careful.  This is possible since the Abort() call does a Join
-     * on the authenticator thread.  An endpoint is either on the authenticating
-     * list or on the endpoint list, so we need to delete them here.
-     */
-    for (list<DaemonTCPEndpoint*>::iterator i = m_authList.begin(); i != m_authList.end();) {
-        DaemonTCPEndpoint* ep = *i;
-        m_authList.erase(i++);
-        ep->Abort();
-        delete ep;
-    }
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
-    m_endpointListLock.Unlock();
+    /*
+     * The use model for DaemonTCPTransport is that it works like a thread.
+     * There is a call to Start() that spins up the server accept loop in order
+     * to get it running.  When someone wants to tear down the transport, they
+     * call Stop() which requests the transport to stop.  This is followed by
+     * Join() which waits for all of the threads to actually stop.
+     *
+     * The name service should play by those rules as well.  We allocate and
+     * initialize it in Start(), which will spin up the main thread there.
+     * We need to Stop() the name service here and Join its thread in
+     * DaemonTCPTransport::Join().  If someone just deletes the transport
+     * there is an implied Stop() and Join() so it behaves correctly.
+     */
+    if (m_ns) {
+        m_ns->Stop();
+    }
 
     return ER_OK;
 }
 
 QStatus DaemonTCPTransport::Join(void)
 {
+    QCC_DbgTrace(("DaemonTCPTransport::Join()"));
+
     /*
-     * Wait for the server accept loop thread to exit.
+     * It is legal to call Join() more than once, so it must be possible to
+     * call Join() on a joined transport.
+     *
+     * First, wait for the server accept loop thread to exit.
      */
     QStatus status = Thread::Join();
     if (status != ER_OK) {
@@ -324,27 +531,68 @@ QStatus DaemonTCPTransport::Join(void)
     }
 
     /*
-     * A call to Stop() above will ask all of the endpoints to stop.  We still
-     * need to wait here until all of the threads running in those endpoints
-     * actually stop running.  When a remote endpoint thead exits the endpoint
-     * will call back into our EndpointExit() and have itself removed from the
-     * list.  We poll for the all-exited condition, yielding the CPU to let
-     * the endpoint therad wake and exit.
+     * A requred call to Stop() that needs to happen before this Join will ask
+     * all of the endpoints to stop; and will also cause any authenticating
+     * endpoints to stop.  We still need to wait here until all of the threads
+     * running in those endpoints actually stop running.
+     *
+     * Since Stop() is a request to stop, and this is what has ultimately been
+     * done to both authentication threads and Rx and Tx threads, it is possible
+     * that a thread is actually running after the call to Stop().  If that
+     * thead happens to be an authenticating endpoint, it is possible that an
+     * authentication actually completes after Stop() is called.  This will move
+     * a connection from the m_authList to the m_endpointList, so we need to
+     * make sure we wait for all of the connections on the m_authList to go away
+     * before we look for the connections on the m_endpointlist.
      */
-    m_endpointListLock.Lock();
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
+    while (m_authList.size() > 0) {
+        m_endpointListLock.Unlock(MUTEX_CONTEXT);
+        /*
+         * Sleep(0) yields to threads of equal or higher priority, so we use
+         * Sleep(1) to make sure we actually yield.  Since the OS has its own
+         * idea of granulatity this will actually be more -- on Linux, for
+         * example, this will translate into 1 Jiffy, which is probably 1/250
+         * sec or 4 ms.
+         */
+        qcc::Sleep(1);
+        m_endpointListLock.Lock(MUTEX_CONTEXT);
+    }
+
+    /* We need to wait here until all of the threads running in the previously
+     * authenticated endpoints actually stop running.  When a remote endpoint
+     * thead exits the endpoint will call back into our EndpointExit() and have
+     * itself removed from the m_endpointList and clean up by themselves.
+     */
     while (m_endpointList.size() > 0) {
-        m_endpointListLock.Unlock();
-        qcc::Sleep(50);
-        m_endpointListLock.Lock();
+        m_endpointListLock.Unlock(MUTEX_CONTEXT);
+        qcc::Sleep(1);
+        m_endpointListLock.Lock(MUTEX_CONTEXT);
     }
 
     /*
-     * All authenticating  endpoints have been removed from their list and
-     * were deleted in Stop() so the list must be empty.
+     * Under no condition will we leave a thread running when we exit this
+     * function.
      */
     assert(m_authList.size() == 0);
+    assert(m_endpointList.size() == 0);
 
-    m_endpointListLock.Unlock();
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
+
+    /*
+     * The use model for DaemonTCPTransport is that it works like a thread.
+     * There is a call to Start() that spins up the server accept loop in order
+     * to get it running.  When someone wants to tear down the transport, they
+     * call Stop() which requests the transport to stop.  This is followed by
+     * Join() which waits for all of the threads to actually stop.
+     *
+     * The name service needs to play by the use model for the transport (see
+     * Start()).  We allocate and initialize it in Start() so we need to Join
+     * and delete the name service here.  Since there is an implied Join() in
+     * the destructor we just delete the name service to play by the rules.
+     */
+    delete m_ns;
+    m_ns = NULL;
 
     m_stopping = false;
 
@@ -371,7 +619,7 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
      * not an error if we don't match, we just don't have anything to offer.
      */
     if (opts.traffic != SessionOpts::TRAFFIC_MESSAGES && opts.traffic != SessionOpts::TRAFFIC_RAW_RELIABLE) {
-        QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): traffic mismatch"));
+        QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): traffic mismatch"));
         return ER_OK;
     }
 
@@ -383,8 +631,22 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
      * those: cogito ergo some.
      */
     if (!(opts.transports & (TRANSPORT_WLAN | TRANSPORT_WWAN | TRANSPORT_LAN))) {
-        QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): transport mismatch"));
+        QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): transport mismatch"));
         return ER_OK;
+    }
+
+    /*
+     * The name service is allocated in Start(), Started by the call to Init()
+     * in Start(), Stopped in our Stop() method and deleted in our Join().  In
+     * this case, the transport will probably be started, and we will probably
+     * find m_ns set, but there is no requirement to ensure this.  If m_ns is
+     * NULL, we need to complain so the user learns to Start() the transport
+     * before calling IfConfig.  A call to IsRunning() here is superfluous since
+     * we really don't care about anything but the name service in this method.
+     */
+    if (m_ns == NULL) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::GetListenAddresses(): NameService not initialized"));
+        return ER_BUS_TRANSPORT_NOT_STARTED;
     }
 
     /*
@@ -398,8 +660,8 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
      * and out of range of this and that and the underlying IP addresses change
      * as DHCP doles out whatever it feels like at any moment.
      */
-    QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): IfConfig()"));
-    assert(m_ns);
+    QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): IfConfig()"));
+
     std::vector<NameService::IfConfigEntry> entries;
     QStatus status = m_ns->IfConfig(entries);
     if (status != ER_OK) {
@@ -413,7 +675,7 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
      * with '*' being a wildcard indicating that we want to match any interface.
      * If there is no configuration item, we default to something rational.
      */
-    QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): GetProperty()"));
+    QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): GetProperty()"));
     qcc::String interfaces = ConfigDB::GetConfigDB()->GetProperty(NameService::MODULE_NAME, NameService::INTERFACES_PROPERTY);
     if (interfaces.size() == 0) {
         interfaces = INTERFACES_DEFAULT;
@@ -428,7 +690,7 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
     const char*wildcard = "*";
     size_t i = interfaces.find(wildcard);
     if (i != qcc::String::npos) {
-        QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): wildcard search"));
+        QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): wildcard search"));
         haveWildcard = true;
         interfaces = wildcard;
     }
@@ -453,33 +715,30 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
             interfaces.clear();
         }
 
-        QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): looking for interface %s", currentInterface.c_str()));
+        QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): looking for interface %s", currentInterface.c_str()));
 
         /*
          * Walk the list of interfaces that we got from the system and see if
          * we find a match.
          */
         for (uint32_t i = 0; i < entries.size(); ++i) {
-            QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): matching %s", entries[i].m_name.c_str()));
+            QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): matching %s", entries[i].m_name.c_str()));
             /*
              * To match a configuration entry, the name of the interface must:
              *
              *   - match the name in the currentInterface (or be wildcarded);
-             *   - support multicast and so plausibly be the source of an advert;
              *   - be UP which means it has an IP address assigned;
              *   - not be the LOOPBACK device and therefore be remotely available.
              */
             uint32_t mask = NameService::IfConfigEntry::UP |
-                            NameService::IfConfigEntry::MULTICAST |
                             NameService::IfConfigEntry::LOOPBACK;
 
-            uint32_t state = NameService::IfConfigEntry::UP |
-                             NameService::IfConfigEntry::MULTICAST;
+            uint32_t state = NameService::IfConfigEntry::UP;
 
             if ((entries[i].m_flags & mask) == state) {
-                QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): %s has correct state", entries[i].m_name.c_str()));
+                QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): %s has correct state", entries[i].m_name.c_str()));
                 if (haveWildcard || entries[i].m_name == currentInterface) {
-                    QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): %s has correct name", entries[i].m_name.c_str()));
+                    QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): %s has correct name", entries[i].m_name.c_str()));
                     /*
                      * This entry matches our search criteria, so we need to
                      * turn the IP address that we found into a busAddr.  We
@@ -487,12 +746,12 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
                      * already in a string, so we can easily put together the
                      * desired busAddr.
                      *
-                     * Currently, however, the daemon caan't handle IPv6
+                     * Currently, however, the daemon can't handle IPv6
                      * addresses, so we filter them out and only let IPv4
                      * addresses (address family is AF_INET) escape.
                      */
                     if (entries[i].m_family == AF_INET) {
-                        QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): %s is IPv4.  Match found", entries[i].m_name.c_str()));
+                        QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): %s is IPv4.  Match found", entries[i].m_name.c_str()));
 
                         /*
                          * We know we have an interface that speaks IPv4 and
@@ -541,15 +800,12 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
      * error to have no available interfaces.  In fact, it is quite expected
      * in a phone if it is not associated with an access point over wi-fi.
      */
-    QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): done"));
+    QCC_DbgPrintf(("DaemonTCPTransport::GetListenAddresses(): done"));
     return ER_OK;
 }
 
 void DaemonTCPTransport::EndpointExit(RemoteEndpoint* ep)
 {
-    DaemonTCPEndpoint* tep = static_cast<DaemonTCPEndpoint*>(ep);
-    assert(tep);
-
     /*
      * This is a callback driven from the remote endpoint thread exit function.
      * Our DaemonTCPEndpoint inherits from class RemoteEndpoint and so when
@@ -558,13 +814,16 @@ void DaemonTCPTransport::EndpointExit(RemoteEndpoint* ep)
      */
     QCC_DbgTrace(("DaemonTCPTransport::EndpointExit()"));
 
+    DaemonTCPEndpoint* tep = static_cast<DaemonTCPEndpoint*>(ep);
+    assert(tep);
+
     /* Remove the dead endpoint from the live endpoint list */
-    m_endpointListLock.Lock();
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
     list<DaemonTCPEndpoint*>::iterator i = find(m_endpointList.begin(), m_endpointList.end(), tep);
     if (i != m_endpointList.end()) {
         m_endpointList.erase(i);
     }
-    m_endpointListLock.Unlock();
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
     /*
      * The endpoint can exit if it was asked to by us in response to a Disconnect()
@@ -581,6 +840,14 @@ void DaemonTCPTransport::EndpointExit(RemoteEndpoint* ep)
 
 void* DaemonTCPTransport::Run(void* arg)
 {
+    QCC_DbgTrace(("DaemonTCPTransport::Run()"));
+    /*
+     * This is the Thread Run function for our server accept loop.  We require
+     * that the name service be started before the Thread that will call us
+     * here.
+     */
+    assert(m_ns);
+
     /*
      * We need to find the defaults for our connection limits.  These limits
      * can be specified in the configuration database with corresponding limits
@@ -616,6 +883,12 @@ void* DaemonTCPTransport::Run(void* arg)
     QStatus status = ER_OK;
 
     while (!IsStopping()) {
+        /*
+         * We require that the name service be created and started before the
+         * Thread that called us here; and we require that the name service stay
+         * around until after we leave.
+         */
+        assert(m_ns);
 
         /*
          * Each time through the loop we create a set of events to wait on.
@@ -624,13 +897,13 @@ void* DaemonTCPTransport::Run(void* arg)
          * code that does the change Alert()s this thread and we wake up and
          * re-evaluate the list of SocketFds.
          */
-        m_listenFdsLock.Lock();
+        m_listenFdsLock.Lock(MUTEX_CONTEXT);
         vector<Event*> checkEvents, signaledEvents;
         checkEvents.push_back(&stopEvent);
         for (list<pair<qcc::String, SocketFd> >::const_iterator i = m_listenFds.begin(); i != m_listenFds.end(); ++i) {
             checkEvents.push_back(new Event(i->second, Event::IO_READ, false));
         }
-        m_listenFdsLock.Unlock();
+        m_listenFdsLock.Unlock(MUTEX_CONTEXT);
 
         /*
          * We have our list of events, so now wait for something to happen
@@ -694,59 +967,69 @@ void* DaemonTCPTransport::Run(void* arg)
 
                 QCC_DbgHLPrintf(("DaemonTCPTransport connect request"));
 
-                m_endpointListLock.Lock();
+                m_endpointListLock.Lock(MUTEX_CONTEXT);
 
                 /*
-                 * See if there are any connections with failed authentications
-                 * on our list that we can clean up.  We do this every time
-                 * through just to conserve resources (memory).  Note that if
-                 * the state of the endpoint is FAILED, any thread running there
-                 * will never touch the endpoint object so it is safe to delete.
-                 * Note the use of Meyers' idiom to erase while iterating.
+                 * See if there any pending connections on the list that can be
+                 * removed (timed out).  If the connection is on the pending
+                 * authentication list, we assume that there is an
+                 * authentication thread running which we can abort.  If we bug
+                 * Abort(), we are *asking* an in-process authentication to
+                 * stop.  When it does, it will delete itself from the
+                 * m_authList and go away.
+                 *
+                 * Here's the trick: It is holding real resources, and may take
+                 * time to release them and exit (for example, close a stream).
+                 * We can't very well just stop the server loop to wait for a
+                 * problematic connection to un-hose itself, but what we can do
+                 * is yield the CPU in the hope that the problem connection
+                 * closes down immediately.  Sleep(0) yields to threads of equal
+                 * or higher priority, so we use Sleep(1) to make sure we
+                 * actually yield to everyone.  Since the OS has its own idea of
+                 * granulatity this will be more -- on Linux, this will
+                 * translate into 1 Jiffy, which is probably 1/250 sec or 4 ms.
                  */
-                QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): Scavenging failed authentications"));
-                for (list<DaemonTCPEndpoint*>::iterator j = m_authList.begin(); j != m_authList.end();) {
-                    if ((*j)->IsFailed()) {
-                        delete *j;
-                        m_authList.erase(j++);
-                        QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): Scavenging failed authentication"));
-                    } else {
-                        ++j;
-                    }
-                }
-
-                /*
-                 * If the pending authentication list is still full, see if
-                 * there any pending connections on the list that can be removed
-                 * (timed out).  Note that we join any thread that may be
-                 * working behind the scenes in the endpoint with the Abort().
-                 */
-                QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): maxAuth == %d", maxAuth));
-                QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): maxConn == %d", maxConn));
-                QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): mAuthList.size() == %d", m_authList.size()));
-                QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): mEndpointList.size() == %d", m_endpointList.size()));
+                QCC_DbgPrintf(("DaemonTCPTransport::Run(): maxAuth == %d", maxAuth));
+                QCC_DbgPrintf(("DaemonTCPTransport::Run(): maxConn == %d", maxConn));
+                QCC_DbgPrintf(("DaemonTCPTransport::Run(): mAuthList.size() == %d", m_authList.size()));
+                QCC_DbgPrintf(("DaemonTCPTransport::Run(): mEndpointList.size() == %d", m_endpointList.size()));
                 assert(m_authList.size() + m_endpointList.size() <= maxConn);
-                if (m_authList.size() == maxAuth) {
-                    DaemonTCPEndpoint* conn = m_authList.back();
-                    if (conn->GetStartTime() + tTimeout < tNow) {
+                for (list<DaemonTCPEndpoint*>::iterator j = m_authList.begin(); j != m_authList.end(); ++j) {
+                    if ((*j)->GetStartTime() + tTimeout < tNow) {
                         QCC_DbgHLPrintf(("DaemonTCPTransport::Run(): Scavenging slow authenticator"));
-                        m_authList.pop_back();
-                        conn->Abort();
-                        delete conn;
+                        (*j)->Abort();
                     }
                 }
+                m_endpointListLock.Unlock(MUTEX_CONTEXT);
+                qcc::Sleep(1);
+                m_endpointListLock.Lock(MUTEX_CONTEXT);
 
                 /*
-                 * We've scavenged any slots we can, so now do we have a slot
-                 * available for a new connection?  If so, use it.
+                 * We've scavenged any slots we can, and have yielded the CPU to
+                 * let threads run and exit, so now do we have a slot available
+                 * for a new connection?  If so, use it.
                  */
                 if ((m_authList.size() < maxAuth) && (m_authList.size() + m_endpointList.size() < maxConn)) {
                     DaemonTCPEndpoint* conn = new DaemonTCPEndpoint(this, m_bus, true, "", newSock, remoteAddr, remotePort);
                     Timespec tNow;
                     GetTimeNow(&tNow);
                     conn->SetStartTime(tNow);
+                    /*
+                     * By putting the connection on the m_authList, we are
+                     * transferring responsibility for the connection to the
+                     * Authentication thread.  Therefore, we must check that the
+                     * thread actually started running to ensure the handoff
+                     * worked.  If it didn't we need to deal with the connection
+                     * here.
+                     */
                     m_authList.push_front(conn);
                     status = conn->Authenticate();
+                    if (status != ER_OK) {
+                        m_authList.pop_front();
+                        delete conn;
+                        conn = NULL;
+                    }
+                    conn = NULL;
                 } else {
                     qcc::Shutdown(newSock);
                     qcc::Close(newSock);
@@ -754,7 +1037,7 @@ void* DaemonTCPTransport::Run(void* arg)
                     QCC_LogError(status, ("DaemonTCPTransport::Run(): No slot for new connection"));
                 }
 
-                m_endpointListLock.Unlock();
+                m_endpointListLock.Unlock(MUTEX_CONTEXT);
             } else if (ER_WOULDBLOCK == status) {
                 status = ER_OK;
             }
@@ -791,11 +1074,18 @@ static const char* ADDR_DEFAULT = "0.0.0.0";
  * The default port for use in listen specs.  This port is used by the TCP
  * listener to listen for incoming connection requests.
  */
+#ifdef QCC_OS_ANDROID
+static const uint16_t PORT_DEFAULT = 0;
+#else
 static const uint16_t PORT_DEFAULT = 9955;
+#endif
 
 QStatus DaemonTCPTransport::NormalizeListenSpec(const char* inSpec, qcc::String& outSpec, map<qcc::String, qcc::String>& argMap) const
 {
     /*
+     * We don't make any calls that require us to be in any particular state
+     * with respect to threading so we don't bother to call IsRunning() here.
+     *
      * Take the string in inSpec, which must start with "tcp:" and parse it,
      * looking for comma-separated "key=value" pairs and initialize the
      * argMap with those pairs.
@@ -851,6 +1141,9 @@ QStatus DaemonTCPTransport::NormalizeListenSpec(const char* inSpec, qcc::String&
 QStatus DaemonTCPTransport::NormalizeTransportSpec(const char* inSpec, qcc::String& outSpec, map<qcc::String, qcc::String>& argMap) const
 {
     /*
+     * We don't make any calls that require us to be in any particular state
+     * with respect to threading so we don't bother to call IsRunning() here.
+     *
      * Unlike a listenSpec a transportSpec (actually a connectSpec) must have
      * a specific address (INADDR_ANY isn't a valid IP address to connect to).
      */
@@ -873,7 +1166,7 @@ QStatus DaemonTCPTransport::NormalizeTransportSpec(const char* inSpec, qcc::Stri
     return ER_OK;
 }
 
-QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** newep)
+QStatus DaemonTCPTransport::Connect(const char* connectSpec, const SessionOpts& opts, RemoteEndpoint** newep)
 {
     QCC_DbgHLPrintf(("DaemonTCPTransport::Connect(): %s", connectSpec));
 
@@ -881,12 +1174,31 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
     bool isConnected = false;
 
     /*
-     * Don't bother trying to create new endpoints if we're shutting down.
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing.  See the comment in Start() for details
+     * about what IsRunning actually means, which might be subtly different from
+     * your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
      */
     if (IsRunning() == false || m_stopping == true) {
-        QCC_DbgHLPrintf(("DaemonTCPTransport::Connect(): Shutting down; exiting"));
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::Connect(): Not running or stopping; exiting"));
         return ER_BUS_TRANSPORT_NOT_STARTED;
     }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
 
     /*
      * Parse and normalize the connectArgs.  When connecting to the outside
@@ -951,7 +1263,7 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
      * either explicitly or via the INADDR_ANY address.
      */
     QCC_DbgHLPrintf(("DaemonTCPTransport::Connect(): Checking for connection to self"));
-    m_listenFdsLock.Lock();
+    m_listenFdsLock.Lock(MUTEX_CONTEXT);
     bool anyEncountered = false;
     for (list<pair<qcc::String, SocketFd> >::iterator i = m_listenFds.begin(); i != m_listenFds.end(); ++i) {
         QCC_DbgHLPrintf(("DaemonTCPTransport::Connect(): Checking listenSpec %s", i->first.c_str()));
@@ -961,7 +1273,7 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
          * an error.
          */
         if (i->first == normSpec) {
-            m_listenFdsLock.Unlock();
+            m_listenFdsLock.Unlock(MUTEX_CONTEXT);
             QCC_DbgHLPrintf(("DaemonTCPTransport::Connect(): Exlicit connection to self"));
             return ER_BUS_ALREADY_LISTENING;
         }
@@ -976,7 +1288,7 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
             anyEncountered = true;
         }
     }
-    m_listenFdsLock.Unlock();
+    m_listenFdsLock.Unlock(MUTEX_CONTEXT);
 
     /*
      * If we are listening to INADDR_ANY, we are going to have to see if any
@@ -986,6 +1298,7 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
     if (anyEncountered) {
         QCC_DbgHLPrintf(("DaemonTCPTransport::Connect(): Checking for implicit connection to self"));
         std::vector<NameService::IfConfigEntry> entries;
+        assert(m_ns);
         QStatus status = m_ns->IfConfig(entries);
 
         /*
@@ -1025,7 +1338,11 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
     SocketFd sockFd = -1;
     status = Socket(QCC_AF_INET, QCC_SOCK_STREAM, sockFd);
     if (status == ER_OK) {
+        /* Turn off Nagle */
+        status = SetNagle(sockFd, false);
+    }
 
+    if (status == ER_OK) {
         /*
          * We got a socket, now tell TCP to connect to the remote address and
          * port.
@@ -1062,9 +1379,9 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
     DaemonTCPEndpoint* conn = NULL;
     if (status == ER_OK) {
         conn = new DaemonTCPEndpoint(this, m_bus, false, normSpec, sockFd, ipAddr, port);
-        m_endpointListLock.Lock();
+        m_endpointListLock.Lock(MUTEX_CONTEXT);
         m_endpointList.push_back(conn);
-        m_endpointListLock.Unlock();
+        m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
         /* Initialized the features for this endpoint */
         conn->GetFeatures().isBusToBus = true;
@@ -1088,12 +1405,12 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, RemoteEndpoint** ne
         if (status != ER_OK && conn) {
             QCC_LogError(status, ("DaemonTCPTransport::Connect(): Start TCPEndpoint failed"));
 
-            m_endpointListLock.Lock();
+            m_endpointListLock.Lock(MUTEX_CONTEXT);
             list<DaemonTCPEndpoint*>::iterator i = find(m_endpointList.begin(), m_endpointList.end(), conn);
             if (i != m_endpointList.end()) {
                 m_endpointList.erase(i);
             }
-            m_endpointListLock.Unlock();
+            m_endpointListLock.Unlock(MUTEX_CONTEXT);
             delete conn;
             conn = NULL;
         }
@@ -1128,6 +1445,34 @@ QStatus DaemonTCPTransport::Disconnect(const char* connectSpec)
     QCC_DbgHLPrintf(("DaemonTCPTransport::Disconnect(): %s", connectSpec));
 
     /*
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing, and by extension the endpoint threads which
+     * must be running to properly clean up.  See the comment in Start() for
+     * details about what IsRunning actually means, which might be subtly
+     * different from your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
+     */
+    if (IsRunning() == false || m_stopping == true) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::Disconnect(): Not running or stopping; exiting"));
+        return ER_BUS_TRANSPORT_NOT_STARTED;
+    }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
+
+    /*
      * Higher level code tells us which connection is refers to by giving us the
      * same connect spec it used in the Connect() call.  We have to determine the
      * address and port in exactly the same way
@@ -1152,28 +1497,47 @@ QStatus DaemonTCPTransport::Disconnect(const char* connectSpec)
      * considered dead.
      */
     status = ER_BUS_BAD_TRANSPORT_ARGS;
-    m_endpointListLock.Lock();
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
     for (list<DaemonTCPEndpoint*>::iterator i = m_endpointList.begin(); i != m_endpointList.end(); ++i) {
         if ((*i)->GetPort() == port && (*i)->GetIPAddress() == ipAddr) {
             DaemonTCPEndpoint* ep = *i;
             ep->SetSuddenDisconnect(false);
-            m_endpointListLock.Unlock();
+            m_endpointListLock.Unlock(MUTEX_CONTEXT);
             return ep->Stop();
         }
     }
-    m_endpointListLock.Unlock();
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
     return status;
 }
 
 QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
 {
     /*
-     * Don't bother trying to create new listeners if we're stopped or shutting
-     * down.
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing.  See the comment in Start() for details
+     * about what IsRunning actually means, which might be subtly different from
+     * your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
      */
     if (IsRunning() == false || m_stopping == true) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::StartListen(): Not running or stopping; exiting"));
         return ER_BUS_TRANSPORT_NOT_STARTED;
     }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
 
     /*
      * Normalize the listen spec.  Although this looks like a connectSpec it is
@@ -1190,7 +1554,7 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
     QCC_DbgPrintf(("DaemonTCPTransport::StartListen(): addr = \"%s\", port = \"%s\"",
                    argMap["addr"].c_str(), argMap["port"].c_str()));
 
-    m_listenFdsLock.Lock();
+    m_listenFdsLock.Lock(MUTEX_CONTEXT);
 
     /*
      * Check to see if the requested address and port is already being listened
@@ -1199,7 +1563,7 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
      */
     for (list<pair<qcc::String, SocketFd> >::iterator i = m_listenFds.begin(); i != m_listenFds.end(); ++i) {
         if (i->first == normSpec) {
-            m_listenFdsLock.Unlock();
+            m_listenFdsLock.Unlock(MUTEX_CONTEXT);
             return ER_BUS_ALREADY_LISTENING;
         }
     }
@@ -1210,22 +1574,6 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
     IPAddress listenAddr;
     listenAddr.SetAddress(argMap["addr"]);
     uint16_t listenPort = StringToU32(argMap["port"]);
-
-    /*
-     * The name service is very flexible about what to advertise.  Empty
-     * strings tell the name service to use IP addreses discovered from
-     * addresses returned in socket receive calls.  Providing explicit IPv4
-     * or IPv6 addresses trumps this and allows us to advertise one interface
-     * over a name service running on another.  The name service allows
-     * this, but we don't use the feature.
-     *
-     * N.B. This means that if we listen on a specific IP address and advertise
-     * over other interfaces (which do not have that IP address assigned) by
-     * providing, for example the wildcard interface, we will be advertising
-     * services on addresses do not listen on.
-     */
-    assert(m_ns);
-    m_ns->SetEndpoints("", "", listenPort);
 
     /*
      * Get the configuration item telling us which network interfaces we
@@ -1279,7 +1627,7 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
     }
 
     /*
-     * Create the TCP listener socket and set SO_REUSEADDR so we don't have
+     * Create the TCP listener socket and set SO_REUSEADDR/SO_REUSEPORT so we don't have
      * to wait for four minutes to relaunch the daemon if it crashes.
      *
      * XXX We should enable IPv6 listerners.
@@ -1287,16 +1635,20 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
     SocketFd listenFd = -1;
     status = Socket(QCC_AF_INET, QCC_SOCK_STREAM, listenFd);
     if (status != ER_OK) {
-        m_listenFdsLock.Unlock();
+        m_listenFdsLock.Unlock(MUTEX_CONTEXT);
         QCC_LogError(status, ("DaemonTCPTransport::StartListen(): Socket() failed"));
         return status;
     }
 
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT SO_REUSEADDR
+#endif
+
     uint32_t yes = 1;
-    if (setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
+    if (setsockopt(listenFd, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
         status = ER_OS_ERROR;
-        m_listenFdsLock.Unlock();
-        QCC_LogError(status, ("DaemonTCPTransport::StartListen(): setsockopt(SO_REUSEADDR) failed"));
+        m_listenFdsLock.Unlock(MUTEX_CONTEXT);
+        QCC_LogError(status, ("DaemonTCPTransport::StartListen(): setsockopt(SO_REUSEPORT) failed"));
         return status;
     }
 
@@ -1306,7 +1658,14 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
      */
     status = Bind(listenFd, listenAddr, listenPort);
     if (status == ER_OK) {
-        status = qcc::Listen(listenFd, 0);
+        /* On Android, bundled daemon will not set the TCP port in the listen spec so as to let the kernel to find an
+         * unused port for TCP transport, thus call GetLocalAddress() to get the actual TCP port used after Bind()
+         * and update the connect spec here.
+         */
+        qcc::GetLocalAddress(listenFd, listenAddr, listenPort);
+        normSpec = "tcp:addr=" + argMap["addr"] + ",port=" + U32ToString(listenPort);
+
+        status = qcc::Listen(listenFd, SOMAXCONN);
         if (status == ER_OK) {
             QCC_DbgPrintf(("DaemonTCPTransport::StartListen(): Listening on %s:%d", argMap["addr"].c_str(), listenPort));
             m_listenFds.push_back(pair<qcc::String, SocketFd>(normSpec, listenFd));
@@ -1318,7 +1677,23 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
                               listenPort));
     }
 
-    m_listenFdsLock.Unlock();
+
+    /*
+     * The name service is very flexible about what to advertise.  Empty
+     * strings tell the name service to use IP addreses discovered from
+     * addresses returned in socket receive calls.  Providing explicit IPv4
+     * or IPv6 addresses trumps this and allows us to advertise one interface
+     * over a name service running on another.  The name service allows
+     * this, but we don't use the feature.
+     *
+     * N.B. This means that if we listen on a specific IP address and advertise
+     * over other interfaces (which do not have that IP address assigned) by
+     * providing, for example the wildcard interface, we will be advertising
+     * services on addresses do not listen on.
+     */
+    assert(m_ns);
+    m_ns->SetEndpoints("", "", listenPort);
+    m_listenFdsLock.Unlock(MUTEX_CONTEXT);
 
     /*
      * Signal the (probably) waiting run thread so it will wake up and add this
@@ -1333,6 +1708,33 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
 
 QStatus DaemonTCPTransport::StopListen(const char* listenSpec)
 {
+    /*
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing.  See the comment in Start() for details
+     * about what IsRunning actually means, which might be subtly different from
+     * your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
+     */
+    if (IsRunning() == false || m_stopping == true) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::StopListen(): Not running or stopping; exiting"));
+        return ER_BUS_TRANSPORT_NOT_STARTED;
+    }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
+
     /*
      * Normalize the listen spec.  We are going to use the name string that was
      * put together for the StartListen call to find the listener instance to
@@ -1350,7 +1752,7 @@ QStatus DaemonTCPTransport::StopListen(const char* listenSpec)
      * Find the (single) listen spec and remove it from the list of active FDs
      * used by the server accept loop (run thread).
      */
-    m_listenFdsLock.Lock();
+    m_listenFdsLock.Lock(MUTEX_CONTEXT);
     status = ER_BUS_BAD_TRANSPORT_ARGS;
     qcc::SocketFd stopFd = -1;
     for (list<pair<qcc::String, SocketFd> >::iterator i = m_listenFds.begin(); i != m_listenFds.end(); ++i) {
@@ -1361,7 +1763,7 @@ QStatus DaemonTCPTransport::StopListen(const char* listenSpec)
             break;
         }
     }
-    m_listenFdsLock.Unlock();
+    m_listenFdsLock.Unlock(MUTEX_CONTEXT);
 
     /*
      * If we took a socketFD off of the list of active FDs, we need to tear it
@@ -1380,6 +1782,33 @@ QStatus DaemonTCPTransport::StopListen(const char* listenSpec)
 
 void DaemonTCPTransport::EnableDiscovery(const char* namePrefix)
 {
+    /*
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing.  See the comment in Start() for details
+     * about what IsRunning actually means, which might be subtly different from
+     * your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
+     */
+    if (IsRunning() == false || m_stopping == true) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::EnableDiscovery(): Not running or stopping; exiting"));
+        return;
+    }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
+
     /*
      * When a bus name is advertised, the source may append a string that
      * identifies a specific instance of advertised name.  For example, one
@@ -1404,25 +1833,50 @@ void DaemonTCPTransport::EnableDiscovery(const char* namePrefix)
     String starPrefix = namePrefix;
     starPrefix.append('*');
 
-    assert(m_ns);
     QStatus status = m_ns->Locate(starPrefix);
     if (status != ER_OK) {
-        QCC_LogError(status, ("Failure enable discovery for \"%s\" on TCP", namePrefix));
+        QCC_LogError(status, ("DaemonTCPTransport::EnableDiscovery(): Failure on \"%s\"", namePrefix));
     }
 }
 
 QStatus DaemonTCPTransport::EnableAdvertisement(const qcc::String& advertiseName)
 {
     /*
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing.  See the comment in Start() for details
+     * about what IsRunning actually means, which might be subtly different from
+     * your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
+     */
+    if (IsRunning() == false || m_stopping == true) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::EnableAdvertisement(): Not running or stopping; exiting"));
+        return ER_BUS_TRANSPORT_NOT_STARTED;
+    }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
+
+    /*
      * Give the provided name to the name service and have it start advertising
      * the name on the network as reachable through the daemon having this
      * transport.  The name service handles periodic retransmission of the name
      * and manages the coming and going of network interfaces for us.
      */
-    assert(m_ns);
     QStatus status = m_ns->Advertise(advertiseName);
     if (status != ER_OK) {
-        QCC_LogError(status, ("DaemonTCPTransport::EnableAdvertisment(%s) failure", advertiseName.c_str()));
+        QCC_LogError(status, ("DaemonTCPTransport::EnableAdvertisment(): Failure on \"%s\"", advertiseName.c_str()));
     }
     return status;
 }
@@ -1430,12 +1884,38 @@ QStatus DaemonTCPTransport::EnableAdvertisement(const qcc::String& advertiseName
 void DaemonTCPTransport::DisableAdvertisement(const qcc::String& advertiseName, bool nameListEmpty)
 {
     /*
+     * We only want to allow this call to proceed if we have a running server
+     * accept thread that isn't in the process of shutting down.  We use the
+     * thread response from IsRunning to give us an idea of what our server
+     * accept (Run) thread is doing.  See the comment in Start() for details
+     * about what IsRunning actually means, which might be subtly different from
+     * your intuitition.
+     *
+     * If we see IsRunning(), the thread might actually have gotten a Stop(),
+     * but has not yet exited its Run routine and become STOPPING.  To plug this
+     * hole, we need to check IsRunning() and also m_stopping, which is set in
+     * our Stop() method.
+     */
+    if (IsRunning() == false || m_stopping == true) {
+        QCC_LogError(ER_BUS_TRANSPORT_NOT_STARTED, ("DaemonTCPTransport::DisableAdvertisement(): Not running or stopping; exiting"));
+        return;
+    }
+
+    /*
+     * If we pass the IsRunning() gate above, we must have a server accept
+     * thread spinning up or shutting down but not yet joined.  Since the name
+     * service is created before the server accept thread is spun up, and
+     * deleted after it is joined, we must have a valid name service or someone
+     * isn't playing by the rules; so an assert is appropriate here.
+     */
+    assert(m_ns);
+
+    /*
      * Tell the name service to stop advertising the provided name on the
      * network as reachable through the daemon having this transport.  The name
      * service sends out a no-longer-here message and stops periodic
      * retransmission of the name as a result of the Cancel() call.
      */
-    assert(m_ns);
     QStatus status = m_ns->Cancel(advertiseName);
     if (status != ER_OK) {
         QCC_LogError(status, ("Failure stop advertising \"%s\" for TCP", advertiseName.c_str()));

@@ -102,15 +102,11 @@ class MyBusListener : public BusListener {
 /** Static bus listener */
 static MyBusListener g_busListener;
 
-/** Signal handler */
+static volatile sig_atomic_t g_interrupt = false;
+
 static void SigIntHandler(int sig)
 {
-    if (NULL != g_msgBus) {
-        QStatus status = g_msgBus->Stop(false);
-        if (ER_OK != status) {
-            QCC_LogError(status, ("BusAttachment::Stop() failed"));
-        }
-    }
+    g_interrupt = true;
 }
 
 static void usage(void)
@@ -195,7 +191,42 @@ int main(int argc, char** argv)
 
     /* Wait for the "FoundAdvertisedName" signal */
     if (ER_OK == status) {
-        status = Event::Wait(g_discoverEvent);
+        for (bool discovered = false; !discovered;) {
+            /*
+             * We want to wait for the discover event, but we also want to
+             * be able to interrupt discovery with a control-C.  The AllJoyn
+             * idiom for waiting for more than one thing this is to create a
+             * vector of things to wait on.  To provide quick response we
+             * poll the g_interrupt bit every 100 ms using a 100 ms timer
+             * event.
+             */
+            qcc::Event timerEvent(100, 100);
+            vector<qcc::Event*> checkEvents, signaledEvents;
+            checkEvents.push_back(&g_discoverEvent);
+            checkEvents.push_back(&timerEvent);
+            status = qcc::Event::Wait(checkEvents, signaledEvents);
+            if (status != ER_OK && status != ER_TIMEOUT) {
+                break;
+            }
+
+            /*
+             * If it was the discover event that popped, we're done.
+             */
+            for (vector<qcc::Event*>::iterator i = signaledEvents.begin(); i != signaledEvents.end(); ++i) {
+                if (*i == &g_discoverEvent) {
+                    discovered = true;
+                    break;
+                }
+            }
+            /*
+             * If we see the g_interrupt bit, we're also done.  Set an error
+             * condition so we don't do anything else.
+             */
+            if (g_interrupt) {
+                status = ER_FAIL;
+                break;
+            }
+        }
     }
 
     /* Check the session */

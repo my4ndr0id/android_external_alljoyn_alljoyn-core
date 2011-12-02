@@ -65,7 +65,7 @@ class BusAttachment : public MessageReceiver {
          * @param opts         Session options.
          * @param context      User defined context which will be passed as-is to callback.
          */
-        virtual void JoinSessionCB(QStatus status, SessionId sessionId, SessionOpts opts, void* context) = 0;
+        virtual void JoinSessionCB(QStatus status, SessionId sessionId, const SessionOpts& opts, void* context) = 0;
     };
 
     /**
@@ -165,14 +165,87 @@ class BusAttachment : public MessageReceiver {
     QStatus DeleteInterface(InterfaceDescription& iface);
 
     /**
-     * Start the message bus.
+     * @brief Start the process of spinning up the independent threads used in
+     * the bus attachment, preparing it for action.
      *
-     * This method only begins the process of starting the bus. Sending and receiving messages
-     * cannot begin until the bus is connected.
+     * This method only begins the process of starting the bus. Sending and
+     * receiving messages cannot begin until the bus is Connect()ed.
      *
-     * There are two ways to determine whether the bus is currently connected:
-     *    -# BusAttachment::IsConnected() returns true
-     *    -# BusObject::ObjectRegistered() is called by the bus
+     * In most cases, it is not required to understand the threading model of
+     * the bus attachment, with one important exception: The bus attachment may
+     * send callbacks to registered listeners using its own internal threads.
+     * This means that any time a listener of any kind is used in a program, the
+     * implication is that a the overall program is multithreaded, irrespective
+     * of whether or not threads are explicilty used.  This, in turn, means that
+     * any time shared state is accessed in listener methods, that state must be
+     * protected.
+     *
+     * As soon as Start() is called, clients of a bus attachment with listeners
+     * must be prepared to recieve callbacks on those listeners in the context
+     * of a thread that will be different from the thread running the main
+     * program or any other thread in the client.
+     *
+     * Although intimate knowledge of the details of the threading model are not
+     * required to use a bus attachment (beyond the caveat above) we do provide
+     * methods on the bus attachment that help users reason abount more complex
+     * threading situations.  This will apply to situations where clients of the
+     * bus attachment are multithreaded and need to interact with the
+     * multithreaded bus attachment.  These methods can be especially useful
+     * during shutdown, when the two separate threading systems need to be
+     * gracefully brought down together.
+     *
+     * The BusAttachment methods Start(), Stop() and Join() all work together to
+     * manage the autonomous activities that can happen in a BusAttachment.
+     * These activities are carried out by so-called hardware threads.  POSIX
+     * defines functions used to control hardware threads, which it calls
+     * pthreads.  Many threading packages use similar constructs.
+     *
+     * In a threading package, a start method asks the underlying system to
+     * arrange for the start of thread execution.  Threads are not necessarily
+     * running when the start method returns, but they are being *started*.  Some time later,
+     * a thread of execution appears in a thread run function, at which point the
+     * thread is considered *running*.  At some later time, executing a stop method asks the
+     * underlying system to arrange for a thread to end its execution.  The system
+     * typically sends a message to the thread to ask it to stop doing what it is doing.
+     * The thread is running until it responds to the stop message, at which time the
+     * run method exits and the thread is considered *stopping*.
+     *
+     * Note that neither of Start() nor Stop() are synchronous in the sense that
+     * one has actually accomplished the desired effect upon the return from a
+     * call.  Of particular interest is the fact that after a call to Stop(),
+     * threads will still be *running* for some non-deterministic time.
+     *
+     * In order to wait until all of the threads have actually stopped, a
+     * blocking call is required.  In threading packages this is typically
+     * called join, and our corresponding method is called Join().
+     *
+     * A Start() method call should be thought of as mapping to a threading
+     * package start function.  it causes the activity threads in the
+     * BusAttachment to be spun up and gets the attachment ready to do its main
+     * job.  As soon as Start() is called, the user should be prepared for one
+     * or more of these threads of execution to pop out of the bus attachment
+     * and into a listener callback.
+     *
+     * The Stop() method call should be thought of as mapping to a threading
+     * package stop function.  It asks the BusAttachment to begin shutting down
+     * its various threads of execution, but does not wait for any threads to exit.
+     *
+     * A call to the Join() method should be thought of as mapping to a
+     * threading package join function call.  It blocks and waits until all of
+     * the threads in the BusAttachment have in fact exited their Run functions,
+     * gone throught the stopping state and have returned their status.  When
+     * the Join() method returns, one may be assured that no threads are running
+     * in the bus attachment, and therefore there will be no callbacks in
+     * progress and no further callbacks will ever come out of a particular
+     * instance of a bus attachment.
+     *
+     * It is important to understand that since Start(), Stop() and Join() map
+     * to threads concepts and functions, one should not expect them to clean up
+     * any bus attachment state when they are called.  These functions are only
+     * present to help in orderly termination of complex threading systems.
+     *
+     * @see Stop()
+     * @see Join()
      *
      * @return
      *      - #ER_OK if successful.
@@ -182,31 +255,83 @@ class BusAttachment : public MessageReceiver {
     QStatus Start();
 
     /**
-     * Stop the message bus.
+     * @brief Ask the threading subsystem in the bus attachment to begin the
+     * process of ending the execution of its threads.
      *
-     * @param blockUntilStopped   Block the caller until the bus is stopped
+     * The Stop() method call on a bus atatchment should be thought of as
+     * mapping to a threading package stop function.  It asks the BusAttachment
+     * to begin shutting down its various threads of execution, but does not
+     * wait for any threads to exit.
+     *
+     * A call to Stop() is implied as one of the first steps in the destruction
+     * of a bus attachment.
+     *
+     * @warning There is no guarantee that a listener callback may begin executing
+     * after a call to Stop().  To achieve that efffect, the Stop() must be followed
+     * by a Join().
+     *
+     * @see Start()
+     * @see Join()
+     *
+     * @return
+     *     - #ER_OK if successful.
+     *     - An error QStatus if unable to begin the process of stopping the
+     *       message bus threads.
+     */
+    QStatus Stop();
+
+    /**
+     * @brief Wait for all of the threads spawned by the bus attachment to be
+     * completely exited.
+     *
+     * A call to the Join() method should be thought of as mapping to a
+     * threading package join function call.  It blocks and waits until all of
+     * the threads in the BusAttachment have, in fact, exited their Run functions,
+     * gone throught the stopping state and have returned their status.  When
+     * the Join() method returns, one may be assured that no threads are running
+     * in the bus attachment, and therefore there will be no callbacks in
+     * progress and no further callbacks will ever come out of the instance of a
+     * bus attachment on which Join() was called.
+     *
+     * A call to Join() is implied as one of the first steps in the destruction
+     * of a bus attachment.  Thus, when a bus attachemnt is destroyed, it is
+     * guaranteed that before it completes its destruction process, there will be
+     * no callbacks in process.
+     *
+     * @warning If Join() is called without a previous Stop() it will result in
+     * blocking "forever."
+     *
+     * @see Start()
+     * @see Stop()
      *
      * @return
      *      - #ER_OK if successful.
-     *      - An error status if unable to stop the message bus
+     *      - #ER_BUS_BUS_ALREADY_STARTED if already started
+     *      - Other error status codes indicating a failure
      */
-    QStatus Stop(bool blockUntilStopped = true);
+    QStatus Join();
 
     /**
-     * Returns true if the mesage bus has been started.
+     * @brief Determine if the bus attachment has been Start()ed.
+     *
+     * @see Start()
+     * @see Stop()
+     * @see Join()
+     *
+     * @return true if the message bus has been Start()ed.
      */
     bool IsStarted() { return isStarted; }
 
     /**
-     * Returns true if the mesage bus has been requested to stop.
+     * @brief Determine if the bus attachment has been Stop()ed.
+     *
+     * @see Start()
+     * @see Stop()
+     * @see Join()
+     *
+     * @return true if the message bus has been Start()ed.
      */
     bool IsStopping() { return isStopping; }
-
-    /**
-     * Wait for the message bus to be stopped. This method blocks the calling thread until another thread
-     * calls the Stop() method. Return immediately if the message bus has not been started.
-     */
-    void WaitStop();
 
     /**
      * Connect to a remote bus address.
@@ -287,12 +412,15 @@ class BusAttachment : public MessageReceiver {
      *
      * @return The unique name of this BusAttachment.
      */
-    const qcc::String& GetUniqueName() const;
+    const qcc::String GetUniqueName() const;
 
     /**
-     * Get the guid of the local daemon as a string
+     * Get the GUID of this BusAttachment.
      *
-     * @return GUID of local AllJoyn daemon as a string.
+     * The returned value may be appended to an advertised well-known name in order to guarantee
+     * that the resulting name is globally unique.
+     *
+     * @return GUID of this BusAttachment as a string.
      */
     const qcc::String& GetGlobalGUIDString() const;
 
@@ -342,23 +470,41 @@ class BusAttachment : public MessageReceiver {
 
     /**
      * Enable peer-to-peer security. This function must be called by applications that want to use
-     * secure interfaces. This bus must have been started by calling BusAttachment::Start() before this
-     * function is called.
+     * authentication and encryption . The bus must have been started by calling
+     * BusAttachment::Start() before this function is called. If the application is providing its
+     * own key store implementation it must have already called RegisterKeyStoreListener() before
+     * calling this function.
      *
-     * @param authMechanisms  The authentication mechanism(s) to use for peer-to-peer authentication.
-     *                        If this parameter is NULL peer-to-peer authentication is disabled.
+     * @param authMechanisms   The authentication mechanism(s) to use for peer-to-peer authentication.
+     *                         If this parameter is NULL peer-to-peer authentication is disabled.
      *
-     * @param listener        Passes password and other authentication related requests to the application.
+     * @param listener         Passes password and other authentication related requests to the application.
      *
-     * @param keyStoreFileName Optional parameter to specify the filename of the default key store.  The
+     * @param keyStoreFileName Optional parameter to specify the filename of the default key store. The
      *                         default value is the applicationName parameter of BusAttachment().
+     *                         Note that this parameter is only meaningful when using the default
+     *                         key store implementation.
+     *
+     * @param isShared         optional parameter that indicates if the key store is shared between multiple
+     *                         applications. It is generally harmless to set this to true even when the
+     *                         key store is not shared but it adds some unnecessary calls to the key store
+     *                         listener to load and store the key store in this case.
      *
      * @return
      *      - #ER_OK if peer security was enabled.
      *      - #ER_BUS_BUS_NOT_STARTED BusAttachment::Start has not be called
      */
-    QStatus EnablePeerSecurity(const char* authMechanisms, AuthListener* listener,
-                               const char* keyStoreFileName = NULL);
+    QStatus EnablePeerSecurity(const char* authMechanisms,
+                               AuthListener* listener,
+                               const char* keyStoreFileName = NULL,
+                               bool isShared = false);
+
+    /**
+     * Check is peer security has been enabled for this bus attachment.
+     *
+     * @return   Returns true if peer security has been enabled, false otherwise.
+     */
+    bool IsPeerSecurityEnabled();
 
     /**
      * Register an object that will receive bus event notifications.
@@ -379,8 +525,13 @@ class BusAttachment : public MessageReceiver {
      * This overrides the internal key store listener.
      *
      * @param listener  The key store listener to set.
+     *
+     * @return
+     *      - #ER_OK if the key store listener was set
+     *      - #ER_BUS_LISTENER_ALREADY_SET if a listener has been set by this function or because
+     *         EnablePeerSecurity has been called.
      */
-    void RegisterKeyStoreListener(KeyStoreListener& listener);
+    QStatus RegisterKeyStoreListener(KeyStoreListener& listener);
 
     /**
      * Reloads the key store for this bus attachment. This function would normally only be called in
@@ -401,15 +552,44 @@ class BusAttachment : public MessageReceiver {
     void ClearKeyStore();
 
     /**
-     * Clear the keys associated with a specific peer identified by its GUID.
+     * Clear the keys associated with aa specific remote peer as identified by its peer GUID. The
+     * peer GUID associated with a bus name can be obtained by calling GetPeerGUID().
      *
      * @param guid  The guid of a remote authenticated peer.
      *
-     * @return  - ER_OK if the key was cleared
+     * @return  - ER_OK if the keys were cleared
      *          - ER_UNKNOWN_GUID if there is no peer with the specified GUID
      *          - Other errors
      */
     QStatus ClearKeys(const qcc::String& guid);
+
+    /**
+     * Set the expiration time on keys associated with a specific remote peer as identified by its
+     * peer GUID. The peer GUID associated with a bus name can be obtained by calling GetPeerGUID().
+     * If the timeout is 0 this is equivalent to calling ClearKeys().
+     *
+     * @param guid     The GUID of a remote authenticated peer.
+     * @param timeout  The time in seconds relative to the current time to expire the keys.
+     *
+     * @return  - ER_OK if the expiration time was succesfully set.
+     *          - ER_UNKNOWN_GUID if there is no authenticated peer with the specified GUID
+     *          - Other errors
+     */
+    QStatus SetKeyExpiration(const qcc::String& guid, uint32_t timeout);
+
+    /**
+     * Get the expiration time on keys associated with a specific authenticated remote peer as
+     * identified by its peer GUID. The peer GUID associated with a bus name can be obtained by
+     * calling GetPeerGUID().
+     *
+     * @param guid     The GUID of a remote authenticated peer.
+     * @param timeout  The time in seconds relative to the current time when the keys will expire.
+     *
+     * @return  - ER_OK if the expiration time was succesfully set.
+     *          - ER_UNKNOWN_GUID if there is no authenticated peer with the specified GUID
+     *          - Other errors
+     */
+    QStatus GetKeyExpiration(const qcc::String& guid, uint32_t& timeout);
 
     /**
      * Adds a logon entry string for the requested authentication mechanism to the key store. This
@@ -677,6 +857,32 @@ class BusAttachment : public MessageReceiver {
     QStatus GetSessionFd(SessionId sessionId, qcc::SocketFd& sockFd);
 
     /**
+     * Set the link timeout for a session.
+     *
+     * Link timeout is the maximum number of seconds that an unresponsive daemon-to-daemon connection
+     * will be monitored before declaring the session lost (via SessionLost callback). Link timeout
+     * defaults to 0 which indicates that AllJoyn link monitoring is disabled.
+     *
+     * Each transport type defines a lower bound on link timeout to avoid defeating transport
+     * specific power management algorithms.
+     *
+     * @param sessionid     Id of session whose link timeout will be modified.
+     * @param linkTimeout   [IN/OUT] Max number of seconds that a link can be unresponsive before being
+     *                      declared lost. 0 indicates that AllJoyn link monitoring will be disabled. On
+     *                      return, this value will be the resulting (possibly upward) adjusted linkTimeout
+     *                      value that acceptable to the underlying transport.
+     *
+     * @return
+     *      - #ER_OK if successful
+     *      - #ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NOT_SUPPORTED if local daemon does not support SetLinkTimeout
+     *      - #ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NO_DEST_SUPPORT if SetLinkTimeout not supported by destination
+     *      - #ER_BUS_NO_SESSION if the Session id is not valid
+     *      - #ER_ALLJOYN_SETLINKTIMEOUT_REPLY_FAILED if SetLinkTimeout failed
+     *      - #ER_BUS_NOT_CONNECTED if the BusAttachment is not connected to the daemon
+     */
+    QStatus SetLinkTimeout(SessionId sessionid, uint32_t& linkTimeout);
+
+    /**
      * Determine whether a given well-known name exists on the bus.
      * This method is a shortcut/helper that issues an org.freedesktop.DBus.NameHasOwner method call to the daemon
      * and interprets the response.
@@ -691,11 +897,14 @@ class BusAttachment : public MessageReceiver {
     QStatus NameHasOwner(const char* name, bool& hasOwner);
 
     /**
-     * Get the peer GUID for this peer or an authenticated remote peer. Peer GUIDs are used by the
+     * Get the peer GUID for this peer of the local peer or an authenticated remote peer. The bus
+     * names of a remote peer can change over time, specifically the unique name is different each
+     * time the peer connects to the bus and a peer may use different well-known-names at different
+     * times. The peer GUID is the only persistent identity for a peer. Peer GUIDs are used by the
      * authentication mechanisms to uniquely and identify a remote application instance. The peer
      * GUID for a remote peer is only available if the remote peer has been authenticated.
      *
-     * @param name  Name of a remote peer or NULL to get the local (our) peer GUID.
+     * @param name  Name of a remote peer or NULL to get the local (this application's) peer GUID.
      * @param guid  Returns the guid for the local or remote peer depending on the value of name.
      *
      * @return
@@ -786,8 +995,8 @@ class BusAttachment : public MessageReceiver {
      */
     BusAttachment(Internal* internal);
     /// @endcond
-  private:
 
+  private:
     /**
      * Assignment operator is private.
      */
@@ -796,16 +1005,47 @@ class BusAttachment : public MessageReceiver {
     /**
      * Copy constructor is private.
      */
-    BusAttachment(const BusAttachment& other) { }
+    BusAttachment(const BusAttachment& other) : joinObj(this) { }
 
     /**
-     * JoinSession method_reply handler. (Internal use only)
+     * Stop the bus, optionally blocking until all of the threads join
      */
-    void JoinSessionMethodCB(Message& message, void* context);
+    QStatus StopInternal(bool blockUntilStopped = true);
 
+    /**
+     * Wait until all of the threads have stopped (join).
+     */
+    void WaitStopInternal();
+
+#if defined(QCC_OS_ANDROID)
+    /**
+     * For Android, try different daemon options with the precedence of pre-installed Daemon > APK daemon > Bundled Daemon.
+     */
+    QStatus TryAlternativeDaemon(RemoteEndpoint** newep);
+#endif
+
+    /**
+     * Try connect to the daemon with the spec.
+     */
+    QStatus TryConnect(const char* connectSpec, RemoteEndpoint** newep);
+
+    qcc::String connectSpec;  /**< The connect spec used to connect to the bus */
+    bool hasStarted;          /**< Indicates if the bus has ever been started */
     bool isStarted;           /**< Indicates if the bus has been started */
     bool isStopping;          /**< Indicates Stop has been called */
     Internal* busInternal;    /**< Internal state information */
+
+    class JoinObj {
+      public:
+        JoinObj(BusAttachment* bus) : bus(bus) { }
+        ~JoinObj() {
+            bus->WaitStopInternal();
+        }
+      private:
+        BusAttachment* bus;
+    };
+
+    JoinObj joinObj;          /**< MUST BE LAST MEMBER. Ensure all threads are joined before BusAttachment destruction */
 };
 
 }

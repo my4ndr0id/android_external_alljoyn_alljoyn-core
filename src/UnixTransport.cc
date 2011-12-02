@@ -30,6 +30,11 @@
 #include <qcc/StringUtil.h>
 #include <qcc/Util.h>
 
+#include <sys/un.h>
+#if defined(QCC_OS_DARWIN)
+#include <sys/ucred.h>
+#endif
+
 #include <alljoyn/BusAttachment.h>
 
 #include "BusInternal.h"
@@ -55,6 +60,9 @@ class UnixEndpoint : public RemoteEndpoint {
         stream(sock)
     {
     }
+
+    /* Destructor */
+    virtual ~UnixEndpoint() { }
 
     /**
      * Set the user id of the endpoint.
@@ -144,50 +152,21 @@ QStatus UnixTransport::Stop(void)
     /*
      * Ask any running endpoints to shut down and exit their threads.
      */
-    m_endpointListLock.Lock();
-
-    /*
-     * Stop() and Join() may be called any number of times, but at least one
-     * call to Stop() must preceed any call to Join() if there are active
-     * endpoints.  The member variable m_stopping indicates we are in the
-     * transitional state where Stop() has been called but active endpoints
-     * still exist (have not exited yet).
-     */
-    if (m_endpointList.size()) {
-        m_stopping = true;
-    } else {
-        m_stopping = false;
-    }
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
+    m_stopping = true;
 
     for (vector<UnixEndpoint*>::iterator i = m_endpointList.begin(); i != m_endpointList.end(); ++i) {
         (*i)->Stop();
     }
 
-    m_endpointListLock.Unlock();
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
     return ER_OK;
 }
 
 QStatus UnixTransport::Join(void)
 {
-    /*
-     * Must have called Stop() to arrange for endpoints to exist or have never
-     * started any endpoints before doing this.
-     */
-    assert(m_running == false);
-
-    m_endpointListLock.Lock();
-
-    /*
-     * Stop() or Join() can be called multiple times, but at least one call to
-     * Stop() must preceed any call to Join().  If there are endpoints that we
-     * expect to exit as a result of a previous Stop(), then m_stopping will
-     * be set to true.  If there are endpoints, and m_stopping is not true
-     * we have a programming error (calling Join() before calling Stop()).
-     */
-    if (m_endpointList.size()) {
-        assert(m_stopping == true);
-    }
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
 
     /*
      * A call to Stop() above will ask all of the endpoints to stop.  We still
@@ -198,14 +177,12 @@ QStatus UnixTransport::Join(void)
      * exit.
      */
     while (m_endpointList.size() > 0) {
-        m_endpointListLock.Unlock();
+        m_endpointListLock.Unlock(MUTEX_CONTEXT);
         qcc::Sleep(50);
-        m_endpointListLock.Lock();
+        m_endpointListLock.Lock(MUTEX_CONTEXT);
     }
 
-    m_endpointListLock.Unlock();
-
-    m_stopping = false;
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
     return ER_OK;
 }
@@ -224,17 +201,15 @@ void UnixTransport::EndpointExit(RemoteEndpoint* ep)
     QCC_DbgTrace(("UnixTransport::EndpointExit()"));
 
     /* Remove thread from thread list */
-    m_endpointListLock.Lock();
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
     vector<UnixEndpoint*>::iterator i = find(m_endpointList.begin(), m_endpointList.end(), uep);
     if (i != m_endpointList.end()) {
         m_endpointList.erase(i);
     }
-    m_endpointListLock.Unlock();
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
     delete uep;
 }
-
-
 
 QStatus UnixTransport::NormalizeTransportSpec(const char* inSpec, qcc::String& outSpec, map<qcc::String, qcc::String>& argMap) const
 {
@@ -269,64 +244,16 @@ QStatus UnixTransport::NormalizeTransportSpec(const char* inSpec, qcc::String& o
     return status;
 }
 
-QStatus UnixTransport::Connect(const char* connectArgs, RemoteEndpoint** newep)
+static QStatus SendSocketCreds(SocketFd sockFd, uid_t uid, gid_t gid, pid_t pid)
 {
-    /*
-     * Parse and normalize the connectArgs.  For a client or service, there are
-     * no reasonable defaults and so the addr and port keys MUST be present or
-     * an error is returned.
-     */
-    QStatus status;
-    qcc::String normSpec;
-    map<qcc::String, qcc::String> argMap;
-    status = NormalizeTransportSpec(connectArgs, normSpec, argMap);
-    if (ER_OK != status) {
-        QCC_LogError(status, ("UnixTransport::Connect(): Invalid Unix connect spec \"%s\"", connectArgs));
-        return status;
-    }
-
-    /*
-     * Check to see if we are already connected to a remote endpoint identified
-     * by the address and port.  If we are we never duplicate the connection.
-     */
-    qcc::String& connectAddr = argMap["_spec"];
-    m_endpointListLock.Lock();
-    for (vector<UnixEndpoint*>::const_iterator i = m_endpointList.begin(); i != m_endpointList.end(); ++i) {
-        if (normSpec == (*i)->GetConnectSpec()) {
-            m_endpointListLock.Unlock();
-            return ER_BUS_ALREADY_CONNECTED;
-        }
-    }
-    m_endpointListLock.Unlock();
-
-    /*
-     * This is a new not previously satisfied connection request, so attempt
-     * to connect to the endpoint specified in the connectSpec.
-     */
-    SocketFd sockFd = -1;
-    status = Socket(QCC_AF_UNIX, QCC_SOCK_STREAM, sockFd);
-    if (status != ER_OK) {
-        QCC_LogError(status, ("UnixTransport(): socket Create() failed"));
-        return status;
-    }
-
-    /*
-     * Got a socket, now Connect() to the remote address and port.
-     */
-    bool isConnected = false;
-    status = qcc::Connect(sockFd, connectAddr.c_str());
-    if (status != ER_OK) {
-        QCC_LogError(status, ("UnixTransport(): socket Connect() failed"));
-        qcc::Close(sockFd);
-        return status;
-    }
-
-    isConnected = true;
-
+#if defined(QCC_OS_DARWIN)
+    // Socket credentials on Darwin are exchanged using getpeereid
+    return ER_OK;
+#else
     int enableCred = 1;
     int rc = setsockopt(sockFd, SOL_SOCKET, SO_PASSCRED, &enableCred, sizeof(enableCred));
     if (rc == -1) {
-        QCC_LogError(status, ("UnixTransport(): setsockopt(SO_PASSCRED) failed"));
+        QCC_LogError(ER_OS_ERROR, ("UnixTransport(): setsockopt(SO_PASSCRED) failed"));
         qcc::Close(sockFd);
         return ER_OS_ERROR;
     }
@@ -355,49 +282,128 @@ QStatus UnixTransport::Connect(const char* connectArgs, RemoteEndpoint** newep)
     cmsg->cmsg_type = SCM_CREDENTIALS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(struct ucred));
     cred = reinterpret_cast<struct ucred*>(CMSG_DATA(cmsg));
-    cred->uid = GetUid();
-    cred->gid = GetGid();
-    cred->pid = GetPid();
+    cred->uid = uid;
+    cred->gid = gid;
+    cred->pid = pid;
 
     QCC_DbgHLPrintf(("Sending UID: %u  GID: %u  PID %u", cred->uid, cred->gid, cred->pid));
 
-    UnixEndpoint* conn = NULL;
     ret = sendmsg(sockFd, &msg, 0);
-    if (ret == 1) {
-        conn = new UnixEndpoint(m_bus, false, normSpec, sockFd);
-        m_endpointListLock.Lock();
-        m_endpointList.push_back(conn);
-        m_endpointListLock.Unlock();
+    if (ret != 1) {
+        return ER_OS_ERROR;
+    }
 
-        /* Initialized the features for this endpoint */
-        conn->GetFeatures().isBusToBus = false;
-        conn->GetFeatures().allowRemote = m_bus.GetInternal().AllowRemoteMessages();
-        conn->GetFeatures().handlePassing = true;
+    /*
+     * If we don't disable this every read will have credentials which adds overhead if have
+     * enabled unix file descriptor passing.
+     */
+    int disableCred = 0;
+    rc = setsockopt(sockFd, SOL_SOCKET, SO_PASSCRED, &disableCred, sizeof(disableCred));
+    if (rc == -1) {
+        QCC_LogError(ER_OS_ERROR, ("UnixTransport(): setsockopt(SO_PASSCRED) failed"));
+    }
 
-        qcc::String authName;
-        status = conn->Establish("EXTERNAL", authName);
-        if (status == ER_OK) {
-            conn->SetListener(this);
-            status = conn->Start();
+    return ER_OK;
+#endif
+}
+
+QStatus UnixTransport::Connect(const char* connectArgs, const SessionOpts& opts, RemoteEndpoint** newep)
+{
+    /*
+     * Parse and normalize the connectArgs.  For a client or service, there are
+     * no reasonable defaults and so the addr and port keys MUST be present or
+     * an error is returned.
+     */
+    QStatus status;
+    qcc::String normSpec;
+    map<qcc::String, qcc::String> argMap;
+    status = UnixTransport::NormalizeTransportSpec(connectArgs, normSpec, argMap);
+    if (ER_OK != status) {
+        QCC_LogError(status, ("UnixTransport::Connect(): Invalid Unix connect spec \"%s\"", connectArgs));
+        return status;
+    }
+
+    /*
+     * Check to see if we are already connected to a remote endpoint identified
+     * by the address and port.  If we are we never duplicate the connection.
+     */
+    qcc::String& connectAddr = argMap["_spec"];
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
+    for (vector<UnixEndpoint*>::const_iterator i = m_endpointList.begin(); i != m_endpointList.end(); ++i) {
+        if (normSpec == (*i)->GetConnectSpec()) {
+            m_endpointListLock.Unlock(MUTEX_CONTEXT);
+            return ER_BUS_ALREADY_CONNECTED;
         }
+    }
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
 
-        /*
-         * We put the endpoint into our list of active endpoints to make life
-         * easier reporting problems up the chain of command behind the scenes
-         * if we got an error during the authentincation process and the endpoint
-         * startup.  If we did get an error, we need to remove the endpoint if it
-         * is still there and the endpoint exit callback didn't kill it.
-         */
-        if (status != ER_OK) {
-            QCC_LogError(status, ("UnixTransport::Connect(): Start UnixEndpoint failed"));
-            m_endpointListLock.Lock();
-            vector<UnixEndpoint*>::iterator i = find(m_endpointList.begin(), m_endpointList.end(), conn);
-            if (i != m_endpointList.end()) {
-                m_endpointList.erase(i);
+    /*
+     * This is a new not previously satisfied connection request, so attempt
+     * to connect to the endpoint specified in the connectSpec.
+     */
+    SocketFd sockFd = -1;
+    status = Socket(QCC_AF_UNIX, QCC_SOCK_STREAM, sockFd);
+    if (status != ER_OK) {
+        QCC_LogError(status, ("UnixTransport(): socket Create() failed"));
+        return status;
+    }
+
+    /*
+     * Got a socket, now Connect() to the remote address and port.
+     */
+    bool isConnected = false;
+    status = qcc::Connect(sockFd, connectAddr.c_str());
+    if (status != ER_OK) {
+        QCC_LogError(status, ("UnixTransport(): socket Connect() failed"));
+        qcc::Close(sockFd);
+        return status;
+    }
+
+    isConnected = true;
+
+    UnixEndpoint* conn = NULL;
+
+    status = SendSocketCreds(sockFd, GetUid(), GetGid(), GetPid());
+    if (status == ER_OK) {
+        m_endpointListLock.Lock(MUTEX_CONTEXT);
+        if (m_stopping) {
+            m_endpointListLock.Unlock(MUTEX_CONTEXT);
+            status = ER_BUS_TRANSPORT_NOT_STARTED;
+        } else {
+            conn = new UnixEndpoint(m_bus, false, normSpec, sockFd);
+            m_endpointList.push_back(conn);
+            m_endpointListLock.Unlock(MUTEX_CONTEXT);
+
+            /* Initialized the features for this endpoint */
+            conn->GetFeatures().isBusToBus = false;
+            conn->GetFeatures().allowRemote = m_bus.GetInternal().AllowRemoteMessages();
+            conn->GetFeatures().handlePassing = true;
+
+            qcc::String authName;
+            status = conn->Establish("EXTERNAL", authName);
+            if (status == ER_OK) {
+                conn->SetListener(this);
+                status = conn->Start();
             }
-            m_endpointListLock.Unlock();
-            delete conn;
-            conn = NULL;
+
+            /*
+             * We put the endpoint into our list of active endpoints to make life
+             * easier reporting problems up the chain of command behind the scenes
+             * if we got an error during the authentincation process and the endpoint
+             * startup.  If we did get an error, we need to remove the endpoint if it
+             * is still there and the endpoint exit callback didn't kill it.
+             */
+            if (status != ER_OK) {
+                QCC_LogError(status, ("UnixTransport::Connect(): Start UnixEndpoint failed"));
+                m_endpointListLock.Lock(MUTEX_CONTEXT);
+                vector<UnixEndpoint*>::iterator i = find(m_endpointList.begin(), m_endpointList.end(), conn);
+                if (i != m_endpointList.end()) {
+                    m_endpointList.erase(i);
+                }
+                m_endpointListLock.Unlock(MUTEX_CONTEXT);
+                delete conn;
+                conn = NULL;
+            }
         }
     }
 
@@ -417,15 +423,6 @@ QStatus UnixTransport::Connect(const char* connectArgs, RemoteEndpoint** newep)
             *newep = NULL;
         }
     } else {
-        /*
-         * If we don't disable this every read will have credentials which adds overhead if have
-         * enabled unix file descriptor passing.
-         */
-        int disableCred = 0;
-        rc = setsockopt(sockFd, SOL_SOCKET, SO_PASSCRED, &disableCred, sizeof(disableCred));
-        if (rc == -1) {
-            QCC_LogError(status, ("UnixTransport(): setsockopt(SO_PASSCRED) failed"));
-        }
         if (newep) {
             *newep = conn;
         }
@@ -445,7 +442,7 @@ QStatus UnixTransport::Disconnect(const char* connectSpec)
      */
     qcc::String normSpec;
     map<qcc::String, qcc::String> argMap;
-    QStatus status = NormalizeTransportSpec(connectSpec, normSpec, argMap);
+    QStatus status = UnixTransport::NormalizeTransportSpec(connectSpec, normSpec, argMap);
     if (ER_OK != status) {
         QCC_LogError(status, ("UnixTransport::Disconnect(): Invalid Unix connect spec \"%s\"", connectSpec));
         return status;
@@ -461,15 +458,15 @@ QStatus UnixTransport::Disconnect(const char* connectSpec)
      */
     status = ER_BUS_BAD_TRANSPORT_ARGS;
 
-    m_endpointListLock.Lock();
+    m_endpointListLock.Lock(MUTEX_CONTEXT);
     for (vector<UnixEndpoint*>::iterator i = m_endpointList.begin(); i != m_endpointList.end(); ++i) {
         if (normSpec == (*i)->GetConnectSpec()) {
             UnixEndpoint* ep = *i;
-            m_endpointListLock.Unlock();
+            m_endpointListLock.Unlock(MUTEX_CONTEXT);
             return ep->Stop();
         }
     }
-    m_endpointListLock.Unlock();
+    m_endpointListLock.Unlock(MUTEX_CONTEXT);
     return status;
 }
 

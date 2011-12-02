@@ -34,6 +34,7 @@
 #include "BusController.h"
 #include "BusEndpoint.h"
 #include "ConfigDB.h"
+#include "PermissionDB.h"
 #include "DaemonRouter.h"
 
 #define QCC_MODULE "ALLJOYN"
@@ -71,7 +72,7 @@ void DeferredMsg::ServiceStarted(const qcc::String& serviceName, QStatus result)
         BusEndpoint* destEndpoint(router.FindEndpoint(msg->GetSender()));
         qcc::String description("Failed to start service for bus name: ");
         description += msg->GetDestination();
-        msg->ErrorMsg("org.freedesktop.DBus.Error.ServiceUnknown", description.c_str());
+        msg->ErrorMsg(msg, "org.freedesktop.DBus.Error.ServiceUnknown", description.c_str());
         destEndpoint->PushMessage(msg);
     }
 
@@ -137,6 +138,7 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
 
     bool destinationEmpty = destination[0] == '\0';
     if (!destinationEmpty) {
+        nameTable.Lock();
         BusEndpoint* destEndpoint = nameTable.FindEndpoint(destination);
         if (destEndpoint) {
             if (destEndpoint != localEndpoint) {
@@ -180,10 +182,16 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                                        msg->GetSender(),
                                        destEndpoint->GetUniqueName().c_str(),
                                        msg->GetCallSerial()));
-                        msg->ErrorMsg("org.alljoyn.Bus.Blocked", "Method reply would be blocked because caller does not allow remote messages");
+                        msg->ErrorMsg(msg, "org.alljoyn.Bus.Blocked", "Method reply would be blocked because caller does not allow remote messages");
                         PushMessage(msg, *localEndpoint);
                     } else {
-                        status = SendThroughEndpoint(msg, *destEndpoint, sessionId);
+                        if (destEndpoint == localEndpoint) {
+                            nameTable.Unlock();
+                            status = SendThroughEndpoint(msg, *destEndpoint, sessionId);
+                            nameTable.Lock();
+                        } else {
+                            status = SendThroughEndpoint(msg, *destEndpoint, sessionId);
+                        }
                     }
                 } else {
                     QCC_DbgPrintf(("Blocking message from %s to %s (serial=%d) because receiver does not allow remote messages",
@@ -194,7 +202,7 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                     if (replyExpected) {
                         qcc::String description("Remote method calls blocked for bus name: ");
                         description += destination;
-                        msg->ErrorMsg("org.alljoyn.Bus.Blocked", description.c_str());
+                        msg->ErrorMsg(msg, "org.alljoyn.Bus.Blocked", description.c_str());
                         PushMessage(msg, *localEndpoint);
                     }
                 }
@@ -202,7 +210,9 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                     QCC_LogError(status, ("BusEndpoint::PushMessage failed"));
                 }
             }
+            nameTable.Unlock();
         } else {
+            nameTable.Unlock();
             if ((msg->GetFlags() & ALLJOYN_FLAG_AUTO_START) && (sender->GetEndpointType() != BusEndpoint::ENDPOINT_TYPE_BUS2BUS)) {
                 /* Need to auto start the service targeted by the message and postpone delivery of the message. */
                 Bus& bus(reinterpret_cast<Bus&>(msg->bus));
@@ -215,7 +225,7 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                 /* Need to let the sender know its reply message cannot be passed on. */
                 qcc::String description("Unknown bus name: ");
                 description += destination;
-                msg->ErrorMsg("org.freedesktop.DBus.Error.ServiceUnknown", description.c_str());
+                msg->ErrorMsg(msg, "org.freedesktop.DBus.Error.ServiceUnknown", description.c_str());
                 PushMessage(msg, *localEndpoint);
             } else {
                 QCC_LogError(ER_BUS_NO_ROUTE, ("Discarding %s no route to %s:%d", msg->Description().c_str(), destination, sessionId));
@@ -225,6 +235,7 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
 
     /* Forward broadcast to endpoints (local or remote) whose rules allow it */
     if ((destinationEmpty && (sessionId == 0)) || policydb->EavesdropEnabled()) {
+        nameTable.Lock();
         ruleTable.Lock();
         RuleIterator it = ruleTable.Begin();
         while (it != ruleTable.End()) {
@@ -275,37 +286,50 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
             }
         }
         ruleTable.Unlock();
+        nameTable.Unlock();
     }
 
     /* Send global broadcast to all busToBus endpoints that aren't the sender of the message */
     if (destinationEmpty && (sessionId == 0) && msg->IsGlobalBroadcast()) {
-        m_b2bEndpointsLock.Lock();
-        vector<RemoteEndpoint*>::const_iterator it = m_b2bEndpoints.begin();
+        m_b2bEndpointsLock.Lock(MUTEX_CONTEXT);
+        set<RemoteEndpoint*>::const_iterator it = m_b2bEndpoints.begin();
         while (it != m_b2bEndpoints.end()) {
             if ((*it) != &origSender) {
-                QStatus tStatus = SendThroughEndpoint(msg, **it, sessionId);
+                RemoteEndpoint* ep = *it;
+                m_b2bEndpointsLock.Unlock(MUTEX_CONTEXT);
+                QStatus tStatus = SendThroughEndpoint(msg, *ep, sessionId);
                 status = (status == ER_OK) ? tStatus : status;
+                m_b2bEndpointsLock.Lock(MUTEX_CONTEXT);
+                it = m_b2bEndpoints.lower_bound(ep);
             }
-            ++it;
+            if (it != m_b2bEndpoints.end()) {
+                ++it;
+            }
         }
-        m_b2bEndpointsLock.Unlock();
+        m_b2bEndpointsLock.Unlock(MUTEX_CONTEXT);
     }
 
     /* Send session multicast messages */
     if (destinationEmpty && (sessionId != 0)) {
-        sessionCastSetLock.Lock();
+        sessionCastSetLock.Lock(MUTEX_CONTEXT);
         RemoteEndpoint* lastB2b = NULL;
         SessionCastEntry sce(sessionId, msg->GetSender(), NULL, NULL);
         set<SessionCastEntry>::iterator sit = sessionCastSet.lower_bound(sce);
         while ((sit != sessionCastSet.end()) && (sit->id == sce.id) && (sit->src == sce.src)) {
             if (!sit->b2bEp || (sit->b2bEp != lastB2b)) {
+                lastB2b = sit->b2bEp;
+                SessionCastEntry entry = *sit;
+                sessionCastSetLock.Unlock(MUTEX_CONTEXT);
                 QStatus tStatus = SendThroughEndpoint(msg, *sit->destEp, sessionId);
                 status = (status == ER_OK) ? tStatus : status;
-                lastB2b = sit->b2bEp;
+                sessionCastSetLock.Lock(MUTEX_CONTEXT);
+                sit = sessionCastSet.lower_bound(entry);
             }
-            ++sit;
+            if (sit != sessionCastSet.end()) {
+                ++sit;
+            }
         }
-        sessionCastSetLock.Unlock();
+        sessionCastSetLock.Unlock(MUTEX_CONTEXT);
     }
     return status;
 }
@@ -320,20 +344,22 @@ BusEndpoint* DaemonRouter::FindEndpoint(const qcc::String& busName)
 {
     BusEndpoint* ep = nameTable.FindEndpoint(busName);
     if (!ep) {
-        m_b2bEndpointsLock.Lock();
-        for (vector<RemoteEndpoint*>::const_iterator it = m_b2bEndpoints.begin(); it != m_b2bEndpoints.end(); ++it) {
+        m_b2bEndpointsLock.Lock(MUTEX_CONTEXT);
+        for (set<RemoteEndpoint*>::const_iterator it = m_b2bEndpoints.begin(); it != m_b2bEndpoints.end(); ++it) {
             if ((*it)->GetUniqueName() == busName) {
                 ep = *it;
                 break;
             }
         }
-        m_b2bEndpointsLock.Unlock();
+        m_b2bEndpointsLock.Unlock(MUTEX_CONTEXT);
     }
     return ep;
 }
 
 QStatus DaemonRouter::RegisterEndpoint(BusEndpoint& endpoint, bool isLocal)
 {
+    QCC_DbgTrace(("DaemonRouter::RegisterEndpoint(%s, %s)", endpoint.GetUniqueName().c_str(), isLocal ? "true" : "false"));
+
     QStatus status = ER_OK;
 
     /* Keep track of local endpoint */
@@ -344,12 +370,23 @@ QStatus DaemonRouter::RegisterEndpoint(BusEndpoint& endpoint, bool isLocal)
     if (endpoint.GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_BUS2BUS) {
         /* AllJoynObj is in charge of managing bus-to-bus endpoints and their names */
         RemoteEndpoint* busToBusEndpoint = static_cast<RemoteEndpoint*>(&endpoint);
+
+        /*
+         * If the bus controller is NULL, it was either never set, or it has
+         * removed itself.  If gone at this point, we certainly can't call out
+         * to it.  Since it goes away here when the BusController is going away,
+         * it probably means we are about to stop.
+         */
+        if (busController == NULL) {
+            return ER_BUS_STOPPING;
+        }
+
         status = busController->GetAllJoynObj().AddBusToBusEndpoint(*busToBusEndpoint);
 
         /* Add to list of bus-to-bus endpoints */
-        m_b2bEndpointsLock.Lock();
-        m_b2bEndpoints.push_back(busToBusEndpoint);
-        m_b2bEndpointsLock.Unlock();
+        m_b2bEndpointsLock.Lock(MUTEX_CONTEXT);
+        m_b2bEndpoints.insert(busToBusEndpoint);
+        m_b2bEndpointsLock.Unlock(MUTEX_CONTEXT);
     } else {
         /* Bus-to-client endpoints appear directly on the bus */
         nameTable.AddUniqueName(endpoint);
@@ -369,13 +406,22 @@ void DaemonRouter::UnregisterEndpoint(BusEndpoint& endpoint)
 
     if (BusEndpoint::ENDPOINT_TYPE_BUS2BUS == endpoint.GetEndpointType()) {
         /* Inform bus controller of bus-to-bus endpoint removal */
-        assert(busController);
         RemoteEndpoint* busToBusEndpoint = static_cast<RemoteEndpoint*>(&endpoint);
-        busController->GetAllJoynObj().RemoveBusToBusEndpoint(*busToBusEndpoint);
+
+        /*
+         * If the bus controller is NULL, it was either never set, or it has
+         * removed itself.  If gone at this point, we certainly can't call out
+         * to it.  Since it goes away here when the BusController is going away,
+         * it probably means we are about to stop; but we'll continue to do as
+         * much local cleanup as we can here.
+         */
+        if (busController != NULL) {
+            busController->GetAllJoynObj().RemoveBusToBusEndpoint(*busToBusEndpoint);
+        }
 
         /* Remove the bus2bus endpoint from the list */
-        m_b2bEndpointsLock.Lock();
-        vector<RemoteEndpoint*>::iterator it = m_b2bEndpoints.begin();
+        m_b2bEndpointsLock.Lock(MUTEX_CONTEXT);
+        set<RemoteEndpoint*>::iterator it = m_b2bEndpoints.begin();
         while (it != m_b2bEndpoints.end()) {
             if (*it == busToBusEndpoint) {
                 m_b2bEndpoints.erase(it);
@@ -383,7 +429,19 @@ void DaemonRouter::UnregisterEndpoint(BusEndpoint& endpoint)
             }
             ++it;
         }
-        m_b2bEndpointsLock.Unlock();
+        m_b2bEndpointsLock.Unlock(MUTEX_CONTEXT);
+
+        /* Remove entries from sessionCastSet with same b2bEp */
+        sessionCastSetLock.Lock(MUTEX_CONTEXT);
+        set<SessionCastEntry>::iterator sit = sessionCastSet.begin();
+        while (sit != sessionCastSet.end()) {
+            set<SessionCastEntry>::iterator doomed = sit;
+            ++sit;
+            if (doomed->b2bEp == &endpoint) {
+                sessionCastSet.erase(doomed);
+            }
+        }
+        sessionCastSetLock.Unlock(MUTEX_CONTEXT);
     } else {
         /* Remove any session routes */
         qcc::String uniqueName = endpoint.GetUniqueName();
@@ -392,6 +450,7 @@ void DaemonRouter::UnregisterEndpoint(BusEndpoint& endpoint)
         /* Remove endpoint from names and rules */
         nameTable.RemoveUniqueName(uniqueName);
         RemoveAllRules(endpoint);
+        GetPermissionDB().RemovePermissionCache(endpoint);
     }
 
     /* Unregister static endpoints */
@@ -400,73 +459,111 @@ void DaemonRouter::UnregisterEndpoint(BusEndpoint& endpoint)
     }
 }
 
-QStatus DaemonRouter::AddSessionRoute(const char* src, SessionId id, BusEndpoint& destEp, RemoteEndpoint*& b2bEp, SessionOpts* optsHint)
+QStatus DaemonRouter::AddSessionRoute(SessionId id, BusEndpoint& srcEp, RemoteEndpoint* srcB2bEp, BusEndpoint& destEp, RemoteEndpoint*& destB2bEp, SessionOpts* optsHint)
 {
+    QCC_DbgTrace(("DaemonRouter::AddSessionRoute(%u, %s, %s, %s, %s, %s)", id, srcEp.GetUniqueName().c_str(), srcB2bEp ? srcB2bEp->GetUniqueName().c_str() : "<none>", destEp.GetUniqueName().c_str(), destB2bEp ? destB2bEp->GetUniqueName().c_str() : "<none>", optsHint ? "opts" : "NULL"));
+
     QStatus status = ER_OK;
     if (id == 0) {
-        status = ER_BUS_NO_SESSION;
-    } else if (destEp.GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL) {
-        if (b2bEp) {
-            status = static_cast<VirtualEndpoint&>(destEp).AddSessionRef(id, *b2bEp);
+        return ER_BUS_NO_SESSION;
+    }
+
+    if (destEp.GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL) {
+        if (destB2bEp) {
+            status = static_cast<VirtualEndpoint&>(destEp).AddSessionRef(id, *destB2bEp);
         } else if (optsHint) {
-            status = static_cast<VirtualEndpoint&>(destEp).AddSessionRef(id, optsHint, b2bEp);
+            status = static_cast<VirtualEndpoint&>(destEp).AddSessionRef(id, optsHint, destB2bEp);
+        } else {
+            status = ER_BUS_NO_SESSION;
+        }
+        if (status != ER_OK) {
+            QCC_LogError(status, ("AddSessionRef(this=%s, %u, %s%s) failed", destEp.GetUniqueName().c_str(),
+                                  id, destB2bEp ? "" : "opts, ", destB2bEp ? destB2bEp->GetUniqueName().c_str() : "NULL"));
         }
     }
 
+    if ((status == ER_OK) && srcB2bEp) {
+        status = static_cast<VirtualEndpoint&>(srcEp).AddSessionRef(id, *srcB2bEp);
+        if (status != ER_OK) {
+            QCC_LogError(status, ("AddSessionRef(this=%s, %u, %s) failed", srcEp.GetUniqueName().c_str(), id, srcB2bEp->GetUniqueName().c_str()));
+            static_cast<VirtualEndpoint&>(destEp).RemoveSessionRef(id);
+        }
+    }
+
+    /* Add sessionCast entries */
     if (status == ER_OK) {
-        String srcStr = src;
-        sessionCastSetLock.Lock();
-        sessionCastSet.insert(SessionCastEntry(id, srcStr, b2bEp, &destEp));
-        sessionCastSetLock.Unlock();
+        sessionCastSetLock.Lock(MUTEX_CONTEXT);
+        SessionCastEntry entry(id, srcEp.GetUniqueName(), destB2bEp, &destEp);
+        sessionCastSet.insert(entry);
+        SessionCastEntry entry2(id, destEp.GetUniqueName(), srcB2bEp, &srcEp);
+        sessionCastSet.insert(entry2);
+        sessionCastSetLock.Unlock(MUTEX_CONTEXT);
     }
     return status;
 }
 
-QStatus DaemonRouter::RemoveSessionRoute(const char* src, SessionId id, BusEndpoint& destEp)
+QStatus DaemonRouter::RemoveSessionRoute(SessionId id, BusEndpoint& srcEp, BusEndpoint& destEp)
 {
     QStatus status = ER_OK;
-    RemoteEndpoint*b2bEp = NULL;
+    RemoteEndpoint* srcB2bEp = NULL;
+    RemoteEndpoint* destB2bEp = NULL;
     if (id == 0) {
-        status = ER_BUS_NO_SESSION;
-    } else if (destEp.GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL) {
-        VirtualEndpoint& vDestEp = static_cast<VirtualEndpoint&>(destEp);
-        b2bEp = vDestEp.GetBusToBusEndpoint(id);
-        vDestEp.RemoveSessionRef(id);
+        return ER_BUS_NO_SESSION;
     }
 
+    /* Update virtual endpoint state */
+    if (destEp.GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL) {
+        VirtualEndpoint& vDestEp = static_cast<VirtualEndpoint&>(destEp);
+        destB2bEp = vDestEp.GetBusToBusEndpoint(id);
+        vDestEp.RemoveSessionRef(id);
+    }
+    if (srcEp.GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL) {
+        VirtualEndpoint& vSrcEp = static_cast<VirtualEndpoint&>(srcEp);
+        srcB2bEp = vSrcEp.GetBusToBusEndpoint(id);
+        vSrcEp.RemoveSessionRef(id);
+    }
+
+    /* Remove entries from sessionCastSet */
     if (status == ER_OK) {
-        String srcStr = src;
-        sessionCastSetLock.Lock();
-        set<SessionCastEntry>::iterator it = sessionCastSet.find(SessionCastEntry(id, srcStr, b2bEp, &destEp));
+        sessionCastSetLock.Lock(MUTEX_CONTEXT);
+        SessionCastEntry entry(id, srcEp.GetUniqueName(), destB2bEp, &destEp);
+        set<SessionCastEntry>::iterator it = sessionCastSet.find(entry);
         if (it != sessionCastSet.end()) {
             sessionCastSet.erase(it);
         }
-        sessionCastSetLock.Unlock();
+
+        SessionCastEntry entry2(id, destEp.GetUniqueName(), srcB2bEp, &srcEp);
+        set<SessionCastEntry>::iterator it2 = sessionCastSet.find(entry2);
+        if (it2 != sessionCastSet.end()) {
+            sessionCastSet.erase(it2);
+        }
+        sessionCastSetLock.Unlock(MUTEX_CONTEXT);
     }
     return status;
 }
 
 void DaemonRouter::RemoveSessionRoutes(const char* src, SessionId id)
 {
-    BusEndpoint* ep = FindEndpoint(src);
+    String srcStr = src;
+    BusEndpoint* ep = FindEndpoint(srcStr);
     if (!ep) {
         QCC_LogError(ER_BUS_NO_ENDPOINT, ("Cannot find %s", src));
+        return;
     }
 
-    sessionCastSetLock.Lock();
-    String srcStr = src;
+    sessionCastSetLock.Lock(MUTEX_CONTEXT);
     set<SessionCastEntry>::iterator it = sessionCastSet.begin();
     while (it != sessionCastSet.end()) {
         if (((it->id == id) || (id == 0)) && ((it->src == src) || (it->destEp == ep))) {
-            if ((id != 0) && (it->destEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL)) {
-                static_cast<VirtualEndpoint*>(it->destEp)->RemoveSessionRef(id);
+            if ((it->id != 0) && (it->destEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL)) {
+                static_cast<VirtualEndpoint*>(it->destEp)->RemoveSessionRef(it->id);
             }
             sessionCastSet.erase(it++);
         } else {
             ++it;
         }
     }
-    sessionCastSetLock.Unlock();
+    sessionCastSetLock.Unlock(MUTEX_CONTEXT);
 }
 
 }

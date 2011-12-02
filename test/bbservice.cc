@@ -68,16 +68,13 @@ static BusAttachment* g_msgBus = NULL;
 static String g_wellKnownName = ::org::alljoyn::alljoyn_test::DefaultWellKnownName;
 static bool g_echo_signal = false;
 static bool g_compress = false;
+static uint32_t keyExpiration = 0xFFFFFFFF;
 
-/** Signal handler */
+static volatile sig_atomic_t g_interrupt = false;
+
 static void SigIntHandler(int sig)
 {
-    if (NULL != g_msgBus) {
-        QStatus status = g_msgBus->Stop(false);
-        if (ER_OK != status) {
-            QCC_LogError(status, ("BusAttachment::Stop() failed"));
-        }
-    }
+    g_interrupt = true;
 }
 
 static const char x509certChain[] = {
@@ -151,6 +148,10 @@ class MyAuthListener : public AuthListener {
         qcc::String guid;
         g_msgBus->GetPeerGUID(authPeer, guid);
         printf("Peer guid %s\n", guid.c_str());
+
+        if (keyExpiration != 0xFFFFFFFF) {
+            creds.SetExpiration(keyExpiration);
+        }
 
         if (strcmp(authMechanism, "ALLJOYN_SRP_KEYX") == 0) {
             if (credMask & AuthListener::CRED_PASSWORD) {
@@ -230,7 +231,7 @@ class MyAuthListener : public AuthListener {
 
 };
 
-class MyBusListener : public BusListener, public SessionPortListener, public SessionListener {
+class MyBusListener : public SessionPortListener, public SessionListener {
 
   public:
     MyBusListener(BusAttachment& bus, const SessionOpts& opts) : bus(bus), opts(opts) { }
@@ -256,15 +257,26 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
 
     void SessionJoined(SessionPort sessionPort, SessionId sessionId, const char* joiner)
     {
-        QCC_SyncPrintf("Session Established: joiner=%s, sessionId=%d\n", joiner, sessionId);
+        QCC_SyncPrintf("Session Established: joiner=%s, sessionId=%08x\n", joiner, sessionId);
         QStatus status = bus.SetSessionListener(sessionId, this);
         if (status != ER_OK) {
             QCC_LogError(status, ("SetSessionListener failed"));
+            return;
+        }
+
+        /* Set the link timeout */
+        uint32_t timeout = 10;
+        status = bus.SetLinkTimeout(sessionId, timeout);
+        if (status == ER_OK) {
+            QCC_SyncPrintf("Link timeout was successfully set to %d\n", timeout);
+        } else {
+            QCC_LogError(status, ("SetLinkTimeout failed"));
+            return;
         }
     }
 
     void SessionLost(SessionId sessionId) {
-        QCC_SyncPrintf("SessionLost(%u) was called\n", sessionId);
+        QCC_SyncPrintf("SessionLost(%08x) was called\n", sessionId);
     }
 
   private:
@@ -293,9 +305,9 @@ class LocalTestObject : public BusObject {
             GetTimeNow(&future);
             future += delay;
             DelayedResponseInfo* respInfo = new DelayedResponseInfo(msg, args, argCount);
-            delayedResponseLock.Lock();
+            delayedResponseLock.Lock(MUTEX_CONTEXT);
             delayedResponses.insert(pair<uint64_t, DelayedResponseInfo*>(future.GetAbsoluteMillis(), respInfo));
-            delayedResponseLock.Unlock();
+            delayedResponseLock.Unlock(MUTEX_CONTEXT);
 
             if (!thread) {
                 thread = new DelayedResponse(lto);
@@ -309,18 +321,18 @@ class LocalTestObject : public BusObject {
       protected:
         ThreadReturn STDCALL Run(void* arg)
         {
-            delayedResponseLock.Lock();
+            delayedResponseLock.Lock(MUTEX_CONTEXT);
             bool done = delayedResponses.empty();
-            delayedResponseLock.Unlock();
+            delayedResponseLock.Unlock(MUTEX_CONTEXT);
 
             while (!done) {
-                delayedResponseLock.Lock();
+                delayedResponseLock.Lock(MUTEX_CONTEXT);
                 Timespec now;
                 GetTimeNow(&now);
                 uint64_t nowms = now.GetAbsoluteMillis();
                 multimap<uint64_t, DelayedResponseInfo*>::iterator it = delayedResponses.begin();
                 uint64_t nextms = it->first;
-                delayedResponseLock.Unlock();
+                delayedResponseLock.Unlock(MUTEX_CONTEXT);
 
                 if (nextms > nowms) {
                     uint64_t delay = nextms - nowms;
@@ -330,7 +342,7 @@ class LocalTestObject : public BusObject {
                     qcc::Sleep(static_cast<uint32_t>(delay));
                 }
 
-                delayedResponseLock.Lock();
+                delayedResponseLock.Lock(MUTEX_CONTEXT);
                 GetTimeNow(&now);
                 nowms = now.GetAbsoluteMillis();
                 while ((it != delayedResponses.end()) && (nextms <= nowms)) {
@@ -340,18 +352,18 @@ class LocalTestObject : public BusObject {
                     delete it->second;
                     delayedResponses.erase(it);
                     it = delayedResponses.begin();
-                    delayedResponseLock.Unlock();
+                    delayedResponseLock.Unlock(MUTEX_CONTEXT);
                     QStatus status = lto.WrappedReply(msg, args, argCount);
                     if (ER_OK != status) {
                         QCC_LogError(status, ("Error sending delayed response"));
                     }
                     delete [] args;
-                    delayedResponseLock.Lock();
+                    delayedResponseLock.Lock(MUTEX_CONTEXT);
                 }
                 if (it == delayedResponses.end()) {
                     done = true;
                 }
-                delayedResponseLock.Unlock();
+                delayedResponseLock.Unlock(MUTEX_CONTEXT);
             }
 
             return static_cast<ThreadReturn>(0);
@@ -567,15 +579,17 @@ static void usage(void)
 {
     printf("Usage: bbservice [-h <name>] [-m] [-e] [-x] [-i #] [-n <name>] [-b] [t] [-l]\n\n");
     printf("Options:\n");
-    printf("   -h         = Print this help message\n");
-    printf("   -m         = Session is a multi-point session\n");
-    printf("   -e         = Echo received signals back to sender\n");
-    printf("   -x         = Compress signals echoed back to sender\n");
-    printf("   -i #       = Signal report interval (number of signals rx per update; default = 1000)\n");
-    printf("   -n <name>  = Well-known name to advertise\n");
-    printf("   -b         = Advertise over Bluetooth (enables selective advertising)\n");
-    printf("   -t         = Advertise over TCP (enables selective advertising)\n");
-    printf("   -l         = Advertise locally (enables selective advertising)\n");
+    printf("   -h                    = Print this help message\n");
+    printf("   -k <key store name>   = The key store file name\n");
+    printf("   -kx #                 = Authentication key expiration (seconds)\n");
+    printf("   -m                    = Session is a multi-point session\n");
+    printf("   -e                    = Echo received signals back to sender\n");
+    printf("   -x                    = Compress signals echoed back to sender\n");
+    printf("   -i #                  = Signal report interval (number of signals rx per update; default = 1000)\n");
+    printf("   -n <well-known name>  = Well-known name to advertise\n");
+    printf("   -b                    = Advertise over Bluetooth (enables selective advertising)\n");
+    printf("   -t                    = Advertise over TCP (enables selective advertising)\n");
+    printf("   -l                    = Advertise locally (enables selective advertising)\n");
 }
 
 /** Main entry point */
@@ -583,7 +597,7 @@ int main(int argc, char** argv)
 {
     QStatus status = ER_OK;
     unsigned long reportInterval = 1000;
-    qcc::String listenSpec;
+    const char* keyStore = NULL;
     SessionOpts opts(SessionOpts::TRAFFIC_MESSAGES, false, SessionOpts::PROXIMITY_ANY, TRANSPORT_NONE);
 
 #ifdef _WIN32
@@ -624,6 +638,24 @@ int main(int argc, char** argv)
                 exit(1);
             } else {
                 g_wellKnownName = argv[i];
+            }
+        } else if (0 == strcmp("-k", argv[i])) {
+            ++i;
+            if (i == argc) {
+                printf("option %s requires a parameter\n", argv[i - 1]);
+                usage();
+                exit(1);
+            } else {
+                keyStore = argv[i];
+            }
+        } else if (0 == strcmp("-kx", argv[i])) {
+            ++i;
+            if (i == argc) {
+                printf("option %s requires a parameter\n", argv[i - 1]);
+                usage();
+                exit(1);
+            } else {
+                keyExpiration = strtoul(argv[i], NULL, 10);
             }
         } else if (0 == strcmp("-m", argv[i])) {
             opts.isMultipoint = true;
@@ -693,44 +725,43 @@ int main(int argc, char** argv)
         status = g_msgBus->Start();
     } else {
         QCC_LogError(status, ("BusAttachment::Start failed"));
+        exit(1);
+    }
+
+    /* Create a bus listener to be used to accept incoming session requests */
+    MyBusListener* myBusListener = new MyBusListener(*g_msgBus, opts);
+
+    /* Register local objects and connect to the daemon */
+    LocalTestObject testObj(*g_msgBus, ::org::alljoyn::alljoyn_test::ObjectPath, reportInterval, opts);
+    g_msgBus->RegisterBusObject(testObj);
+
+
+    g_msgBus->EnablePeerSecurity("ALLJOYN_SRP_KEYX ALLJOYN_RSA_KEYX ALLJOYN_SRP_LOGON", new MyAuthListener(), keyStore, keyStore != NULL);
+    /*
+     * Pre-compute logon entry for user sleepy
+     */
+    g_msgBus->AddLogonEntry("ALLJOYN_SRP_LOGON", "sleepy", "123456");
+
+    /* Connect to the daemon */
+    status = g_msgBus->Connect(clientArgs.c_str());
+    if (ER_OK == status) {
+        /* Bind a well-known session port for incoming client connections */
+        SessionPort sessionPort = ::org::alljoyn::alljoyn_test::SessionPort;
+        status = g_msgBus->BindSessionPort(sessionPort, opts, *myBusListener);
+        if (status != ER_OK) {
+            QCC_LogError(status, ("BindSessionPort failed"));
+        }
+    } else {
+        QCC_LogError(status, ("Failed to connect to \"%s\"", clientArgs.c_str()));
     }
 
     if (ER_OK == status) {
-        /* Create a bus listener to be used to accept incoming session requests */
-        MyBusListener* myBusListener = new MyBusListener(*g_msgBus, opts);
-        g_msgBus->RegisterBusListener(*myBusListener);
-
-        /* Register local objects and connect to the daemon */
-        LocalTestObject testObj(*g_msgBus, ::org::alljoyn::alljoyn_test::ObjectPath, reportInterval, opts);
-        g_msgBus->RegisterBusObject(testObj);
-
-
-        g_msgBus->EnablePeerSecurity("ALLJOYN_SRP_KEYX ALLJOYN_RSA_KEYX ALLJOYN_SRP_LOGON", new MyAuthListener());
-        /*
-         * Pre-compute logon entry for user sleepy
-         */
-        g_msgBus->AddLogonEntry("ALLJOYN_SRP_LOGON", "sleepy", "123456");
-
-        /* Connect to the daemon */
-        status = g_msgBus->Connect(clientArgs.c_str());
-        if (ER_OK == status) {
-            /* Bind a well-known session port for incoming client connections */
-            SessionPort sessionPort = ::org::alljoyn::alljoyn_test::SessionPort;
-            status = g_msgBus->BindSessionPort(sessionPort, opts, *myBusListener);
-            if (status != ER_OK) {
-                QCC_LogError(status, ("BindSessionPort failed"));
-            }
-
-            /* Wait until bus is stopped */
-            if (status == ER_OK) {
-                g_msgBus->WaitStop();
-            }
-        } else {
-            QCC_LogError(status, ("Failed to connect to \"%s\"", clientArgs.c_str()));
+        while (g_interrupt == false) {
+            qcc::Sleep(100);
         }
-        /* Unregister the bus object */
-        g_msgBus->UnregisterBusObject(testObj);
     }
+
+    g_msgBus->UnregisterBusObject(testObj);
 
     /* Clean up msg bus */
     BusAttachment* deleteMe = g_msgBus;

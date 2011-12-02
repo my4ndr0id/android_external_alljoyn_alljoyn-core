@@ -68,8 +68,11 @@ const char* InterfaceName = "org.alljoyn.alljoyn_test.values";
 static BusAttachment* g_msgBus = NULL;
 static Event g_discoverEvent;
 static String g_wellKnownName = ::org::alljoyn::alljoyn_test::DefaultWellKnownName;
-static uint32_t startTime = 0;
-static uint32_t endTime = 0;
+static uint32_t findStartTime = 0;
+static uint32_t findEndTime = 0;
+static uint32_t joinStartTime = 0;
+static uint32_t joinEndTime = 0;
+static uint32_t keyExpiration = 0xFFFFFFFF;
 
 /** AllJoynListener receives discovery events from AllJoyn */
 class MyBusListener : public BusListener, public SessionListener {
@@ -79,8 +82,8 @@ class MyBusListener : public BusListener, public SessionListener {
 
     void FoundAdvertisedName(const char* name, TransportMask transport, const char* namePrefix)
     {
-        endTime = GetTimestamp();
-        QCC_SyncPrintf("FindAdvertisedName takes %d ms \n", (endTime - startTime));
+        findEndTime = GetTimestamp();
+        QCC_SyncPrintf("FindAdvertisedName 0x%x takes %d ms \n", transport, (findEndTime - findStartTime));
         QCC_SyncPrintf("FoundAdvertisedName(name=%s, transport=0x%x, prefix=%s)\n", name, transport, namePrefix);
 
         if (0 == ::strcmp(name, g_wellKnownName.c_str())) {
@@ -95,7 +98,7 @@ class MyBusListener : public BusListener, public SessionListener {
                 }
             }
 
-            startTime = GetTimestamp();
+            joinStartTime = GetTimestamp();
 
             status = g_msgBus->JoinSession(name, ::org::alljoyn::alljoyn_test::SessionPort, this, sessionId, opts);
             if (ER_OK != status) {
@@ -104,17 +107,17 @@ class MyBusListener : public BusListener, public SessionListener {
 
             /* Release the main thread */
             if (ER_OK == status) {
-                endTime = GetTimestamp();
-                QCC_SyncPrintf("JoinSession takes %d ms \n", (endTime - startTime));
+                joinEndTime = GetTimestamp();
+                QCC_SyncPrintf("JoinSession 0x%x takes %d ms \n", transport, (joinEndTime - joinStartTime));
 
                 g_discoverEvent.SetEvent();
             }
         }
     }
 
-    void LostAdvertisedName(const char* name, const char* guid, const char* prefix, const char* busAddress)
+    void LostAdvertisedName(const char* name, TransportMask transport, const char* prefix)
     {
-        QCC_SyncPrintf("LostAdvertisedName(name=%s, guid=%s, prefix=%s, addr=%s)\n", name, guid, prefix, busAddress);
+        QCC_SyncPrintf("LostAdvertisedName(name=%s, transport=0x%x, prefix=%s)\n", name, transport, prefix);
     }
 
     void NameOwnerChanged(const char* name, const char* previousOwner, const char* newOwner)
@@ -126,7 +129,7 @@ class MyBusListener : public BusListener, public SessionListener {
     }
 
     void SessionLost(SessionId sessionId) {
-        QCC_SyncPrintf("SessionLost(%u) was called\n", sessionId);
+        QCC_SyncPrintf("SessionLost(%08x) was called\n", sessionId);
         exit(1);
     }
 
@@ -140,15 +143,11 @@ class MyBusListener : public BusListener, public SessionListener {
 /** Static bus listener */
 static MyBusListener* g_busListener;
 
-/** Signal handler */
+static volatile sig_atomic_t g_interrupt = false;
+
 static void SigIntHandler(int sig)
 {
-    if (NULL != g_msgBus) {
-        QStatus status = g_msgBus->Stop(false);
-        if (ER_OK != status) {
-            QCC_LogError(status, ("BusAttachment::Stop() failed"));
-        }
-    }
+    g_interrupt = true;
 }
 
 static void usage(void)
@@ -156,13 +155,14 @@ static void usage(void)
     printf("Usage: bbclient [-h] [-c <count>] [-i] [-e] [-r #] [-l | -la | -d[s]] [-n <well-known name>] [-t[a] <delay> [<interval>] | -rt]\n\n");
     printf("Options:\n");
     printf("   -h                    = Print this help message\n");
+    printf("   -k <key store name>   = The key store file name\n");
     printf("   -c <count>            = Number of pings to send to the server\n");
     printf("   -i                    = Use introspection to discover remote interfaces\n");
     printf("   -e[k] [RSA|SRP]       = Encrypt the test interface using specified auth mechanism, -ek means clear keys\n");
     printf("   -a #                  = Max authentication attempts\n");
+    printf("   -kx #                 = Authentication key expiration (seconds)\n");
     printf("   -r #                  = AllJoyn attachment restart count\n");
     printf("   -l                    = launch bbservice if not already running\n");
-    printf("   -la                   = launch bbservice if not already running using auto-launch\n");
     printf("   -n <well-known name>  = Well-known bus name advertised by bbservice\n");
     printf("   -d                    = discover remote bus with test service\n");
     printf("   -ds                   = discover remote bus with test service and cancel discover when found\n");
@@ -170,7 +170,7 @@ static void usage(void)
     printf("   -ta                   = Like -t except calls asynchronously\n");
     printf("   -rt [run time]        = Round trip timer (optional run time in ms)\n");
     printf("   -w                    = Don't wait for service\n");
-    printf("   -s                    = Call BusAttachment::WaitStop before exiting");
+    printf("   -s                    = Wait for SIGINT (Control-C) at the end of the tests\n");
     printf("\n");
 }
 
@@ -229,6 +229,10 @@ class MyAuthListener : public AuthListener {
         qcc::String guid;
         g_msgBus->GetPeerGUID(authPeer, guid);
         printf("Peer guid %s\n", guid.c_str());
+
+        if (keyExpiration != 0xFFFFFFFF) {
+            creds.SetExpiration(keyExpiration);
+        }
 
         if (strcmp(authMechanism, "ALLJOYN_SRP_KEYX") == 0) {
             if (credMask & AuthListener::CRED_PASSWORD) {
@@ -331,20 +335,20 @@ int main(int argc, char** argv)
     qcc::String authMechs;
     qcc::String pbusConnect;
     qcc::String userId;
+    const char* keyStore = NULL;
     unsigned long pingCount = 1;
     unsigned long repCount = 1;
     unsigned long authCount = 1000;
     uint64_t runTime = 0;
     Environ* env;
     bool startService = false;
-    bool autoStartService = false;
     bool discoverRemote = false;
     bool stopDiscover = false;
     bool waitForService = true;
     bool asyncPing = false;
     uint32_t pingDelay = 0;
     uint32_t pingInterval = 0;
-    bool waitStop = false;
+    bool waitForSigint = false;
     bool roundtrip = false;
 
 #ifdef _WIN32
@@ -395,6 +399,24 @@ int main(int argc, char** argv)
                 usage();
                 exit(1);
             }
+        } else if (0 == strcmp("-k", argv[i])) {
+            ++i;
+            if (i == argc) {
+                printf("option %s requires a parameter\n", argv[i - 1]);
+                usage();
+                exit(1);
+            } else {
+                keyStore = argv[i];
+            }
+        } else if (0 == strcmp("-kx", argv[i])) {
+            ++i;
+            if (i == argc) {
+                printf("option %s requires a parameter\n", argv[i - 1]);
+                usage();
+                exit(1);
+            } else {
+                keyExpiration = strtoul(argv[i], NULL, 10);
+            }
         } else if (0 == strcmp("-a", argv[i])) {
             ++i;
             if (i == argc) {
@@ -436,8 +458,6 @@ int main(int argc, char** argv)
             exit(0);
         } else if (0 == strcmp("-l", argv[i])) {
             startService = true;
-        } else if (0 == strcmp("-la", argv[i])) {
-            autoStartService = true;
         } else if (0 == strcmp("-d", argv[i])) {
             discoverRemote = true;
         } else if (0 == strcmp("-ds", argv[i])) {
@@ -474,7 +494,7 @@ int main(int argc, char** argv)
                 pingCount = 1000;
             }
         } else if (0 == strcmp("-s", argv[i])) {
-            waitStop = true;
+            waitForSigint = true;
         } else {
             status = ER_FAIL;
             printf("Unknown option %s\n", argv[i]);
@@ -492,47 +512,7 @@ int main(int argc, char** argv)
     qcc::String connectArgs = env->Find("BUS_ADDRESS", "unix:abstract=alljoyn");
 #endif
 
-    /* Create message bus */
-    g_msgBus = new BusAttachment("bbclient", true);
-
-    if (!useIntrospection) {
-        /* Add org.alljoyn.alljoyn_test interface */
-        InterfaceDescription* testIntf = NULL;
-        status = g_msgBus->CreateInterface(::org::alljoyn::alljoyn_test::InterfaceName, testIntf, encryptIfc);
-        if ((ER_OK == status) && testIntf) {
-            testIntf->AddSignal("my_signal", NULL, NULL, 0);
-            testIntf->AddMethod("my_ping", "s", "s", "outStr,inStr", 0);
-            testIntf->AddMethod("delayed_ping", "su", "s", "outStr,delay,inStr", 0);
-            testIntf->AddMethod("time_ping", "uq", "uq", NULL, 0);
-            testIntf->Activate();
-        } else {
-            if (ER_OK == status) status = ER_FAIL;
-            QCC_LogError(status, ("Failed to create interface \"%s\"", ::org::alljoyn::alljoyn_test::InterfaceName));
-        }
-
-        if (ER_OK == status) {
-            /* Add org.alljoyn.alljoyn_test.values interface */
-            InterfaceDescription* valuesIntf = NULL;
-            status = g_msgBus->CreateInterface(::org::alljoyn::alljoyn_test::values::InterfaceName, valuesIntf, encryptIfc);
-            if ((ER_OK == status) && valuesIntf) {
-                valuesIntf->AddProperty("int_val", "i", PROP_ACCESS_RW);
-                valuesIntf->AddProperty("str_val", "s", PROP_ACCESS_RW);
-                valuesIntf->AddProperty("ro_str", "s", PROP_ACCESS_READ);
-                valuesIntf->Activate();
-            } else {
-                if (ER_OK == status) status = ER_FAIL;
-                QCC_LogError(status, ("Failed to create interface \"%s\"", ::org::alljoyn::alljoyn_test::values::InterfaceName));
-            }
-        }
-    }
-
-    /* Register a bus listener in order to get discovery indications */
-    if (ER_OK == status) {
-        g_busListener = new MyBusListener(stopDiscover);
-        g_msgBus->RegisterBusListener(*g_busListener);
-    }
-
-    for (unsigned long i = 0; i < repCount; i++) {
+    for (unsigned long i = 0; i < repCount && !g_interrupt; i++) {
         unsigned long pings;
         if (runTime > 0) {
             pings = 1;
@@ -541,12 +521,52 @@ int main(int argc, char** argv)
             pings = pingCount;
         }
 
+        /* Create message bus */
+        g_msgBus = new BusAttachment("bbclient", true);
+
+        if (!useIntrospection) {
+            /* Add org.alljoyn.alljoyn_test interface */
+            InterfaceDescription* testIntf = NULL;
+            status = g_msgBus->CreateInterface(::org::alljoyn::alljoyn_test::InterfaceName, testIntf, encryptIfc);
+            if ((ER_OK == status) && testIntf) {
+                testIntf->AddSignal("my_signal", NULL, NULL, 0);
+                testIntf->AddMethod("my_ping", "s", "s", "outStr,inStr", 0);
+                testIntf->AddMethod("delayed_ping", "su", "s", "outStr,delay,inStr", 0);
+                testIntf->AddMethod("time_ping", "uq", "uq", NULL, 0);
+                testIntf->Activate();
+            } else {
+                if (ER_OK == status) status = ER_FAIL;
+                QCC_LogError(status, ("Failed to create interface \"%s\"", ::org::alljoyn::alljoyn_test::InterfaceName));
+            }
+
+            if (ER_OK == status) {
+                /* Add org.alljoyn.alljoyn_test.values interface */
+                InterfaceDescription* valuesIntf = NULL;
+                status = g_msgBus->CreateInterface(::org::alljoyn::alljoyn_test::values::InterfaceName, valuesIntf, encryptIfc);
+                if ((ER_OK == status) && valuesIntf) {
+                    valuesIntf->AddProperty("int_val", "i", PROP_ACCESS_RW);
+                    valuesIntf->AddProperty("str_val", "s", PROP_ACCESS_RW);
+                    valuesIntf->AddProperty("ro_str", "s", PROP_ACCESS_READ);
+                    valuesIntf->Activate();
+                } else {
+                    if (ER_OK == status) status = ER_FAIL;
+                    QCC_LogError(status, ("Failed to create interface \"%s\"", ::org::alljoyn::alljoyn_test::values::InterfaceName));
+                }
+            }
+        }
+
+        /* Register a bus listener in order to get discovery indications */
+        if (ER_OK == status) {
+            g_busListener = new MyBusListener(stopDiscover);
+            g_msgBus->RegisterBusListener(*g_busListener);
+        }
+
         /* Start the msg bus */
         if (ER_OK == status) {
             status = g_msgBus->Start();
             if (ER_OK == status) {
                 if (encryptIfc) {
-                    g_msgBus->EnablePeerSecurity(authMechs.c_str(), new MyAuthListener(userId, authCount));
+                    g_msgBus->EnablePeerSecurity(authMechs.c_str(), new MyAuthListener(userId, authCount), keyStore, keyStore != NULL);
                     if (clearKeys) {
                         g_msgBus->ClearKeyStore();
                     }
@@ -579,8 +599,12 @@ int main(int argc, char** argv)
                                             reply);
             } else if (discoverRemote) {
                 /* Begin discovery on the well-known name of the service to be called */
-                startTime = GetTimestamp();
-
+                findStartTime = GetTimestamp();
+                /*
+                 * Make sure the g_discoverEvent flag has been set to the
+                 * name-not-found state before trying to find the well-known name.
+                 */
+                g_discoverEvent.ResetEvent();
                 status = g_msgBus->FindAdvertisedName(g_wellKnownName.c_str());
                 if (status != ER_OK) {
                     QCC_LogError(status, ("FindAdvertisedName failed"));
@@ -593,7 +617,42 @@ int main(int argc, char** argv)
          * remote bus that is advertising bbservice's well-known name.
          */
         if (discoverRemote && (ER_OK == status)) {
-            status = Event::Wait(g_discoverEvent);
+            for (bool discovered = false; !discovered;) {
+                /*
+                 * We want to wait for the discover event, but we also want to
+                 * be able to interrupt discovery with a control-C.  The AllJoyn
+                 * idiom for waiting for more than one thing this is to create a
+                 * vector of things to wait on.  To provide quick response we
+                 * poll the g_interrupt bit every 100 ms using a 100 ms timer
+                 * event.
+                 */
+                qcc::Event timerEvent(100, 100);
+                vector<qcc::Event*> checkEvents, signaledEvents;
+                checkEvents.push_back(&g_discoverEvent);
+                checkEvents.push_back(&timerEvent);
+                status = qcc::Event::Wait(checkEvents, signaledEvents);
+                if (status != ER_OK && status != ER_TIMEOUT) {
+                    break;
+                }
+
+                /*
+                 * If it was the discover event that popped, we're done.
+                 */
+                for (vector<qcc::Event*>::iterator i = signaledEvents.begin(); i != signaledEvents.end(); ++i) {
+                    if (*i == &g_discoverEvent) {
+                        discovered = true;
+                        break;
+                    }
+                }
+                /*
+                 * If we see the g_interrupt bit, we're also done.  Set an error
+                 * condition so we don't do anything else.
+                 */
+                if (g_interrupt) {
+                    status = ER_FAIL;
+                    break;
+                }
+            }
         } else if (waitForService && (ER_OK == status)) {
             /* If bbservice's well-known name is not currently on the bus yet, then wait for it to appear */
             bool hasOwner = false;
@@ -659,7 +718,7 @@ int main(int argc, char** argv)
                     pingArgs[0].Set("u", now.seconds);
                     pingArgs[1].Set("q", now.mseconds);
                 } else {
-                    sprintf(buf, "Ping String %u", static_cast<unsigned int>(++cnt));
+                    snprintf(buf, 80, "Ping String %u", static_cast<unsigned int>(++cnt));
                     pingArgs[0].Set("s", buf);
 
                     if (pingDelay > 0) {
@@ -759,30 +818,26 @@ int main(int argc, char** argv)
                     QCC_LogError(status, ("GetProperty on %s failed", g_wellKnownName.c_str()));
                 }
             }
+        }
 
-            /* Stop the bus */
-            if (waitStop) {
-                g_msgBus->WaitStop();
-            } else {
-                QStatus s = g_msgBus->Stop();
-                if (ER_OK != s) {
-                    QCC_LogError(s, ("BusAttachment::Stop failed"));
-                }
-            }
-
-            if (status != ER_OK) {
-                break;
+        if (status == ER_OK && waitForSigint) {
+            while (g_interrupt == false) {
+                qcc::Sleep(100);
             }
         }
+
+        /* Deallocate bus */
+        BusAttachment* deleteMe = g_msgBus;
+        g_msgBus = NULL;
+        delete deleteMe;
+
+        delete g_busListener;
+        g_busListener = NULL;
+
+        if (status != ER_OK) {
+            break;
+        }
     }
-
-    /* Deallocate bus */
-    BusAttachment* deleteMe = g_msgBus;
-    g_msgBus = NULL;
-    delete deleteMe;
-
-    delete g_busListener;
-    g_busListener = NULL;
 
     printf("bbclient exiting with status %d (%s)\n", status, QCC_StatusText(status));
 

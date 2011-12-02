@@ -26,6 +26,7 @@
 #endif
 
 #include <map>
+#include <set>
 
 #include <qcc/platform.h>
 
@@ -34,6 +35,8 @@
 #include <qcc/KeyBlob.h>
 #include <qcc/Mutex.h>
 #include <qcc/Stream.h>
+#include <qcc/Event.h>
+#include <qcc/time.h>
 
 #include <alljoyn/KeyStoreListener.h>
 
@@ -41,11 +44,6 @@
 
 
 namespace ajn {
-
-/**
- * Forward declaration.
- */
-class KeyStore;
 
 /**
  * The %KeyStore class manages the storing and loading of key blobs from
@@ -65,33 +63,24 @@ class KeyStore {
     ~KeyStore();
 
     /**
-     * Load the key store
+     * Initialize the key store. The function can only be called once.
      *
-     * @param fileName The filename of the default key store.  When NULL the value is the applicationName
-     *                 parameter of BusAttachment().
+     * @param fileName  The filename to be used by the default key store if the default key store is being used.
+     *                  This overrides the value in the applicationName parameter passed into the constructor.
+     *
+     * @param isShared  Indicates if the key store is being shared between multiple applications.
      */
-    QStatus Load(const char* fileName);
+    QStatus Init(const char* fileName, bool isShared);
 
     /**
-     * Store the key store
+     * Requests the key store listener to store the contents of the key store
      */
-    QStatus Store() { return (storeState == MODIFIED) ?  listener->StoreRequest(*this) : ER_OK; }
+    QStatus Store();
 
     /**
-     * Read keys into the key store from a specific source.
-     *
-     * @param source    The source to read the keys from.
-     * @param password  The password required to decrypt the key store
-     *
-     * @return
-     *      - ER_OK if successful
-     *      - An error status otherwise
-     *
-     */
-    QStatus Load(qcc::Source& source, const qcc::String& password);
-
-    /**
-     * Re-read keys from the key store
+     * Re-read keys from the key store. This is a no-op unless the key store is shared.
+     * If the key store is shared the key store is reloaded merging any changes made by
+     * other applications with changes made by the calling application.
      *
      * @return
      *      - ER_OK if successful
@@ -99,16 +88,6 @@ class KeyStore {
      *
      */
     QStatus Reload();
-
-    /**
-     * Write the current keys from the key store to a specific sink
-     *
-     * @param sink The sink to write the keys to.
-     * @return
-     *      - ER_OK if successful
-     *      - An error status otherwise
-     */
-    QStatus Store(qcc::Sink& sink);
 
     /**
      * Get a key blob from the key store
@@ -120,7 +99,7 @@ class KeyStore {
      *      - ER_BUS_KEY_UNAVAILABLE if key is unavailable
      *      - ER_BUS_KEY_EXPIRED if the requested key has expired
      */
-    QStatus GetKey(const qcc::GUID& guid, qcc::KeyBlob& key);
+    QStatus GetKey(const qcc::GUID128& guid, qcc::KeyBlob& key);
 
     /**
      * Add a key blob to the key store
@@ -130,7 +109,7 @@ class KeyStore {
      * @param expires  Time when the key expires.
      * @return ER_OK
      */
-    QStatus AddKey(const qcc::GUID& guid, const qcc::KeyBlob& key);
+    QStatus AddKey(const qcc::GUID128& guid, const qcc::KeyBlob& key);
 
     /**
      * Remove a key blob from the key store
@@ -138,7 +117,25 @@ class KeyStore {
      * @param guid  The unique identifier for the key
      * return ER_OK
      */
-    QStatus DelKey(const qcc::GUID& guid);
+    QStatus DelKey(const qcc::GUID128& guid);
+
+    /**
+     * Set expiration time on a key blob from the key store
+     *
+     * @param guid        The unique identifier for the key
+     * @param expiration  Time to expire the key
+     * return ER_OK
+     */
+    QStatus SetKeyExpiration(const qcc::GUID128& guid, const qcc::Timespec& expiration);
+
+    /**
+     * Get expiration time on a key blob from the key store
+     *
+     * @param guid        The unique identifier for the key
+     * @param expiration  Time the key will expire
+     * return ER_OK
+     */
+    QStatus GetKeyExpiration(const qcc::GUID128& guid, qcc::Timespec& expiration);
 
     /**
      * Test is there is a requested key blob in the key store
@@ -146,7 +143,7 @@ class KeyStore {
      * @param guid  The unique identifier for the key
      * @return      Returns true if the requested key is in the key store.
      */
-    bool HasKey(const qcc::GUID& guid);
+    bool HasKey(const qcc::GUID128& guid);
 
     /**
      * Return the GUID for this key store
@@ -155,7 +152,7 @@ class KeyStore {
      *      - ER_OK on success
      *      - ER_BUS_KEY_STORE_NOT_LOADED if the GUID is not available
      */
-    QStatus GetGuid(qcc::GUID& guid)
+    QStatus GetGuid(qcc::GUID128& guid)
     {
         if (storeState == UNAVAILABLE) {
             return ER_BUS_KEY_STORE_NOT_LOADED;
@@ -174,9 +171,11 @@ class KeyStore {
 
     /**
      * Override the default listener so the application can provide the load and store
-     * @param listener the listener that will override the default listener
+     *
+     * @param listener  The listener that will override the default listener. This function
+     *                  must be called before the key store is initialized.
      */
-    void SetListener(KeyStoreListener& listener) { this->listener = &listener; }
+    QStatus SetListener(KeyStoreListener& listener);
 
     /**
      * Get the name of the application that owns this key store.
@@ -192,20 +191,66 @@ class KeyStore {
      */
     QStatus Clear();
 
+    /**
+     * Pull keys into the key store from a source.
+     *
+     * @param source    The source to read the keys from.
+     * @param password  The password required to decrypt the key store
+     *
+     * @return
+     *      - ER_OK if successful
+     *      - An error status otherwise
+     *
+     */
+    QStatus Pull(qcc::Source& source, const qcc::String& password);
+
+    /**
+     * Push the current keys from the key store into a sink
+     *
+     * @param sink The sink to write the keys to.
+     * @return
+     *      - ER_OK if successful
+     *      - An error status otherwise
+     */
+    QStatus Push(qcc::Sink& sink);
+
+    /**
+     * Indicates if this is a shared key store.
+     *
+     * @return  Returns true if the key store is shared between multiple applications.
+     */
+    bool IsShared() { return shared; }
+
   private:
 
     /**
-     * Assignment operator is private
+     * Assignment not allowed
      */
-    KeyStore& operator=(const KeyStore& other) { return *this; }
+    KeyStore& operator=(const KeyStore& other);
 
     /**
-     * Copy constructor is private
+     * Copy constructor not allowed
      */
-    KeyStore(const KeyStore& other) { }
+    KeyStore(const KeyStore& other);
 
     /**
-     * The application that owns this key store
+     * Default constructor not allowed
+     */
+    KeyStore();
+
+    /**
+     * Internal function to erase expired keys
+     */
+    size_t EraseExpiredKeys();
+
+    /**
+     * Internal Load function
+     */
+    QStatus Load();
+
+    /**
+     * The application that owns this key store. If the key store is shared this will be the name
+     * of a suite of applications.
      */
     qcc::String application;
 
@@ -219,14 +264,29 @@ class KeyStore {
     } storeState;
 
     /**
-     * Default constructor is private
+     *  Type for a key record
      */
-    KeyStore();
+    class KeyRecord {
+      public:
+        KeyRecord() : revision(0) { }
+        uint32_t revision; ///< Revision number when this key was added
+        qcc::KeyBlob key;  ///< The key blob for the key
+    };
+
+    /**
+     * Type for a key map
+     */
+    typedef std::map<qcc::GUID128, KeyRecord> KeyMap;
 
     /**
      * In memory copy of the key store
      */
-    std::map<qcc::GUID, qcc::KeyBlob> keys;
+    KeyMap* keys;
+
+    /**
+     * GUID for keys that have been deleted
+     */
+    std::set<qcc::GUID128> deletions;
 
     /**
      * Default listener for handling load/store requests
@@ -241,7 +301,7 @@ class KeyStore {
     /**
      * The guid for this key store
      */
-    qcc::GUID thisGuid;
+    qcc::GUID128 thisGuid;
 
     /**
      * Mutex to protect key store
@@ -252,6 +312,26 @@ class KeyStore {
      * Key for encrypting/decrypting the key store.
      */
     qcc::KeyBlob* keyStoreKey;
+
+    /**
+     * Revision number for the key store
+     */
+    uint32_t revision;
+
+    /**
+     * Indicates if the key store is shared between multiple applications.
+     */
+    bool shared;
+
+    /**
+     * Event for synchronizing store requests
+     */
+    qcc::Event* stored;
+
+    /**
+     * Event for synchronizing load requests
+     */
+    qcc::Event* loaded;
 };
 
 }

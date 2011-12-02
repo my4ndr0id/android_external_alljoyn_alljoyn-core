@@ -37,7 +37,7 @@
 #include <alljoyn/SessionPortListener.h>
 #include <alljoyn/SessionListener.h>
 
-#include "AuthMechanism.h"
+#include "AuthManager.h"
 #include "ClientRouter.h"
 #include "KeyStore.h"
 #include "PeerState.h"
@@ -49,7 +49,7 @@
 
 namespace ajn {
 
-class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListener, public qcc::ThreadListener {
+class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListener {
     friend class BusAttachment;
 
   public:
@@ -97,7 +97,7 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
      *
      * @return Global GUID
      */
-    const qcc::GUID& GetGlobalGUID(void) const { return globalGuid; }
+    const qcc::GUID128& GetGlobalGUID(void) const { return globalGuid; }
 
     /**
      * Return the local endpoint for this bus.
@@ -216,9 +216,10 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
      *
      * @param listener  The alarm listener to receive the message.
      * @param msg       The message to queue
+     * @param context   User defined context.
      * @param delay     Time to delay before delivering the message.
      */
-    QStatus DispatchMessage(AlarmListener& listener, Message& msg, uint32_t delay = 0);
+    QStatus DispatchMessage(AlarmListener& listener, Message& msg, void* context, uint32_t delay = 0);
 
     /**
      * This function puts a caller specified context on the dispatch thread and deliver it to the specified alarm listener.
@@ -230,9 +231,27 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
     QStatus Dispatch(AlarmListener& listener, void* context, uint32_t delay = 0);
 
     /**
+     * Remove all dispatcher references to a given AlarmListner.
+     *
+     * @param listener   AlarmListener whose refs will be removed.
+     */
+    void RemoveDispatchListener(AlarmListener& listener);
+
+    /**
      * Called if the bus attachment become disconnected from the bus.
      */
     void LocalEndpointDisconnected();
+
+    /**
+     * JoinSession method_reply handler.
+     */
+    void JoinSessionMethodCB(Message& message, void* context);
+
+    /**
+     * Dispatched joinSession method_reply handler.
+     */
+    void DoJoinSessionMethodCB(Message& message, void* context);
+
 
   private:
 
@@ -252,8 +271,6 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
      */
     Internal& operator=(const BusAttachment::Internal& other);
 
-    void ThreadExit(qcc::Thread* thread);
-
     qcc::String application;              /* Name of the that owns the BusAttachment application */
     BusAttachment& bus;                   /* Reference back to the bus attachment that owns this state */
     qcc::Mutex listenersLock;             /* Mutex that protects BusListeners vector */
@@ -261,7 +278,7 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
     TransportList transportList;          /* List of active transports */
     KeyStore keyStore;                    /* The key store for the bus attachment */
     AuthManager authManager;              /* The authentication manager for the bus attachment */
-    qcc::GUID globalGuid;                 /* Global GUID for this BusAttachment */
+    qcc::GUID128 globalGuid;                 /* Global GUID for this BusAttachment */
     int32_t msgSerial;                    /* Serial number is updated for every message sent by this bus */
     Router* router;                       /* Message bus router */
     PeerStateTable peerStateTable;        /* Table that maintains state information about remote peers */

@@ -60,7 +60,6 @@ class MyBusListener;
 /* Static data */
 static BusAttachment* s_bus = NULL;
 static ChatObject* s_chatObj = NULL;
-static qcc::String s_connectName;
 static qcc::String s_advertisedName;
 static MyBusListener* s_busListener = NULL;
 static SessionId s_sessionId = 0;
@@ -158,7 +157,10 @@ class ChatObject : public BusObject {
     {
         /* Inform Java GUI of this message */
         JNIEnv* env;
-        vm->AttachCurrentThread(&env, NULL);
+        jint jret = vm->GetEnv((void**)&env, JNI_VERSION_1_2);
+        if (JNI_EDETACHED == jret) {
+            vm->AttachCurrentThread(&env, NULL);
+        }
         jclass jcls = env->GetObjectClass(jobj);
         jmethodID mid = env->GetMethodID(jcls, "ChatCallback", "(Ljava/lang/String;Ljava/lang/String;)V");
         if (mid == 0) {
@@ -170,6 +172,9 @@ class ChatObject : public BusObject {
             env->CallVoidMethod(jobj, mid, jSender, jChatStr);
             env->DeleteLocalRef(jSender);
             env->DeleteLocalRef(jChatStr);
+        }
+        if (JNI_EDETACHED == jret) {
+            vm->DetachCurrentThread();
         }
     }
 
@@ -216,7 +221,8 @@ extern "C" {
 /**
  * Initialize AllJoyn and connect to local daemon.
  */
-JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnCreate(JNIEnv* env, jobject jobj)
+JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnCreate(JNIEnv* env, jobject jobj,
+                                                                          jstring packageNameStrObj)
 {
 
 
@@ -224,8 +230,11 @@ JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnCreate(JNIEnv
     //QCC_SetLogLevels("ALLJOYN=7;ALL=1");
     QCC_UseOSLogging(true);
 
+    jboolean iscopy;
+    const char* packageNameStr = env->GetStringUTFChars(packageNameStrObj, &iscopy);
     /* Create message bus */
-    s_bus = new BusAttachment("chat", true);
+    s_bus = new BusAttachment(packageNameStr, true);
+
     QStatus status = ER_OK;
     const char* daemonAddr = "unix:abstract=alljoyn";
 
@@ -268,6 +277,7 @@ JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnCreate(JNIEnv
         s_bus->RegisterBusListener(*s_busListener);
     }
 
+    env->ReleaseStringUTFChars(packageNameStrObj, packageNameStr);
 
     if (NULL == s_bus) {
         return jboolean(false);
@@ -358,27 +368,6 @@ JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_chat_Chat_joinSession(JN
 
 
 /**
- * Request the local daemon to disconnect from the remote daemon.
- */
-JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_chat_Chat_disconnect(JNIEnv* env,
-                                                                             jobject jobj)
-{
-    if ((NULL == s_bus) || s_connectName.empty()) {
-        return jboolean(false);
-    }
-    /* Send a disconnect message to the daemon */
-    Message reply(*s_bus);
-    const ProxyBusObject& alljoynObj = s_bus->GetAllJoynProxyObj();
-    MsgArg disconnectArg("s", s_connectName.c_str());
-    QStatus status = alljoynObj.MethodCall(org::alljoyn::Bus::InterfaceName, "Disconnect", &disconnectArg, 1, reply, 4000);
-    if (ER_OK != status) {
-        LOGE("%s.Disonnect(%s) failed", org::alljoyn::Bus::InterfaceName, s_connectName.c_str(), QCC_StatusText(status));
-    }
-    s_connectName.clear();
-    return jboolean(ER_OK == status);
-}
-
-/**
  * Called when SimpleClient Java application exits. Performs AllJoyn cleanup.
  */
 JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnDestroy(JNIEnv* env, jobject jobj)
@@ -391,8 +380,6 @@ JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnDestroy(JNIEn
 
     /* Deregister the ServiceObject. */
     if (s_chatObj) {
-        s_chatObj->ReleaseName();
-        //s_bus->DeregisterBusObject(*s_chatObj);
         delete s_chatObj;
         s_chatObj = NULL;
     }
@@ -422,6 +409,12 @@ JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_sendChatMsg(JNIEnv
     return (jint) status;
 }
 
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm,
+                                  void* reserved)
+{
+    QCC_UseOSLogging(true);
+    return JNI_VERSION_1_2;
+}
 
 #ifdef __cplusplus
 }

@@ -53,21 +53,22 @@ static const uint8_t MEMBER_ANNOTATE_DEPRECATED = 2; /**< Deprecated annotate fl
 /**
  * @class InterfaceDescription
  * Class for describing message bus interfaces. %InterfaceDescription objects describe the methods,
- * signals and properties of a %BusObject or %ProxyBusObject.
+ * signals and properties of a BusObject or ProxyBusObject.
  *
- * Calling %ProxyBusObject::AddInterface(const char*) adds the AllJoyn interface described by an
- * %InterfaceDescription to a %ProxyBusObject instance. After an  %InterfaceDescription has been
+ * Calling ProxyBusObject::AddInterface(const char*) adds the AllJoyn interface described by an
+ * %InterfaceDescription to a ProxyBusObject instance. After an  %InterfaceDescription has been
  * added, the methods described in the interface can be called. Similarly calling
- * %BusObject::AddInterface adds the interface and it methods, properties, and signal to a
+ * BusObject::AddInterface adds the interface and its methods, properties, and signal to a
  * BusObject. After an interface has been added method handlers for the methods described in the
- * interface can be added by calling %BusObject::AddMethodHandler or %BusObject::AddMethodHandlers.
+ * interface can be added by calling BusObject::AddMethodHandler or BusObject::AddMethodHandlers.
  *
- * An InterfaceDescription can be constructed piecemeal by calling InterfaceDescription::AddMethod,
+ * An %InterfaceDescription can be constructed piecemeal by calling InterfaceDescription::AddMethod,
  * InterfaceDescription::AddMember(), and InterfaceDescription::AddProperty(). Alternatively,
- * calling %ProxyBusObjec::ParseXml will create the InterfaceDescription instances for that proxy
- * object directly from an XML string. Calling %ProxyBusObject::Introspect also creates the
- * InterfaceDescription instances from XML but in this case the XML is obtained by making a remote
- * Introspect method call an bus object.
+ * calling ProxyBusObject::ParseXml will create the %InterfaceDescription instances for that proxy
+ * object directly from an XML string. Calling ProxyBusObject::IntrospectRemoteObject or
+ * ProxyBusObject::IntrospectRemoteObjectAsync also creates the %InterfaceDescription
+ * instances from XML but in this case the XML is obtained by making a remote Introspect method
+ * call on a bus object.
  */
 
 class InterfaceDescription {
@@ -88,17 +89,19 @@ class InterfaceDescription {
         qcc::String returnSignature;         /**< Signal or method call OUT arguments */
         qcc::String argNames;                /**< Comma separated list of argument names - can be NULL */
         uint8_t annotation;                  /**< Exclusive OR of flags MEMBER_ANNOTATE_NO_REPLY and MEMBER_ANNOTATE_DEPRECATED */
+        qcc::String accessPerms;              /**< Required permissions to invoke this call */
 
         /** %Member constructor */
         Member(const InterfaceDescription* iface, AllJoynMessageType type, const char* name,
-               const char* signature, const char* returnSignature, const char* argNames, uint8_t annotation)
+               const char* signature, const char* returnSignature, const char* argNames, uint8_t annotation, const char* accessPerms)
             : iface(iface),
             memberType(type),
             name(name),
             signature(signature ? signature : ""),
             returnSignature(returnSignature ? returnSignature : ""),
             argNames(argNames ? argNames : ""),
-            annotation(annotation) { }
+            annotation(annotation),
+            accessPerms(accessPerms ? accessPerms : "") { }
 
         /**
          * Equality. Two members are defined to be equal if their members are equal except for iface which is ignored for equality.
@@ -138,12 +141,13 @@ class InterfaceDescription {
      * @param outSig      Signature of output parameters or NULL for none.
      * @param argNames    Comma separated list of input and then output arg names used in annotation XML.
      * @param annotation  Annotation flags.
+     * @param accessPerms Required permissions to invoke this call
      *
      * @return
      *      - #ER_OK if successful
      *      - #ER_BUS_MEMBER_ALREADY_EXISTS if member already exists
      */
-    QStatus AddMember(AllJoynMessageType type, const char* name, const char* inputSig, const char* outSig, const char* argNames, uint8_t annotation = 0);
+    QStatus AddMember(AllJoynMessageType type, const char* name, const char* inputSig, const char* outSig, const char* argNames, uint8_t annotation = 0, const char* accessPerms = 0);
 
     /**
      * Lookup a member description by name
@@ -190,14 +194,15 @@ class InterfaceDescription {
      * @param outSig      Signature of output parameters or NULL for none.
      * @param argNames    Comma separated list of input and then output arg names used in annotation XML.
      * @param annotation  Annotation flags.
+     * @param accessPerms Access permission requirements on this call
      *
      * @return
      *      - #ER_OK if successful
      *      - #ER_BUS_MEMBER_ALREADY_EXISTS if member already exists
      */
-    QStatus AddMethod(const char* name, const char* inputSig, const char* outSig, const char* argNames, uint8_t annotation = 0)
+    QStatus AddMethod(const char* name, const char* inputSig, const char* outSig, const char* argNames, uint8_t annotation = 0, const char* accessPerms = 0)
     {
-        return AddMember(MESSAGE_METHOD_CALL, name, inputSig, outSig, argNames, annotation);
+        return AddMember(MESSAGE_METHOD_CALL, name, inputSig, outSig, argNames, annotation, accessPerms);
     }
 
     /**
@@ -221,14 +226,15 @@ class InterfaceDescription {
      * @param sig         Signature of parameters or NULL for none.
      * @param argNames    Comma separated list of arg names used in annotation XML.
      * @param annotation  Annotation flags.
+     * @param accessPerms Access permission requirements on this call
      *
      * @return
      *      - #ER_OK if successful
      *      - #ER_BUS_MEMBER_ALREADY_EXISTS if member already exists
      */
-    QStatus AddSignal(const char* name, const char* sig, const char* argNames, uint8_t annotation = 0)
+    QStatus AddSignal(const char* name, const char* sig, const char* argNames, uint8_t annotation = 0, const char* accessPerms = 0)
     {
-        return AddMember(MESSAGE_SIGNAL, name, sig, NULL, argNames, annotation);
+        return AddMember(MESSAGE_SIGNAL, name, sig, NULL, argNames, annotation, accessPerms);
     }
 
     /**

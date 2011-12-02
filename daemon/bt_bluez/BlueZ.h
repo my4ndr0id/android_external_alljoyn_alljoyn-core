@@ -23,19 +23,35 @@
 
 #include <qcc/platform.h>
 
+#include <sys/ioctl.h>
+
 
 #define SOL_BLUETOOTH  274
+#define SOL_HCI          0
 #define SOL_L2CAP        6
 #define SOL_RFCOMM      18
 #define BT_SECURITY      4
 #define BT_SECURITY_LOW  1
 
-#define RFCOMM_CONNINFO  2
-#define L2CAP_CONNINFO   2
-#define L2CAP_OPTIONS    1
-
 #define RFCOMM_PROTOCOL_ID 3
+#define RFCOMM_CONNINFO  2
+
 #define L2CAP_PROTOCOL_ID  0
+
+#define L2CAP_OPTIONS    1
+#define L2CAP_CONNINFO   2
+#define L2CAP_LM         3
+
+#define L2CAP_LM_MASTER 0x1
+
+#define HCI_FILTER 2
+
+#define HCI_LM_MASTER 0x1
+
+#define HCI_SCO_LINK  0x00
+#define HCI_ACL_LINK  0x01
+#define HCI_ESCO_LINK 0x02
+
 
 namespace ajn {
 namespace bluez {
@@ -66,6 +82,9 @@ struct l2cap_options {
     uint16_t imtu;
     uint16_t flush_to;
     uint8_t mode;
+    uint8_t fcs;
+    uint8_t max_tx;
+    uint16_t txwin_size;
 };
 
 struct sockaddr_hci {
@@ -73,7 +92,29 @@ struct sockaddr_hci {
     uint16_t dev;
 };
 
+struct hci_conn_info {
+    uint16_t handle;
+    BDADDR bdaddr;
+    uint8_t type;
+    uint8_t out;
+    uint16_t state;
+    uint32_t link_mode;
+};
 
+struct hci_conn_info_req {
+    BDADDR bdaddr;
+    uint8_t type;
+    struct hci_conn_info conn_info;
+};
+
+struct hci_filter {
+    uint32_t type_mask;
+    uint32_t event_mask[2];
+    uint16_t opcode;
+};
+
+
+#define HCIGETCONNINFO _IOR('H', 213, int)
 
 
 } // namespace bluez

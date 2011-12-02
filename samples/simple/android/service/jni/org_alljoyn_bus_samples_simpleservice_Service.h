@@ -42,18 +42,18 @@ JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_simple
 /*
  * Class:     org_alljoyn_bus_samples_simpleservice_Service
  * Method:    startService
- * Signature: (Ljava/lang/String;)Z
+ * Signature: (Ljava/lang/String;Ljava/lang/String;)Z
  */
 JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_startService
-    (JNIEnv *, jobject, jstring);
+    (JNIEnv *, jobject, jstring, jstring);
 
 /*
  * Class:     org_alljoyn_bus_samples_simpleservice_Service
  * Method:    stopService
- * Signature: ()V
+ * Signature: (Ljava/lang/String;)V
  */
 JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_stopService
-    (JNIEnv *, jobject);
+    (JNIEnv *, jobject, jstring);
 
 #ifdef __cplusplus
 }

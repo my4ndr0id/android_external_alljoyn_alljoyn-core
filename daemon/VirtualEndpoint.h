@@ -112,9 +112,10 @@ class VirtualEndpoint : public BusEndpoint {
      * Get the BusToBus endpoint associated with this virtual endpoint.
      *
      * @param sessionId   Id of session between src and dest.
+     * @param b2bCount    [OUT] Number of b2bEps that can route for given session. May be NULL.
      * @return The current (top of queue) bus-to-bus endpoint.
      */
-    RemoteEndpoint* GetBusToBusEndpoint(SessionId sessionId = 0) const;
+    RemoteEndpoint* GetBusToBusEndpoint(SessionId sessionId = 0, int* b2bCount = NULL) const;
 
     /**
      * Add an alternate bus-to-bus endpoint that can route for this endpoint.
@@ -168,12 +169,21 @@ class VirtualEndpoint : public BusEndpoint {
     bool CanUseRoute(const RemoteEndpoint& b2bEndpoint) const;
 
     /**
+     * Return true iff the virtual endpoint can route to destination without the aid of the
+     * daemon identified by guid.
+     *
+     * @param guid     GUID of daemon that should be ignored when determing whether vep can route to dest.
+     * @return true iff the vep can route to its dest without the aid of daemon identified by guid.
+     */
+    bool CanRouteWithout(const qcc::GUID128& guid) const;
+
+    /**
      * Get the set of sessionIds that route through a given bus-to-bus endpoint.
      *
      * @param[IN]   b2bEndpoint   B2B endpoint.
      * @param[OUT]  set of sessionIds that route through the given endpoint.
      */
-    void GetSessionIdsForB2B(RemoteEndpoint& endpoint, std::vector<SessionId>& sessionIds);
+    void GetSessionIdsForB2B(RemoteEndpoint& endpoint, std::set<SessionId>& sessionIds);
 
     /**
      * Indicate whether this endpoint is allowed to receive messages from remote devices.
@@ -194,7 +204,8 @@ class VirtualEndpoint : public BusEndpoint {
         SessionOpts opts;     /**< Session options for B2BEndpoint */
         uint32_t hops;        /**< Currently unused hop count from local daemon to final destination */
     };
-    mutable qcc::Mutex m_b2bEndpointsLock;                     /**< Lock that protects m_b2bEndpoints */
+    mutable qcc::Mutex m_b2bEndpointsLock;      /**< Lock that protects m_b2bEndpoints */
+    bool m_hasRefs;
 };
 
 }

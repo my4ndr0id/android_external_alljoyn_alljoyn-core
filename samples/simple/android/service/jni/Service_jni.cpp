@@ -59,9 +59,6 @@ class MyBusListener;
 static BusAttachment* s_bus = NULL;
 static ServiceObject* s_obj = NULL;
 static MyBusListener* s_busListener = NULL;
-static qcc::String s_joinName;
-static SessionId s_sessionId = 0;
-static bool s_joinComplete = false;
 
 
 class MyBusListener : public BusListener, public SessionPortListener, public SessionListener {
@@ -89,7 +86,6 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
 
     void SessionJoined(SessionPort sessionPort, SessionId id, const char* joiner)
     {
-        s_sessionId = id;
         LOGD("SessionJoined with %s (id=%u)\n", joiner, id);
     }
 
@@ -182,7 +178,10 @@ class ServiceObject : public BusObject {
 
         /* Inform Java GUI of this ping */
         JNIEnv* env;
-        vm->AttachCurrentThread(&env, NULL);
+        jint jret = vm->GetEnv((void**)&env, JNI_VERSION_1_2);
+        if (JNI_EDETACHED == jret) {
+            vm->AttachCurrentThread(&env, NULL);
+        }
 
         jclass jcls = env->GetObjectClass(jobj);
         jmethodID mid = env->GetMethodID(jcls, "PingCallback", "(Ljava/lang/String;Ljava/lang/String;)V");
@@ -203,7 +202,9 @@ class ServiceObject : public BusObject {
             LOGE("Ping: Error sending reply (%s)", QCC_StatusText(status));
         }
 
-
+        if (JNI_EDETACHED == jret) {
+            vm->DetachCurrentThread();
+        }
     }
 
   private:
@@ -219,7 +220,7 @@ extern "C" {
 /*
  * Class:     org_alljoyn_bus_samples_simpleservice_Service
  * Method:    simpleOnCreate
- * Signature: ()I
+ * Signature: (Ljava/lang/String;)I
  */
 JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_simpleOnCreate(JNIEnv* env, jobject jobj)
 {
@@ -229,22 +230,18 @@ JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_simple
     // QCC_SetLogLevels("ALLJOYN=7;ALL=1");
     QCC_UseOSLogging(true);
 
-    /* Create message bus */
-    s_bus = new BusAttachment("service", true);
-
-    return status;
+    return ER_OK;
 }
 
 /*
  * Class:     org_alljoyn_bus_samples_simpleservice_Service
  * Method:    startService
- * Signature: (Ljava/lang/String;)Z
+ * Signature: (Ljava/lang/String;Ljava/lang/String;)Z
  */
-JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_startService(JNIEnv* env, jobject jobj, jstring jServiceName)
+JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_startService(JNIEnv* env, jobject jobj,
+                                                                                           jstring jServiceName, jstring packageNameStrObj)
 {
-    if (s_obj) {
-        return (jboolean) false;
-    }
+    QStatus status = ER_OK;
 
     jboolean iscopy;
     const char* serviceNameStr = env->GetStringUTFChars(jServiceName, &iscopy);
@@ -252,46 +249,65 @@ JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_st
     serviceName += SIMPLE_SERVICE_WELL_KNOWN_NAME_PREFIX;
     serviceName += serviceNameStr;
 
+    SessionOpts opts(SessionOpts::TRAFFIC_MESSAGES, false, SessionOpts::PROXIMITY_ANY, TRANSPORT_ANY);
+
     const char* daemonAddr = "unix:abstract=alljoyn";
 
-    /* Add org.alljoyn.samples.simple interface */
-    InterfaceDescription* testIntf = NULL;
-    QStatus status = s_bus->CreateInterface(SIMPLE_SERVICE_INTERFACE_NAME, testIntf);
-    if (ER_OK == status) {
-        testIntf->AddMethod("Ping", "s",  "s", "inStr,outStr", 0);
-        testIntf->Activate();
-    } else {
-        LOGE("Failed to create interface %s (%s)", SIMPLE_SERVICE_INTERFACE_NAME, QCC_StatusText(status));
-    }
+    /* Initialize AllJoyn only once */
+    if (!s_bus) {
+        const char* packageNameStr = env->GetStringUTFChars(packageNameStrObj, &iscopy);
+        s_bus = new BusAttachment("service", true);
 
-    /* Start the msg bus */
-    if (ER_OK == status) {
-        status = s_bus->Start();
-    } else {
-        LOGE("BusAttachment::Start failed (%s)", QCC_StatusText(status));
-    }
-
-    /* Connect to the daemon */
-    if (ER_OK == status) {
-        status = s_bus->Connect(daemonAddr);
-        if (ER_OK != status) {
-            LOGE("Connect to %s failed (%s)", daemonAddr, QCC_StatusText(status));
+        /* Add org.alljoyn.samples.simple interface */
+        InterfaceDescription* testIntf = NULL;
+        status = s_bus->CreateInterface(SIMPLE_SERVICE_INTERFACE_NAME, testIntf);
+        if (ER_OK == status) {
+            testIntf->AddMethod("Ping", "s",  "s", "inStr,outStr", 0);
+            testIntf->Activate();
+        } else {
+            LOGE("Failed to create interface %s (%s)", SIMPLE_SERVICE_INTERFACE_NAME, QCC_StatusText(status));
         }
+
+        /* Start the msg bus */
+        if (ER_OK == status) {
+            status = s_bus->Start();
+        } else {
+            LOGE("BusAttachment::Start failed (%s)", QCC_StatusText(status));
+        }
+
+        /* Connect to the daemon */
+        if (ER_OK == status) {
+            status = s_bus->Connect(daemonAddr);
+            if (ER_OK != status) {
+                LOGE("Connect to %s failed (%s)", daemonAddr, QCC_StatusText(status));
+            }
+        }
+
+        /* Register the bus listener */
+        JavaVM* vm;
+        env->GetJavaVM(&vm);
+        if (ER_OK == status) {
+            s_busListener = new MyBusListener(vm, jobj);
+            s_bus->RegisterBusListener(*s_busListener);
+            LOGD("\n Bus Listener registered \n");
+        }
+
+        /* Register service object */
+        s_obj = new ServiceObject(*s_bus, SIMPLE_SERVICE_OBJECT_PATH, vm, jobj);
+        s_bus->RegisterBusObject(*s_obj);
+
+        /* Bind the session port*/
+        if (ER_OK == status) {
+            SessionPort sp = SESSION_PORT;
+            status = s_bus->BindSessionPort(sp, opts, *s_busListener);
+            if (ER_OK != status) {
+                LOGE("BindSessionPort failed (%s)\n", QCC_StatusText(status));
+            } else {
+                LOGD("\n Bind Session Port to %d was successful \n", SESSION_PORT);
+            }
+        }
+        env->ReleaseStringUTFChars(packageNameStrObj, packageNameStr);
     }
-
-    /* Register the bus listener */
-    JavaVM* vm;
-    env->GetJavaVM(&vm);
-    if (ER_OK == status) {
-        s_busListener = new MyBusListener(vm, jobj);
-        s_bus->RegisterBusListener(*s_busListener);
-        LOGD("\n Bus Listener registered \n");
-    }
-
-    /* Register service object */
-    s_obj = new ServiceObject(*s_bus, SIMPLE_SERVICE_OBJECT_PATH, vm, jobj);
-    s_bus->RegisterBusObject(*s_obj);
-
 
     /* Request name */
     status = s_bus->RequestName(serviceName.c_str(), DBUS_NAME_FLAG_DO_NOT_QUEUE);
@@ -302,19 +318,9 @@ JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_st
         LOGD("\n Request Name was successful");
     }
 
-    /* Bind the session port*/
-    SessionOpts opts(SessionOpts::TRAFFIC_MESSAGES, false, SessionOpts::PROXIMITY_ANY, TRANSPORT_ANY);
-    if (ER_OK == status) {
-        SessionPort sp = SESSION_PORT;
-        status = s_bus->BindSessionPort(sp, opts, *s_busListener);
-        if (ER_OK != status) {
-            LOGE("BindSessionPort failed (%s)\n", QCC_StatusText(status));
-        } else {
-            LOGD("\n Bind Session Port to %d was successful \n", SESSION_PORT);
-        }
-    }
     /* Advertise the name */
     if (ER_OK == status) {
+
         status = s_bus->AdvertiseName(serviceName.c_str(), opts.transports);
         if (status != ER_OK) {
             LOGD("Failed to advertise name %s (%s) \n", serviceName.c_str(), QCC_StatusText(status));
@@ -322,7 +328,7 @@ JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_st
             LOGD("\n Name %s was successfully advertised", serviceName.c_str());
         }
     }
-
+    env->ReleaseStringUTFChars(jServiceName, serviceNameStr);
     env->DeleteLocalRef(jServiceName);
     return (jboolean) true;
 }
@@ -332,16 +338,32 @@ JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_st
  * Method:    stopService
  * Signature: ()V
  */
-JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_stopService(JNIEnv* env, jobject jobj)
+JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_stopService(JNIEnv* env, jobject jobj, jstring jServiceName)
 {
-    /* Deregister the ServiceObject. */
-    if (s_obj) {
-        s_obj->ReleaseName();
-        s_obj->CancelAdvertise();
-        //  s_bus->DeregisterBusObject(*s_obj);
-        delete s_obj;
-        s_obj = NULL;
+    if (!s_bus) {
+        return;
     }
+
+    jboolean isCopy;
+    const char* serviceNameStr = env->GetStringUTFChars(jServiceName, &isCopy);
+    qcc::String serviceName(SIMPLE_SERVICE_WELL_KNOWN_NAME_PREFIX);
+    serviceName += serviceNameStr;
+
+    /* Stop advertising the name */
+    QStatus status = s_bus->CancelAdvertiseName(serviceName.c_str(), TRANSPORT_ANY);
+    if (status != ER_OK) {
+        LOGE("CancelAdvertiseName failed with %s", QCC_StatusText(status));
+    }
+
+    /* Release the name */
+    status =  s_bus->ReleaseName(serviceName.c_str());
+    if (status != ER_OK) {
+        LOGE("ReleaseName failed with %s", QCC_StatusText(status));
+    }
+
+    env->ReleaseStringUTFChars(jServiceName, serviceNameStr);
+    env->DeleteLocalRef(jServiceName);
+    return;
 }
 
 /*
@@ -351,18 +373,29 @@ JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_stopSe
  */
 JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_simpleservice_Service_simpleOnDestroy(JNIEnv* env, jobject jobj)
 {
-    /* Unregister and deallocate service object */
-    if (s_obj) {
-        if (s_bus) {
-            // s_bus->DeregisterBusObject(*s_obj);
-        }
-        delete s_obj;
-    }
-
     /* Deallocate bus */
     if (s_bus) {
         delete s_bus;
+        s_bus = NULL;
     }
+
+    if (s_busListener) {
+        delete s_busListener;
+        s_busListener = NULL;
+    }
+
+    /* Unregister and deallocate service object */
+    if (s_obj) {
+        delete s_obj;
+        s_obj = NULL;
+    }
+}
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm,
+                                  void* reserved)
+{
+    QCC_UseOSLogging(true);
+    return JNI_VERSION_1_2;
 }
 
 #ifdef __cplusplus

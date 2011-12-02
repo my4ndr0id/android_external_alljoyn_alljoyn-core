@@ -15,22 +15,26 @@
  */
 
 #include <qcc/platform.h>
+
 #include <alljoyn/BusAttachment.h>
 #include <alljoyn/ProxyBusObject.h>
 #include <alljoyn/BusObject.h>
 #include <alljoyn/InterfaceDescription.h>
 #include <alljoyn/DBusStd.h>
 #include <alljoyn/AllJoynStd.h>
+#include <qcc/Util.h>
 #include <qcc/Log.h>
 #include <qcc/String.h>
 #include <qcc/StringUtil.h>
 #include <qcc/Mutex.h>
+#include <qcc/Thread.h>
 #include <cassert>
 #include <cstdio>
 
 #include <set>
 #include <map>
 #include <vector>
+#include <limits>
 
 using namespace ajn;
 using namespace std;
@@ -54,6 +58,11 @@ struct DiscoverInfo {
     {
         return (peerName < other.peerName) || ((peerName == other.peerName) && (transport < other.transport));
     }
+
+    bool operator==(const DiscoverInfo& other) const
+    {
+        return (peerName == other.peerName) && (transport == other.transport);
+    }
 };
 
 struct SessionPortInfo {
@@ -72,6 +81,7 @@ struct SessionInfo {
     SessionInfo(SessionId id, const SessionPortInfo& portInfo) : id(0), portInfo(portInfo) { }
 };
 
+
 /* static data */
 static ajn::BusAttachment* s_bus = NULL;
 static MyBusListener* s_busListener = NULL;
@@ -82,6 +92,7 @@ static set<DiscoverInfo> s_discoverSet;
 static map<SessionPort, SessionPortInfo> s_sessionPortMap;
 static map<SessionId, SessionInfo> s_sessionMap;
 static Mutex s_lock;
+static bool s_chatEcho = true;
 
 /*
  * get a line of input from the the file pointer (most likely stdin).
@@ -139,8 +150,8 @@ class SessionTestObject : public BusObject {
     }
 
     /** Send a Chat signal */
-    QStatus SendChatSignal(SessionId id, const char* msg, uint8_t flags) {
-
+    QStatus SendChatSignal(SessionId id, const char* msg, uint8_t flags)
+    {
         MsgArg chatArg("s", msg);
         return Signal(NULL, id, *chatSignalMember, &chatArg, 1, 0, flags);
     }
@@ -148,7 +159,9 @@ class SessionTestObject : public BusObject {
     /** Receive a signal from another Chat client */
     void ChatSignalHandler(const InterfaceDescription::Member* member, const char* srcPath, Message& msg)
     {
-        printf("RX chat from %s[%u]: %s\n", msg->GetSender(), msg->GetSessionId(), msg->GetArg(0)->v_string.str);
+        if (s_chatEcho) {
+            printf("RX chat from %s[%u]: %s\n", msg->GetSender(), msg->GetSessionId(), msg->GetArg(0)->v_string.str);
+        }
     }
 
   private:
@@ -159,8 +172,9 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
     void FoundAdvertisedName(const char* name, TransportMask transport, const char* namePrefix)
     {
         printf("Discovered name : \"%s\"\n", name);
-
+        s_lock.Lock(MUTEX_CONTEXT);
         s_discoverSet.insert(DiscoverInfo(name, transport));
+        s_lock.Unlock(MUTEX_CONTEXT);
     }
 
     void NameOwnerChanged(const char* busName, const char* previousOwner, const char* newOwner)
@@ -169,10 +183,17 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
                newOwner ? newOwner : "<none>");
     }
 
+    void LostAdvertisedName(const char* name, TransportMask transport, const char* namePrefix) {
+        printf("LostAdvertisedName name=%s, namePrefix=%s\n", name, namePrefix);
+        s_lock.Lock(MUTEX_CONTEXT);
+        s_discoverSet.erase(DiscoverInfo(name, transport));
+        s_lock.Unlock(MUTEX_CONTEXT);
+    }
+
     bool AcceptSessionJoiner(SessionPort sessionPort, const char* joiner, const SessionOpts& opts)
     {
         bool ret = false;
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         map<SessionPort, SessionPortInfo>::iterator it = s_sessionPortMap.find(sessionPort);
         if (it != s_sessionPortMap.end()) {
             printf("Accepting join request on %u from %s\n", sessionPort, joiner);
@@ -180,13 +201,13 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
         } else {
             printf("Rejecting join attempt to unregistered port %u from %s\n", sessionPort, joiner);
         }
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
         return ret;
     }
 
     void SessionJoined(SessionPort sessionPort, SessionId id, const char* joiner)
     {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         map<SessionPort, SessionPortInfo>::iterator it = s_sessionPortMap.find(sessionPort);
         if (it != s_sessionPortMap.end()) {
             s_bus->SetSessionListener(id, this);
@@ -196,10 +217,10 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
                 s_sessionMap[id] = sessionInfo;
             }
             s_sessionMap[id].peerNames.push_back(joiner);
-            s_lock.Unlock();
+            s_lock.Unlock(MUTEX_CONTEXT);
             printf("SessionJoined with %s (id=%u)\n", joiner, id);
         } else {
-            s_lock.Unlock();
+            s_lock.Unlock(MUTEX_CONTEXT);
             printf("Leaving unexpected session %u with %s\n", id, joiner);
             s_bus->LeaveSession(id);
         }
@@ -207,17 +228,71 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
 
     void SessionLost(SessionId id)
     {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         map<SessionId, SessionInfo>::iterator it = s_sessionMap.find(id);
         if (it != s_sessionMap.end()) {
             s_sessionMap.erase(it);
-            s_lock.Unlock();
+            s_lock.Unlock(MUTEX_CONTEXT);
             printf("Session %u is lost\n", id);
         } else {
-            s_lock.Unlock();
+            s_lock.Unlock(MUTEX_CONTEXT);
             printf("SessionLost for unknown sessionId %u\n", id);
         }
     }
+
+    void SessionMemberAdded(SessionId id, const char* uniqueName)
+    {
+        printf("%s was added to session %u\n", uniqueName, id);
+    }
+
+    void SessionMemberRemoved(SessionId id, const char* uniqueName)
+    {
+        printf("%s was removed from session %u\n", uniqueName, id);
+    }
+};
+
+class AutoChatThread : public Thread, public ThreadListener {
+  public:
+    static AutoChatThread* Launch(SessionTestObject& busObj, SessionId id, uint32_t count, uint32_t freqMs, uint32_t minSize, uint32_t maxSize)
+    {
+        AutoChatThread* t = new AutoChatThread(busObj, id, count, freqMs, minSize, maxSize);
+        t->Start();
+        return t;
+    }
+
+    AutoChatThread(SessionTestObject& busObj, SessionId id, uint32_t count, uint32_t delay, uint32_t minSize, uint32_t maxSize)
+        : busObj(busObj), id(id), count(count), delay(delay), minSize(minSize), maxSize(maxSize) { }
+
+    void ThreadExit(Thread* thread)
+    {
+        delete thread;
+    }
+
+  protected:
+    ThreadReturn STDCALL Run(void* args)
+    {
+        char* buf = new char[maxSize + 1];
+        for (size_t i = 0; i <= maxSize; ++i) {
+            buf[i] = 'a' + (i % 26);
+        }
+
+        while (IsRunning() && count--) {
+            size_t len = minSize + (maxSize - minSize) * (((float)Rand16()) / (std::numeric_limits<uint16_t>::max()));
+            buf[len] = '\0';
+            busObj.SendChatSignal(id, buf, 0);
+            buf[len] = 'a' + (len % 26);
+            qcc::Sleep(delay);
+        }
+        return 0;
+    }
+
+  private:
+    SessionTestObject& busObj;
+    SessionId id;
+    uint32_t count;
+    uint32_t delay;
+    uint32_t minSize;
+    uint32_t maxSize;
 };
 
 static void usage()
@@ -240,13 +315,35 @@ static String NextTok(String& inStr)
     return Trim(ret);
 }
 
+static SessionId NextTokAsSessionId(String& inStr)
+{
+    uint32_t ret = 0;
+    String tok = NextTok(inStr);
+    if (tok[0] == '#') {
+        uint32_t i = StringToU32(tok.substr(1), 0, 0);
+        s_lock.Lock(MUTEX_CONTEXT);
+        map<SessionId, SessionInfo>::const_iterator sit = s_sessionMap.begin();
+        if (i < s_sessionMap.size()) {
+            while (i--) {
+                sit++;
+            }
+            ret = sit->first;
+        }
+        s_lock.Unlock(MUTEX_CONTEXT);
+    } else {
+        ret = StringToU32(tok, 0, 0);
+    }
+    return static_cast<SessionId>(ret);
+}
+
+
 static void DoRequestName(const String& name)
 {
     QStatus status = s_bus->RequestName(name.c_str(), DBUS_NAME_FLAG_DO_NOT_QUEUE);
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_requestedNames.insert(name);
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("RequestName(%s) failed with %s\n", name.c_str(), QCC_StatusText(status));
     }
@@ -256,9 +353,9 @@ static void DoReleaseName(const String& name)
 {
     QStatus status = s_bus->ReleaseName(name.c_str());
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_requestedNames.erase(name);
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("ReleaseName(%s) failed with %s\n", name.c_str(), QCC_StatusText(status));
     }
@@ -280,9 +377,9 @@ static void DoBind(SessionPort port, const SessionOpts& opts)
     }
     QStatus status = s_bus->BindSessionPort(port, opts, *s_busListener);
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_sessionPortMap.insert(pair<SessionPort, SessionPortInfo>(port, SessionPortInfo(port, s_bus->GetUniqueName(), opts)));
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("BusAttachment::BindSessionPort(%u, <>, <>) failed with %s\n", port, QCC_StatusText(status));
     }
@@ -296,9 +393,9 @@ static void DoUnbind(SessionPort port)
     }
     QStatus status = s_bus->UnbindSessionPort(port);
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_sessionPortMap.erase(port);
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("BusAttachment::UnbindSessionPort(%u) failed with %s\n", port, QCC_StatusText(status));
     }
@@ -308,9 +405,9 @@ static void DoAdvertise(String name, TransportMask transports)
 {
     QStatus status = s_bus->AdvertiseName(name.c_str(), transports);
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_advertisements.insert(name);
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("BusAttachment::AdvertiseName(%s, 0x%x) failed with %s\n", name.c_str(), transports, QCC_StatusText(status));
     }
@@ -324,9 +421,9 @@ static void DoCancelAdvertise(String name, TransportMask transports)
     }
     QStatus status = s_bus->CancelAdvertiseName(name.c_str(), transports);
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_advertisements.erase(name);
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("BusAttachment::AdvertiseName(%s, 0x%x) failed with %s\n", name.c_str(), transports, QCC_StatusText(status));
     }
@@ -359,7 +456,7 @@ static void DoList()
     }
 
     printf("---------Outgoing Advertisments----------------\n");
-    s_lock.Lock();
+    s_lock.Lock(MUTEX_CONTEXT);
     set<String>::const_iterator ait = s_advertisements.begin();
     while (ait != s_advertisements.end()) {
         printf("  %s\n", ait->c_str());
@@ -384,8 +481,10 @@ static void DoList()
     }
     printf("---------Active sessions-----------------------\n");
     map<SessionId, SessionInfo>::const_iterator sit = s_sessionMap.begin();
+    int i = 0;
     while (sit != s_sessionMap.end()) {
-        printf("   SessionId: %u, Creator: %s, Port:%u, isMultipoint=%s, traffic=%u, proximity=%u, transports=0x%x\n",
+        printf("   #%d: SessionId: %u, Creator: %s, Port:%u, isMultipoint=%s, traffic=%u, proximity=%u, transports=0x%x\n",
+               i++,
                sit->first,
                sit->second.portInfo.sessionHost.c_str(),
                sit->second.portInfo.port,
@@ -402,7 +501,7 @@ static void DoList()
         }
         ++sit;
     }
-    s_lock.Unlock();
+    s_lock.Unlock(MUTEX_CONTEXT);
 }
 
 static void DoJoin(String name, SessionPort port, const SessionOpts& opts)
@@ -411,9 +510,9 @@ static void DoJoin(String name, SessionPort port, const SessionOpts& opts)
     SessionOpts optsOut = opts;
     QStatus status = s_bus->JoinSession(name.c_str(), port, s_busListener, id, optsOut);
     if (status == ER_OK) {
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_sessionMap.insert(pair<SessionId, SessionInfo>(id, SessionInfo(id, SessionPortInfo(port, name, optsOut))));
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("JoinSession(%s, %u, ...) failed with %s\n", name.c_str(), port, QCC_StatusText(status));
     }
@@ -428,11 +527,21 @@ static void DoLeave(SessionId id)
         if (status != ER_OK) {
             printf("SessionLost(%u) failed with %s\n", id, QCC_StatusText(status));
         }
-        s_lock.Lock();
+        s_lock.Lock(MUTEX_CONTEXT);
         s_sessionMap.erase(id);
-        s_lock.Unlock();
+        s_lock.Unlock(MUTEX_CONTEXT);
     } else {
         printf("Invalid session id %u specified in LeaveSession\n", id);
+    }
+}
+
+static void DoSetLinkTimeout(SessionId id, uint32_t timeout)
+{
+    QStatus status = s_bus->SetLinkTimeout(id, timeout);
+    if (status != ER_OK) {
+        printf("SetLinkTimeout(%u, %u) failed with %s\n", id, timeout, QCC_StatusText(status));
+    } else {
+        printf("Link timeout for session %u is %d\n", id, timeout);
     }
 }
 
@@ -593,26 +702,58 @@ int main(int argc, char** argv)
             opts.transports = static_cast<TransportMask>(StringToU32(NextTok(line), 0, 0xFFFF));
             DoJoin(name, port, opts);
         } else if (cmd == "leave") {
-            SessionId id = static_cast<SessionId>(StringToU32(NextTok(line), 0, 0));
+            SessionId id = NextTokAsSessionId(line);
             if (id == 0) {
                 printf("Usage: leave <sessionId>\n");
                 continue;
             }
             DoLeave(id);
+        } else if (cmd == "timeout") {
+            SessionId id = NextTokAsSessionId(line);
+            uint32_t timeout = StringToU32(NextTok(line), 0, 0);
+            if (id == 0) {
+                printf("Usage: timeout <sessionId> <timeout>\n");
+                continue;
+            }
+            DoSetLinkTimeout(id, timeout);
         } else if (cmd == "chat") {
             uint8_t flags = 0;
-            qcc::String tok = NextTok(line);
-            if (tok == "-c") {
-                flags |= ALLJOYN_FLAG_COMPRESSED;
-                tok = NextTok(line);
-            }
-            SessionId id = StringToU32(tok);
+            SessionId id = NextTokAsSessionId(line);
             String chatMsg = Trim(line);
             if ((id == 0) || chatMsg.empty()) {
-                printf("Usage: chat [-c] <sessionId> <msg>\n");
+                printf("Usage: chat <sessionId> <msg>\n");
                 continue;
             }
             sessionTestObj.SendChatSignal(id, chatMsg.c_str(), flags);
+        } else if (cmd == "cchat") {
+            uint8_t flags = ALLJOYN_FLAG_COMPRESSED;
+            SessionId id = NextTokAsSessionId(line);
+            String chatMsg = Trim(line);
+            if ((id == 0) || chatMsg.empty()) {
+                printf("Usage: cchat <sessionId> <msg>\n");
+                continue;
+            }
+            sessionTestObj.SendChatSignal(id, chatMsg.c_str(), flags);
+        } else if (cmd == "autochat") {
+            SessionId id = NextTokAsSessionId(line);
+            uint32_t count = StringToU32(NextTok(line), 0, 0);
+            uint32_t delay = StringToU32(NextTok(line), 0, 100);
+            uint32_t minSize = StringToU32(NextTok(line), 0, 10);
+            uint32_t maxSize = StringToU32(NextTok(line), 0, 100);
+            if ((id == 0) || (minSize > maxSize)) {
+                printf("Usage: autochat <sessionId> [count] [delay] [minSize] [maxSize]\n");
+                continue;
+            }
+            AutoChatThread::Launch(sessionTestObj, id, count, delay, minSize, maxSize);
+        } else if (cmd == "chatecho") {
+            String arg = NextTok(line);
+            if (arg == "on") {
+                s_chatEcho = true;
+            } else if (arg == "off") {
+                s_chatEcho = false;
+            } else {
+                printf("Usage: chatecho [on|off]\n");
+            }
         } else if (cmd == "exit") {
             break;
         } else if (cmd == "help") {
@@ -628,10 +769,14 @@ int main(int argc, char** argv)
             printf("list                                                          - List port bindings, discovered names and active sessions\n");
             printf("join <name> <port> [isMultipoint] [traffic] [proximity] [transports] - Join a session\n");
             printf("leave <sessionId>                                             - Leave a session\n");
-            printf("chat [-c] <sessionId> <msg>                                   - Send a message over a given session\n");
-            printf("                                                                If present option -c means use header compression\n");
+            printf("chat <sessionId> <msg>                                        - Send a message over a given session\n");
+            printf("cchat <sessionId> <msg>                                       - Send a message over a given session with compression\n");
+            printf("autochat <sessionId> [count] [delay] [minSize] [maxSize]      - Send periodic messages of various sizes\n");
+            printf("timeout <sessionId> <linkTimeout>                             - Set link timeout for a session\n");
+            printf("chatecho [on|off]                                             - Turn on/off chat messages\n");
             printf("exit                                                          - Exit this program\n");
             printf("\n");
+            printf("SessionIds can be specified by value or by #<idx> where <idx> is the session index printed with \"list\" command\n");
         } else {
             printf("Unknown command: %s\n", cmd.c_str());
         }

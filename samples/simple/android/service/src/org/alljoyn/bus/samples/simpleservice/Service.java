@@ -46,10 +46,10 @@ public class Service extends Activity {
     private native void simpleOnDestroy();
 
     /** Called to start service with a given well-known name */
-    private native boolean startService(String name);
+    private native boolean startService(String name, String packageName);
 
     /** Called to stop service */
-    private native void stopService();
+    private native void stopService(String name);
 
     /** Handler used to post messages from C++ into UI thread */
     private Handler handler = new Handler() {
@@ -76,7 +76,7 @@ public class Service extends Activity {
         startButton.setOnClickListener(new Button.OnClickListener() {
                                            public void onClick(View v) {
                                                EditText edit = (EditText) findViewById(R.id.AdvertisedName);
-                                               if (startService(edit.getText().toString())) {
+                                               if (startService(edit.getText().toString(), getPackageName())) {
                                                    Button startButton = (Button) v;
                                                    startButton.setEnabled(false);
                                                    Button stopButton = (Button) findViewById(R.id.StopButton);
@@ -90,12 +90,12 @@ public class Service extends Activity {
         Button stopButton = (Button) findViewById(R.id.StopButton);
         stopButton.setOnClickListener(new Button.OnClickListener() {
                                           public void onClick(View v) {
-                                              stopService();
+                                        	  EditText edit = (EditText) findViewById(R.id.AdvertisedName);
+                                              stopService(edit.getText().toString());
                                               Button stopButton = (Button) v;
                                               stopButton.setEnabled(false);
                                               Button startButton = (Button) findViewById(R.id.StartButton);
                                               startButton.setEnabled(true);
-                                              EditText edit = (EditText) findViewById(R.id.AdvertisedName);
                                               edit.setEnabled(true);
                                           }
                                       });

@@ -34,12 +34,17 @@
 
 #include "BDAddress.h"
 #include "BTController.h"
+#include "BTEndpoint.h"
 #include "BTTransport.h"
 
 #if defined QCC_OS_GROUP_POSIX
+#if defined(QCC_OS_DARWIN)
+#warning Darwin support for bluetooth to be implemented
+#else
 #include "bt_bluez/BTAccessor.h"
+#endif
 #elif defined QCC_OS_GROUP_WINDOWS
-#error Windows support to be implemented
+#include "bt_windows/BTAccessor.h"
 #endif
 
 #include <Status.h>
@@ -50,7 +55,10 @@
 using namespace std;
 using namespace qcc;
 using namespace ajn;
+
+#if !defined QCC_OS_GROUP_WINDOWS
 using namespace ajn::bluez;
+#endif
 
 namespace ajn {
 
@@ -82,6 +90,7 @@ BTTransport::~BTTransport()
     Join();
 
     delete btController;
+    btController = NULL;
     if (btmActive) {
         delete btAccessor;
     }
@@ -160,9 +169,9 @@ void* BTTransport::Run(void* arg)
                 conn->GetFeatures().allowRemote = false;
                 conn->GetFeatures().handlePassing = false;
 
-                threadListLock.Lock();
-                threadList.push_back(conn);
-                threadListLock.Unlock();
+                threadListLock.Lock(MUTEX_CONTEXT);
+                threadList.insert(conn);
+                threadListLock.Unlock(MUTEX_CONTEXT);
                 QCC_DbgPrintf(("BTTransport::Run: Calling conn->Establish() [for accepted connection]"));
                 status = conn->Establish("ANONYMOUS", authName);
                 if (ER_OK == status) {
@@ -171,7 +180,20 @@ void* BTTransport::Run(void* arg)
                     status = conn->Start();
                 }
 
-                if (ER_OK != status) {
+                if (ER_OK == status) {
+                    connNodeDB.Lock();
+                    const BTNodeInfo& connNode = reinterpret_cast<BTEndpoint*>(conn)->GetNode();
+                    BTNodeInfo node = connNodeDB.FindNode(connNode->GetBusAddress().addr);
+                    if (!node->IsValid()) {
+                        node = connNode;
+                        connNodeDB.AddNode(node);
+                    }
+
+                    node->IncConnCount();
+                    QCC_DbgPrintf(("Increment connection count for %s to %u: ACCEPT", node->ToString().c_str(), node->GetConnectionCount()));
+                    connNodeDB.Unlock();
+
+                } else {
                     QCC_LogError(status, ("Error starting RemoteEndpoint"));
                     EndpointExit(conn);
                     conn = NULL;
@@ -200,13 +222,14 @@ QStatus BTTransport::Start()
 
 QStatus BTTransport::Stop(void)
 {
+    QCC_DbgTrace(("BTTransport::Stop()"));
     if (!btmActive) {
         return ER_BUS_TRANSPORT_NOT_AVAILABLE;
     }
 
     transportIsStopping = true;
 
-    vector<RemoteEndpoint*>::iterator eit;
+    set<RemoteEndpoint*>::iterator eit;
 
     bool isStopping = IsStopping();
 
@@ -215,11 +238,11 @@ QStatus BTTransport::Stop(void)
     }
 
     /* Stop any endpoints that are running */
-    threadListLock.Lock();
+    threadListLock.Lock(MUTEX_CONTEXT);
     for (eit = threadList.begin(); eit != threadList.end(); ++eit) {
         (*eit)->Stop();
     }
-    threadListLock.Unlock();
+    threadListLock.Unlock(MUTEX_CONTEXT);
 
     return ER_OK;
 }
@@ -232,13 +255,13 @@ QStatus BTTransport::Join(void)
     }
 
     /* Wait for the thread list to empty out */
-    threadListLock.Lock();
+    threadListLock.Lock(MUTEX_CONTEXT);
     while (threadList.size() > 0) {
-        threadListLock.Unlock();
+        threadListLock.Unlock(MUTEX_CONTEXT);
         qcc::Sleep(50);
-        threadListLock.Lock();
+        threadListLock.Lock(MUTEX_CONTEXT);
     }
-    threadListLock.Unlock();
+    threadListLock.Unlock(MUTEX_CONTEXT);
     return Thread::Join();
 }
 
@@ -308,7 +331,7 @@ void BTTransport::DisableAdvertisement(const qcc::String& advertiseName, bool na
 }
 
 
-QStatus BTTransport::Connect(const char* connectSpec, RemoteEndpoint** newep)
+QStatus BTTransport::Connect(const char* connectSpec, const SessionOpts& opts, RemoteEndpoint** newep)
 {
     QCC_DbgTrace(("BTTransport::Connect(connectSpec = \"%s\")", connectSpec));
     if (!btmActive) {
@@ -323,15 +346,7 @@ QStatus BTTransport::Connect(const char* connectSpec, RemoteEndpoint** newep)
 
 QStatus BTTransport::Disconnect(const char* connectSpec)
 {
-    QCC_DbgTrace(("BTTransport::Disconnect(connectSpec = \"%s\")", connectSpec));
-    if (!btmActive) {
-        return ER_BUS_TRANSPORT_NOT_AVAILABLE;
-    }
-
-    qcc::String spec;
-    BTBusAddress addr(spec);
-
-    return Disconnect(addr);
+    return ER_OK;
 }
 
 // @@ TODO
@@ -362,6 +377,32 @@ QStatus BTTransport::StopListen(const char* listenSpec)
     return ER_OK;
 }
 
+void BTTransport::BTDeviceAvailable(bool avail)
+{
+    if (btController) {
+        btController->BTDeviceAvailable(avail);
+    }
+}
+
+bool BTTransport::CheckIncomingAddress(const BDAddress& addr) const
+{
+    if (btController) {
+        return btController->CheckIncomingAddress(addr);
+    } else {
+        return false;
+    }
+}
+
+void BTTransport::DisconnectAll()
+{
+    set<RemoteEndpoint*>::iterator eit;
+    threadListLock.Lock(MUTEX_CONTEXT);
+    for (eit = threadList.begin(); eit != threadList.end(); ++eit) {
+        (*eit)->Stop();
+    }
+    threadListLock.Unlock(MUTEX_CONTEXT);
+}
+
 void BTTransport::EndpointExit(RemoteEndpoint* endpoint)
 {
     if (!btmActive) {
@@ -372,23 +413,48 @@ void BTTransport::EndpointExit(RemoteEndpoint* endpoint)
                   endpoint->GetRemoteGUID().ToShortString().c_str(),
                   endpoint->GetConnectSpec().c_str()));
 
+    BTNodeInfo node;
+
+    connNodeDB.Lock();
+
     /* Remove thread from thread list */
-    threadListLock.Lock();
-    vector<RemoteEndpoint*>::iterator eit = find(threadList.begin(), threadList.end(), endpoint);
+    threadListLock.Lock(MUTEX_CONTEXT);
+    set<RemoteEndpoint*>::iterator eit = threadList.find(endpoint);
     if (eit != threadList.end()) {
+        BTEndpoint* btEp = reinterpret_cast<BTEndpoint*>(endpoint);
+        node = connNodeDB.FindNode(btEp->GetNode()->GetBusAddress().addr);
         threadList.erase(eit);
     }
-    threadListLock.Unlock();
+    threadListLock.Unlock(MUTEX_CONTEXT);
+
+    if (node->IsValid()) {
+        BTNodeInfo rnode = connNodeDB.FindNode(node->GetBusAddress().addr);
+        uint32_t connCount = rnode->DecConnCount();
+        QCC_DbgPrintf(("Decrement connection count for %s to %u: ENDPOINT_EXIT", node->ToString().c_str(), connCount));
+        if (connCount == 0) {
+            connNodeDB.RemoveNode(rnode);
+
+            // There should only ever have been one.
+            assert(!connNodeDB.FindNode(node->GetBusAddress().addr)->IsValid());
+        }
+
+        if (connCount == 1) {
+            btController->LostLastConnection(node->GetBusAddress().addr);
+        }
+    }
+
+    connNodeDB.Unlock();
 
     delete endpoint;
 }
 
 
-void BTTransport::DeviceChange(const BDAddress& adBdAddr,
-                               uint32_t uuidRev)
+void BTTransport::DeviceChange(const BDAddress& bdAddr,
+                               uint32_t uuidRev,
+                               bool eirCapable)
 {
-    if (btmActive) {
-        btController->ProcessDeviceChange(adBdAddr, uuidRev);
+    if (btController) {
+        btController->ProcessDeviceChange(bdAddr, uuidRev, eirCapable);
     }
 }
 
@@ -493,15 +559,14 @@ QStatus BTTransport::Connect(const BTBusAddress& addr,
 
     qcc::String authName;
 
-    BTBusAddress connAddr = btController->PrepConnect(addr);
-
-    if (!connAddr.IsValid()) {
+    BTNodeInfo connNode = btController->PrepConnect(addr);
+    if (!connNode->IsValid()) {
         status = ER_FAIL;
-        QCC_LogError(status, ("Connect address %s is for an unknown device", addr.ToString().c_str()));
+        QCC_LogError(status, ("No connect route to device with address %s", addr.ToString().c_str()));
         goto exit;
     }
 
-    conn = btAccessor->Connect(bus, connAddr, addr);
+    conn = btAccessor->Connect(bus, connNode);
     if (!conn) {
         status = ER_FAIL;
         goto exit;
@@ -512,11 +577,11 @@ QStatus BTTransport::Connect(const BTBusAddress& addr,
     conn->GetFeatures().allowRemote = bus.GetInternal().AllowRemoteMessages();
     conn->GetFeatures().handlePassing = false;
 
-    threadListLock.Lock();
-    threadList.push_back(conn);
-    threadListLock.Unlock();
+    threadListLock.Lock(MUTEX_CONTEXT);
+    threadList.insert(conn);
+    threadListLock.Unlock(MUTEX_CONTEXT);
     QCC_DbgPrintf(("BTTransport::Connect: Calling conn->Establish() [addr = %s via %s]",
-                   addr.ToString().c_str(), connAddr.ToString().c_str()));
+                   addr.ToString().c_str(), connNode->ToString().c_str()));
     status = conn->Establish("ANONYMOUS", authName);
     if (status != ER_OK) {
         QCC_LogError(status, ("BTEndpoint::Establish failed"));
@@ -525,7 +590,7 @@ QStatus BTTransport::Connect(const BTBusAddress& addr,
         goto exit;
     }
 
-    QCC_DbgPrintf(("Starting endpoint [addr = %s via %s]", addr.ToString().c_str(), connAddr.ToString().c_str()));
+    QCC_DbgPrintf(("Starting endpoint [addr = %s via %s]", addr.ToString().c_str(), connNode->ToString().c_str()));
     /* Start the endpoint */
     conn->SetListener(this);
     status = conn->Start();
@@ -545,6 +610,29 @@ exit:
     if (status == ER_OK) {
         if (newep) {
             *newep = conn;
+
+            connNodeDB.Lock();
+            BTNodeInfo connNode = reinterpret_cast<BTEndpoint*>(conn)->GetNode();
+            BTNodeInfo node = connNodeDB.FindNode(connNode->GetBusAddress().addr);
+            if (!node->IsValid() || (node->GetBusAddress().psm == bt::INCOMING_PSM)) {
+                if (node->GetBusAddress().psm == bt::INCOMING_PSM) {
+                    connNode->SetConnectionCount(node->GetConnectionCount());
+                    if ((connNode->GetSessionState() != _BTNodeInfo::SESSION_UP) &&
+                        (node->GetSessionState() != _BTNodeInfo::NO_SESSION)) {
+                        connNode->SetSessionState(node->GetSessionState());
+                    }
+                    connNodeDB.RemoveNode(node);
+
+                    QCC_DbgPrintf(("Set connection count for %s to %u: CONNECT", connNode->ToString().c_str(), connNode->GetConnectionCount()));
+                }
+                node = connNode;
+                connNodeDB.AddNode(node);
+            }
+
+            node->IncConnCount();
+            QCC_DbgPrintf(("Increment connection count for %s to %u: CONNECT", node->ToString().c_str(), node->GetConnectionCount()));
+            connNodeDB.Unlock();
+
         }
     } else {
         if (newep) {
@@ -553,23 +641,35 @@ exit:
     }
 
     String emptyName;
-    btController->PostConnect(status, addr, conn ? conn->GetRemoteName() : emptyName);
+    btController->PostConnect(status, connNode, conn ? conn->GetRemoteName() : emptyName);
 
     return status;
 }
 
 
-QStatus BTTransport::Disconnect(const BTBusAddress& addr)
+QStatus BTTransport::Disconnect(const String& busName)
 {
-    return btAccessor->Disconnect(addr);
+    QCC_DbgTrace(("BTTransport::Disconnect(busName = %s)", busName.c_str()));
+    QStatus status(ER_BUS_BAD_TRANSPORT_ARGS);
+
+    set<RemoteEndpoint*>::iterator eit;
+
+    threadListLock.Lock(MUTEX_CONTEXT);
+    for (eit = threadList.begin(); eit != threadList.end(); ++eit) {
+        if (busName == (*eit)->GetUniqueName()) {
+            status = (*eit)->Stop();
+        }
+    }
+    threadListLock.Unlock(MUTEX_CONTEXT);
+    return status;
 }
 
 
 RemoteEndpoint* BTTransport::LookupEndpoint(const qcc::String& busName)
 {
     RemoteEndpoint* ep = NULL;
-    vector<RemoteEndpoint*>::iterator eit;
-    threadListLock.Lock();
+    set<RemoteEndpoint*>::iterator eit;
+    threadListLock.Lock(MUTEX_CONTEXT);
     for (eit = threadList.begin(); eit != threadList.end(); ++eit) {
         if ((*eit)->GetRemoteName() == busName) {
             ep = *eit;
@@ -577,30 +677,33 @@ RemoteEndpoint* BTTransport::LookupEndpoint(const qcc::String& busName)
         }
     }
     if (!ep) {
-        threadListLock.Unlock();
+        threadListLock.Unlock(MUTEX_CONTEXT);
     }
     return ep;
 }
 
 
 void BTTransport::ReturnEndpoint(RemoteEndpoint* ep) {
-    if (find(threadList.begin(), threadList.end(), ep) != threadList.end()) {
-        threadListLock.Unlock();
+    if (threadList.find(ep) != threadList.end()) {
+        threadListLock.Unlock(MUTEX_CONTEXT);
     }
 }
 
 
-QStatus BTTransport::Disconnect(const qcc::String& busName)
+QStatus BTTransport::IsMaster(const BDAddress& addr, bool& master) const
 {
-    QStatus status = ER_OK;
-    RemoteEndpoint* ep = LookupEndpoint(busName);
-    if (ep) {
-        ReturnEndpoint(ep);
-        status = ep->Stop();
-    }
-
-    return status;
+    return btAccessor->IsMaster(addr, master);
 }
 
+
+void BTTransport::RequestBTRole(const BDAddress& addr, bt::BluetoothRole role)
+{
+    btAccessor->RequestBTRole(addr, role);
+}
+
+bool BTTransport::IsEIRCapable() const
+{
+    return btAccessor->IsEIRCapable();
+}
 
 }

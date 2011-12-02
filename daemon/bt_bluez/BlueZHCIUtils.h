@@ -26,6 +26,9 @@
 
 #include <qcc/Socket.h>
 
+#include "BDAddress.h"
+#include "BTTransportConsts.h"
+
 #include <Status.h>
 
 namespace ajn {
@@ -34,7 +37,13 @@ namespace bluez {
 /**
  * Set the L2CAP mtu to something better than the BT 1.0 default value.
  */
-void ConfigL2cap(qcc::SocketFd sockFd);
+void ConfigL2capMTU(qcc::SocketFd sockFd);
+
+void ConfigL2capMaster(qcc::SocketFd sockFd);
+
+QStatus IsMaster(uint16_t deviceId, const BDAddress& addr, bool& master);
+
+QStatus RequestBTRole(uint16_t deviceId, const BDAddress& addr, bt::BluetoothRole role);
 
 
 /**
@@ -64,6 +73,8 @@ QStatus ConfigurePeriodicInquiry(uint16_t deviceId,
 
 
 QStatus ConfigureSimplePairingDebugMode(uint16_t deviceId, bool enable);
+
+QStatus ConfigureClassOfDevice(uint16_t deviceId, uint32_t cod);
 
 } // namespace bluez
 } // namespace ajn

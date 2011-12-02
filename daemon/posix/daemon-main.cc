@@ -50,17 +50,28 @@
 #include "Transport.h"
 #include "DaemonTCPTransport.h"
 #include "DaemonUnixTransport.h"
+#include "DaemonLaunchdTransport.h"
+
+#if defined(QCC_OS_DARWIN)
+#warning BT Support on Darwin needs to be implemented
+#else
 #include "BTTransport.h"
+#endif
+
 #include "Bus.h"
 #include "BusController.h"
 #include "ConfigDB.h"
 
 #if !defined(DAEMON_LIB)
+
+#if defined(QCC_OS_LINUX) || defined(QCC_OS_ANDROID)
 #include <sys/prctl.h>
 #include <linux/capability.h>
 extern "C" {
 extern int capset(cap_user_header_t hdrp, const cap_user_data_t datap);
 }
+#endif
+
 #if defined(QCC_OS_ANDROID)
 #define BLUETOOTH_UID 1002
 #endif
@@ -93,6 +104,7 @@ static const char internalConfig[] =
     "<busconfig>"
     "  <type>alljoyn</type>"
     "  <listen>unix:abstract=alljoyn</listen>"
+    "  <listen>launchd:env=DBUS_LAUNCHD_SESSION_BUS_SOCKET</listen>"
     "  <listen>bluetooth:</listen>"
     "  <listen>tcp:addr=0.0.0.0,port=9955</listen>"
     "  <policy context=\"default\">"
@@ -110,6 +122,13 @@ static const char internalConfig[] =
     "    <property interfaces=\"*\"/>"
     "  </alljoyn>"
     "</busconfig>";
+
+
+static const char versionPreamble[] =
+    "AllJoyn Message Bus Daemon version: %s\n"
+    "Copyright (c) 2009-2011 Qualcomm Innovation Center, Inc.\n"
+    "Licensed under Apache2.0: http://www.apache.org/licenses/LICENSE-2.0.html\n"
+    "Build: %s\n";
 
 
 void SignalHandler(int sig)
@@ -141,7 +160,7 @@ class OptParse {
     };
 
     OptParse(int argc, char** argv) :
-        argc(argc), argv(argv), fork(false), noFork(false), noBT(false), noTCP(false), noSwitchUser(false),
+        argc(argc), argv(argv), fork(false), noFork(false), noBT(false), noTCP(false), noLaunchd(false), noSwitchUser(false),
         printAddressFd(-1), printPidFd(-1),
         session(false), system(false), internal(false), configService(false), verbosity(LOG_WARNING)
     { }
@@ -153,6 +172,7 @@ class OptParse {
     bool GetNoFork() const { return noFork; }
     bool GetNoBT() const { return noBT; }
     bool GetNoTCP() const { return noTCP; }
+    bool GetNoLaunchd() const { return noLaunchd; }
     bool GetNoSwitchUser() const { return noSwitchUser; }
     int GetPrintAddressFd() const { return printAddressFd; }
     int GetPrintPidFd() const { return printPidFd; }
@@ -169,6 +189,7 @@ class OptParse {
     bool noFork;
     bool noBT;
     bool noTCP;
+    bool noLaunchd;
     bool noSwitchUser;
     int printAddressFd;
     int printPidFd;
@@ -194,8 +215,8 @@ void OptParse::PrintUsage()
 #endif
             "]\n"
             "%*s [--print-address[=DESCRIPTOR]] [--print-pid[=DESCRIPTOR]]\n"
-            "%*s [--fork | --nofork] [--no-bt] [--no-tcp] [--no-switch-user]\n"
-            "%*s [--verbosity=LEVEL] [--version]\n\n"
+            "%*s [--fork | --nofork] [--no-bt] [--no-tcp] [--no-launchd]\n"
+            "%*s  [--no-switch-user] [--verbosity=LEVEL] [--version]\n\n"
             "    --session\n"
             "        Use the standard configuration for the per-login-session message bus.\n\n"
             "    --system\n"
@@ -221,6 +242,8 @@ void OptParse::PrintUsage()
             "        Disable the Bluetooth transport (override config file setting).\n\n"
             "    --no-tcp\n"
             "        Disable the TCP transport (override config file setting).\n\n"
+            "    --no-launchd\n"
+            "        Disable the Launchd transport (override config file setting).\n\n"
             "    --no-switch-user\n"
             "        Don't switch from root to "
 #if defined(QCC_OS_ANDROID)
@@ -253,11 +276,7 @@ OptParse::ParseResultCode OptParse::ParseResult()
         qcc::String arg(argv[i]);
 
         if (arg.compare("--version") == 0) {
-            printf("AllJoyn Message Bus Daemon version: %s\n"
-                   "Copyright (c) 2009-2011 Qualcomm Innovation Center, Inc.\n"
-                   "Licensed under Apache2.0: http://www.apache.org/licenses/LICENSE-2.0.html\n"
-                   "\n"
-                   "Build: %s\n", GetVersion(), GetBuildInfo());
+            printf(versionPreamble, GetVersion(), GetBuildInfo());
             result = PR_EXIT_NO_ERROR;
             goto exit;
         } else if (arg.compare("--session") == 0) {
@@ -349,6 +368,8 @@ OptParse::ParseResultCode OptParse::ParseResult()
             noBT = true;
         } else if (arg.compare("--no-tcp") == 0) {
             noTCP = true;
+        } else if (arg.compare("--no-launchd") == 0) {
+            noLaunchd = true;
         } else if (arg.compare("--no-switch-user") == 0) {
             noSwitchUser = true;
         } else if (arg.substr(0, sizeof("--verbosity") - 1).compare("--verbosity") == 0) {
@@ -427,6 +448,9 @@ int daemon(OptParse& opts)
                 env->Add(var, addrStr);
             }
 
+        } else if (it->compare(0, sizeof("launchd:") - 1, "launchd:") == 0) {
+            skip = opts.GetNoLaunchd();
+
         } else if (it->compare(0, sizeof("tcp:") - 1, "tcp:") == 0) {
             skip = opts.GetNoTCP();
 
@@ -462,7 +486,12 @@ int daemon(OptParse& opts)
     TransportFactoryContainer cntr;
     cntr.Add(new TransportFactory<DaemonTCPTransport>("tcp", false));
     cntr.Add(new TransportFactory<DaemonUnixTransport>("unix", false));
+    cntr.Add(new TransportFactory<DaemonLaunchdTransport>("launchd", false));
+#if defined(QCC_OS_DARWIN)
+#warning BT transport factory needs to be implemented for Darwin
+#else
     cntr.Add(new TransportFactory<BTTransport>("bluetooth", false));
+#endif
 
     Bus ajBus("alljoyn-daemon", cntr, listenSpecs.c_str());
     BusController ajBusController(ajBus, status);
@@ -480,7 +509,6 @@ int daemon(OptParse& opts)
     if (!config->GetAuth().empty()) {
         if (ajBus.GetInternal().FilterAuthMechanisms(config->GetAuth()) == 0) {
             Log(LOG_ERR, "No supported authentication mechanisms.  Aborting...\n");
-            ajBus.Stop();
             return DAEMON_EXIT_STARTUP_ERROR;
         }
     }
@@ -488,7 +516,6 @@ int daemon(OptParse& opts)
     status = ajBus.StartListen(listenSpecs.c_str());
     if (ER_OK != status) {
         Log(LOG_ERR, "Failed to start listening on specified addresses\n");
-        ajBus.Stop();
         return DAEMON_EXIT_STARTUP_ERROR;
     }
 
@@ -558,8 +585,6 @@ int daemon(OptParse& opts)
 
     Log(LOG_INFO, "Terminating.\n");
     ajBus.StopListen(listenSpecs.c_str());
-    ajBus.Stop();
-    ajBus.WaitStop();
 
     if (!pidfn.empty()) {
         unlink(pidfn.c_str());
@@ -576,7 +601,7 @@ int daemon(OptParse& opts)
 // called from the Java service code.
 //
 #if defined(DAEMON_LIB)
-extern "C" int DaemonMain(int argc, char** argv, char* serviceConfig)
+int DaemonMain(int argc, char** argv, char* serviceConfig)
 #else
 int main(int argc, char** argv, char** env)
 #endif
@@ -631,10 +656,14 @@ int main(int argc, char** argv, char** env)
     loggerSettings->SetSyslog(config->GetSyslog());
     loggerSettings->SetFile((opts.GetFork() || (config->GetFork() && !opts.GetNoFork())) ? NULL : stderr);
 
+    Log(LOG_NOTICE, versionPreamble, GetVersion(), GetBuildInfo());
+
 #if !defined(DAEMON_LIB)
     if (!opts.GetNoSwitchUser()) {
+#if defined(QCC_OS_LINUX) || defined(QCC_OS_ANDROID)
         // Keep all capabilities before switching users
         prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+#endif
 
 #if defined(QCC_OS_ANDROID)
         // Android uses hard coded UIDs.
@@ -662,6 +691,7 @@ int main(int argc, char** argv, char** env)
         }
 #endif
 
+#if defined(QCC_OS_LINUX) || defined(QCC_OS_ANDROID)
         // Set the capabilities we need.
         struct __user_cap_header_struct header;
         struct __user_cap_data_struct cap;
@@ -673,8 +703,11 @@ int main(int argc, char** argv, char** env)
         cap.effective = cap.permitted;
         cap.inheritable = 0;
         capset(&header, &cap);
+#endif
     }
 #endif
+
+    Log(LOG_INFO, "Running with effective userid %d\n", geteuid());
 
     if (opts.GetFork() || (config->GetFork() && !opts.GetNoFork())) {
         Log(LOG_DEBUG, "Forking into daemon mode...\n");

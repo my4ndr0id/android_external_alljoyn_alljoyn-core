@@ -64,15 +64,11 @@ const char* Path = "/org/alljoyn/sock_test";
 
 static BusAttachment* gBus = NULL;
 
-/** Signal handler */
+static volatile sig_atomic_t g_interrupt = false;
+
 static void SigIntHandler(int sig)
 {
-    if (gBus) {
-        QStatus status = gBus->Stop(false);
-        if (ER_OK != status) {
-            QCC_LogError(status, ("BusAttachment::Stop() failed"));
-        }
-    }
+    g_interrupt = true;
 }
 
 static void usage(void)
@@ -91,6 +87,7 @@ static const char ifcXML[] =
     "  <interface name=\"org.alljoyn.sock_test\">"
     "    <method name=\"PutSock\">"
     "      <arg name=\"sock\" type=\"h\" direction=\"in\"/>"
+    "      <arg name=\"sockOut\" type=\"h\" direction=\"out\"/>"
     "    </method>"
     "    <method name=\"GetSock\">"
     "      <arg name=\"sock\" type=\"h\" direction=\"out\"/>"
@@ -139,7 +136,9 @@ class SockService : public BusObject {
         if (status == ER_OK) {
             status = qcc::SocketDup(handle, handle);
             if (status == ER_OK) {
-                status = MethodReply(msg);
+                status = MethodReply(msg, msg->GetArg(0), 1);
+            } else {
+                status = MethodReply(msg, status);
             }
         }
         if (status == ER_OK) {
@@ -251,7 +250,7 @@ int main(int argc, char** argv)
     BusAttachment bus("sock_test");
     bool client = false;
     bool server = false;
-    size_t iterations = 1;
+    uint32_t iterations = 1;
     Environ* env;
 
     printf("AllJoyn Library version: %s\n", ajn::GetVersion());
@@ -326,7 +325,8 @@ int main(int argc, char** argv)
             QCC_LogError(status, ("Failed to parse XML"));
             goto Exit;
         }
-        for (size_t i = 0; i < iterations; ++i) {
+        for (uint32_t i = 0; i < iterations; ++i) {
+            printf("Iteration %u: ", i + 1);
             /* Create a connected pair if sockets */
             status = SocketPair(handles, 9900 + i);
             if (status != ER_OK) {
@@ -353,7 +353,7 @@ int main(int argc, char** argv)
                         break;
                     }
                     if (status == ER_OK) {
-                        printf("Received %d bytes: %s\n", (int)recvd, buf);
+                        printf("received %d bytes: %s", (int)recvd, buf);
                     } else {
                         QCC_LogError(status, ("Recv failed"));
                     }
@@ -363,8 +363,10 @@ int main(int argc, char** argv)
                     QCC_LogError(status, ("PutSock failed"));
                 }
             }
+            if (g_interrupt) {
+                break;
+            }
         }
-        bus.WaitStop();
     } else {
         QStatus status = bus.CreateInterfacesFromXml(ifcXML);
         if (status != ER_OK) {
@@ -373,7 +375,10 @@ int main(int argc, char** argv)
         }
         SockService sockService(bus);
         bus.RegisterBusObject(sockService);
-        bus.WaitStop();
+
+        while (g_interrupt == false) {
+            qcc::Sleep(100);
+        }
     }
 
 Exit:

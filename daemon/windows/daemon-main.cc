@@ -43,6 +43,12 @@
 
 #include "Transport.h"
 #include "DaemonTCPTransport.h"
+#if defined(QCC_OS_DARWIN)
+#warning BT Support on Darwin needs to be implemented
+#else
+#include "BTTransport.h"
+#endif
+
 #include "Bus.h"
 #include "BusController.h"
 #include "ConfigDB.h"
@@ -68,12 +74,12 @@ static const char defaultConfig[] =
     "<busconfig>"
     "  <type>alljoyn</type>"
     "  <listen>tcp:addr=0.0.0.0,port=9955</listen>"
-    //"  <listen>bluetooth:</listen>"
+    "  <listen>bluetooth:</listen>"
     "  <policy context=\"default\">"
     "    <!-- Allow everything to be sent -->"
-    "    <allow send_destination=\"*\" eavesdrop=\"true\"/>"
-    "    <!-- Allow everything to be received -->"
-    "    <allow eavesdrop=\"true\"/>"
+    "    <allow send_destination=\"*\" eavesdrop=\"false\"/>"
+    "    <!-- Disable eavesdropping -->"
+    "    <allow eavesdrop=\"false\"/>"
     "    <!-- Allow anyone to own anything -->"
     "    <allow own=\"*\"/>"
     "  </policy>"
@@ -85,15 +91,11 @@ static const char defaultConfig[] =
     "  </alljoyn>"
     "</busconfig>";
 
-BusAttachment* g_ajBus = NULL;
+static volatile sig_atomic_t g_interrupt = false;
 
-void SignalHandler(int signal)
+static void SignalHandler(int sig)
 {
-    if (g_ajBus) {
-        Log(LOG_INFO, "Terminating.\n");
-        g_ajBus->Stop();
-        g_ajBus = NULL;
-    }
+    g_interrupt = true;
 }
 
 class OptParse {
@@ -200,6 +202,7 @@ OptParse::ParseResultCode OptParse::ParseResult()
             result = PR_EXIT_NO_ERROR;
             goto exit;
         } else {
+            PrintUsage();
             result = PR_INVALID_OPTION;
             goto exit;
         }
@@ -236,9 +239,9 @@ int daemon(OptParse& opts)
     const ConfigDB::ListenList& listenList = config->GetListen();
     ConfigDB::ListenList::const_iterator it = listenList.begin();
     qcc::String listenSpecs;
-    bool skip = false;
 
     while (it != listenList.end()) {
+        bool skip = false;
         qcc::String addrStr(*it);
         if (it->compare(0, sizeof("tcp:") - 1, "tcp:") == 0) {
             // No special processing needed for TCP.
@@ -276,6 +279,9 @@ int daemon(OptParse& opts)
     //
     TransportFactoryContainer cntr;
     cntr.Add(new TransportFactory<DaemonTCPTransport>("tcp", false));
+    if (!opts.GetNoBT()) {
+        cntr.Add(new TransportFactory<BTTransport>("bluetooth", false));
+    }
 
     Bus ajBus("alljoyn-daemon", cntr, listenSpecs.c_str());
     BusController ajBusController(ajBus, status);
@@ -294,6 +300,7 @@ int daemon(OptParse& opts)
         if (ajBus.GetInternal().FilterAuthMechanisms(config->GetAuth()) == 0) {
             Log(LOG_ERR, "No supported authentication mechanisms.  Aborting...\n");
             ajBus.Stop();
+            ajBus.Join();
             return DAEMON_EXIT_STARTUP_ERROR;
         }
     }
@@ -302,6 +309,7 @@ int daemon(OptParse& opts)
     if (ER_OK != status) {
         Log(LOG_ERR, "Failed to start listening on specified addresses\n");
         ajBus.Stop();
+        ajBus.Join();
         return DAEMON_EXIT_STARTUP_ERROR;
     }
 
@@ -312,12 +320,18 @@ int daemon(OptParse& opts)
         printf("%s", addrStr.c_str());
     }
 
-    g_ajBus = &ajBus;
     /*
-     * Wait until bus is stopped
+     * Wait until we find a Control-C happening.
      */
-    ajBus.WaitStop();
+    while (g_interrupt == false) {
+        qcc::Sleep(100);
+    }
 
+    /*
+     * We are shutting down, relying on the C++ scoping rules to cause the
+     * destructor for the ajBus to be run and the bus to be shut down in
+     * an orderly fashion.
+     */
     return DAEMON_EXIT_OK;
 }
 

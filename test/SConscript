@@ -17,6 +17,7 @@ Import('env')
 
 # Test Programs
 progs = [
+    env.Program('bignum',        ['bignum.cc']),
     env.Program('socktest',      ['socktest.cc']),
     env.Program('autochat',      ['autochat.cc']),
     env.Program('remarshal',     ['remarshal.cc']),
@@ -26,22 +27,21 @@ progs = [
     env.Program('aes_ccm',       ['aes_ccm.cc']),
     env.Program('keystore',      ['keystore.cc']),
     env.Program('bbservice',     ['bbservice.cc']),
-    env.Program('bbdisco',       ['bbdisco.cc']),
     env.Program('bbsig',         ['bbsig.cc']),
     env.Program('bbclient',      ['bbclient.cc']),
+    env.Program('bbjoin',        ['bbjoin.cc']),
     env.Program('bttimingclient', ['bttimingclient.cc']),
     env.Program('marshal',       ['marshal.cc']),
     env.Program('names',         ['names.cc']),
     env.Program('compression',   ['compression.cc']),
-    env.Program('bbcodisco',     ['bb_codisco.cc']),
     env.Program('rawclient',     ['rawclient.cc']),
     env.Program('rawservice',    ['rawservice.cc']),
     env.Program('sessions',      ['sessions.cc'])
     ]
 
 if env['OS'] == 'linux' or env['OS'] == 'android':
-   progs.extend(env.Program('bbkiller',   ['bbkiller.cc'])),
-   progs.extend(env.Program('mc-rcv',     ['mc-rcv.cc'])),
+   progs.extend(env.Program('mc-rcv',     ['mc-rcv.cc']))
    progs.extend(env.Program('mc-snd',     ['mc-snd.cc']))
+   progs.extend(env.Program('bluetoothd-crasher',     ['bluetoothd-crasher.cc']))
 
 Return('progs')

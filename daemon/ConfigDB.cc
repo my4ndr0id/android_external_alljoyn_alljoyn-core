@@ -22,6 +22,9 @@
 
 #include <errno.h>
 #include <sys/types.h>
+#if !defined(QCC_OS_WINDOWS)
+#include <pwd.h>
+#endif
 
 #include <list>
 #include <map>
@@ -136,18 +139,45 @@ bool ConfigDB::DB::ParseSource(qcc::String fileName, Source& src)
 
 bool ConfigDB::DB::ParseFile(qcc::String fileName, bool ignore_missing)
 {
-    FileSource fs(fileName);
+
     bool success(true);
 
+    qcc::String expandedFileName;
+    int position;
+
+    /* Check if the file path contains tilde (~) */
+    if (fileName[0] == '~') {
+#if !defined(QCC_OS_WINDOWS)
+        qcc::String home(getenv("HOME"));
+        /* If HOME is not set get the user from the present working directory */
+        if (home.empty()) {
+            struct passwd*pwd = getpwuid(getuid());
+            if (pwd) {
+                home = pwd->pw_dir;
+            }
+        }
+        home += '/';
+        /* Reconstruct the path from either case when HOME was set or not */
+        position = fileName.find_first_of('/');
+        expandedFileName = home + fileName.substr(position + 1);
+#endif
+    } else {
+        expandedFileName = fileName;
+    }
+
+    FileSource fs(expandedFileName.c_str());
+
     if (fs.IsValid()) {
-        success = ParseSource(fileName, fs);
+        success = ParseSource(expandedFileName.c_str(), fs);
     } else if (!ignore_missing) {
-        Log(LOG_ERR, "Failed to open \"%s\": %s\n", fileName.c_str(), strerror(errno));
+        Log(LOG_ERR, "Failed to open \"%s\": %s\n", expandedFileName.c_str(), strerror(errno));
         success = false;
     }
 
     return success;
 }
+
+
 
 
 bool ConfigDB::DB::ProcessAssociate(const qcc::String fileName, const XmlElement& associate)
@@ -428,7 +458,11 @@ bool ConfigDB::DB::ProcessListen(const qcc::String fileName, const XmlElement& l
             fileName.c_str(), listen.GetName().c_str());
         success = false;
     } else {
-        listenList.push_back(addr);
+        if (listenList.find(addr) != listenList.end()) {
+            Log(LOG_WARNING, "Warning processing \"%s\": Duplicate listen spec found (ignoring): %s\n",
+                fileName.c_str(), addr.c_str());
+        }
+        listenList.insert(addr);
     }
 
     return success;

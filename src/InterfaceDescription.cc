@@ -24,6 +24,7 @@
 #include <qcc/String.h>
 #include <qcc/StringMapKey.h>
 #include <map>
+#include <alljoyn/AllJoynStd.h>
 #include <alljoyn/DBusStd.h>
 #include <Status.h>
 
@@ -164,6 +165,9 @@ qcc::String InterfaceDescription::Introspect(size_t indent) const
         }
         ++pit;
     }
+    if (IsSecure()) {
+        xml += in + "  <annotation name=\"" + org::alljoyn::Bus::Secure + "\" value=\"true\"/>\n";
+    }
     xml += in + "</interface>\n";
     return xml;
 }
@@ -173,14 +177,15 @@ QStatus InterfaceDescription::AddMember(AllJoynMessageType type,
                                         const char* inSig,
                                         const char* outSig,
                                         const char* argNames,
-                                        uint8_t annotation)
+                                        uint8_t annotation,
+                                        const char* accessPerms)
 {
     if (isActivated) {
         return ER_BUS_INTERFACE_ACTIVATED;
     }
 
     StringMapKey key = qcc::String(name);
-    Member member(this, type, name, inSig, outSig, argNames, annotation);
+    Member member(this, type, name, inSig, outSig, argNames, annotation, accessPerms);
     pair<StringMapKey, Member> item(key, member);
     pair<map<StringMapKey, Member>::iterator, bool> ret = defs->members.insert(item);
     return ret.second ? ER_OK : ER_BUS_MEMBER_ALREADY_EXISTS;

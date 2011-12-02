@@ -25,11 +25,12 @@
 #include <qcc/platform.h>
 
 #include <map>
-#include <queue>
+#include <deque>
 
 #include <qcc/GUID.h>
 #include <qcc/String.h>
-#include <qcc/Thread.h>
+#include <qcc/Timer.h>
+#include <qcc/KeyBlob.h>
 
 #include <alljoyn/BusObject.h>
 #include <alljoyn/Message.h>
@@ -37,6 +38,7 @@
 #include "BusEndpoint.h"
 #include "RemoteEndpoint.h"
 #include "PeerState.h"
+#include "AuthMechanism.h"
 
 namespace ajn {
 
@@ -44,7 +46,6 @@ namespace ajn {
 /* Forward declaration */
 class SASLEngine;
 class BusAttachment;
-class AuthListener;
 
 /**
  * The AllJoynPeer object @c /org/alljoyn/Bus/Peer implements interfaces that provide AllJoyn
@@ -52,7 +53,7 @@ class AuthListener;
  *
  * %AllJoynPeerObj inherits from BusObject
  */
-class AllJoynPeerObj : public BusObject, public BusListener {
+class AllJoynPeerObj : public BusObject, public BusListener, public qcc::AlarmListener {
   public:
 
     /**
@@ -90,6 +91,17 @@ class AllJoynPeerObj : public BusObject, public BusListener {
     QStatus RequestHeaderExpansion(Message& msg, RemoteEndpoint* sender);
 
     /**
+     * This function is called when an encrypted message requires authentication.
+     *
+     * @param msg     The message to be encrypted.
+     * @param sender  The remote endpoint that the encrypted message will be sent to
+     * @return
+     *      - ER_OK if successful
+     *      - An error status otherwise
+     */
+    QStatus RequestAuthentication(Message& msg, RemoteEndpoint* sender);
+
+    /**
      * Setup for peer-to-peer authentication. The authentication mechanisms listed can only be used
      * if they are already registered with bus. The authentication mechanisms names are separated by
      * space characters.
@@ -100,22 +112,50 @@ class AllJoynPeerObj : public BusObject, public BusListener {
      */
     void SetupPeerAuthentication(const qcc::String& authMechanisms, AuthListener* listener) {
         peerAuthMechanisms = authMechanisms;
-        peerAuthListener = listener;
+        peerAuthListener.Set(listener);
     }
 
     /**
-     * Secure the connection to a remote peer. A secure connection is authenticated and has
-     * established a session key with a remote peer.
+     * Check if authentication has been enabled.
+     *
+     * @return  Returns true is there are authentication mechanisms registered.
+     */
+    bool AuthenticationEnabled() { return !peerAuthMechanisms.empty(); }
+
+    /**
+     * Force re-authentication for the specified peer.
+     */
+    void ForceAuthentication(const qcc::String& busName);
+
+    /**
+     * Authenticate the connection to a remote peer. Authentication establishes a session key with a remote peer.
      *
      * @param busName   The bus name of the remote peer we are securing.
-     * @param forceAuth If true, forces an re-authentication even if the peer connection is already
-     *                  authenticated.
+     * @param wait      If true the function will block if there is an authentication already in
+     *                  progress with the peer on a separate thread. If false, the function will
+     *                  return an ER_WOULD_BLOCK status instead of waiting.
      *
      * @return
      *      - ER_OK if successful
+     *      - ER_WOULD_BLOCK if there is already an authentication in progress with the remote peer
+     *        and the wait parameter was false.
      *      - An error status otherwise
      */
-    QStatus SecurePeerConnection(const qcc::String& busName, bool forceAuth = false);
+    QStatus AuthenticatePeer(AllJoynMessageType msgType,  const qcc::String& busName, bool wait = true);
+
+    /**
+     * Authenticate the connection to a remote peer asynchronously. Authentication establishes a session key with
+     * a remote peer.
+     *
+     * Notification of success or failure will be via the AuthListener.
+     *
+     * @param busName   The bus name of the remote peer we are securing.
+     *
+     * @return
+     *      - ER_OK if the authentication is successfully begun
+     *      - An error status otherwise
+     */
+    QStatus AuthenticatePeerAsync(const qcc::String& busName);
 
     /**
      * Reports a security failure. This would normally be due to stale or expired keys.
@@ -156,11 +196,36 @@ class AllJoynPeerObj : public BusObject, public BusListener {
     QStatus Join();
 
     /**
+     * Dispatcher callback.
+     * (For internal use only)
+     */
+    void AlarmTriggered(const qcc::Alarm& alarm, QStatus reason);
+
+    /**
      * Destructor
      */
     ~AllJoynPeerObj();
 
   private:
+
+    /**
+     * Types of request that can be queued.
+     */
+    typedef enum {
+        AUTHENTICATE_PEER,
+        AUTH_CHALLENGE,
+        EXPAND_HEADER,
+        ACCEPT_SESSION,
+        SECURE_CONNECTION
+    } RequestType;
+
+    /* Dispatcher context */
+    struct Request {
+        Message msg;
+        RequestType reqType;
+        const qcc::String data;
+        Request(const Message& msg, RequestType type, const qcc::String& data) : msg(msg), reqType(type), data(data) { }
+    };
 
     /**
      * Header decompression method'
@@ -223,7 +288,7 @@ class AllJoynPeerObj : public BusObject, public BusListener {
      * @param seed       A seed string negotiated by the peers.
      * @param verifier   A verifier string that used to verify the session key.
      */
-    QStatus KeyGen(PeerState& peerState, qcc::String seed, qcc::String& verifier);
+    QStatus KeyGen(PeerState& peerState, qcc::String seed, qcc::String& verifier, qcc::KeyBlob::Role role);
 
     /**
      * Get a property from this object
@@ -246,12 +311,21 @@ class AllJoynPeerObj : public BusObject, public BusListener {
     void NameOwnerChanged(const char* busName, const char* previousOwner, const char* newOwner);
 
     /**
-     * AcceptSession method handler called when the local daemon asks permission to accpet a JoinSession request.
+     * AcceptSession method handler called when the local daemon asks permission to accept a JoinSession request.
      *
      * @param member  The member that was called
      * @param msg     The method call message
      */
     void AcceptSession(const InterfaceDescription::Member* member, Message& msg);
+
+    /**
+     * Add a Request to the peer object's dispatcher
+     *
+     * @param msg       Message to be dispatched.
+     * @param reqType   Type of AllJoynPeerObj request.
+     * @param data      Optional reqType specific data.
+     */
+    QStatus DispatchRequest(Message& msg, AllJoynPeerObj::RequestType reqType, const qcc::String data = "");
 
     /**
      * The peer-to-peer authentication mechanisms available to this object
@@ -261,59 +335,21 @@ class AllJoynPeerObj : public BusObject, public BusListener {
     /**
      * The listener for interacting with the application
      */
-    AuthListener* peerAuthListener;
+    ProtectedAuthListener peerAuthListener;
 
     /**
      * Peer endpoints currently in an authentication conversation
      */
     std::map<qcc::String, SASLEngine*> conversations;
 
-    /**
-     * Short term lock to protect the peer object.
-     */
+    /** Short term lock to protect the peer object. */
     qcc::Mutex lock;
 
-    /**
-     * Long term lock held while securing a connection. This serializes all client initiated authentications.
-     */
-    static qcc::Mutex clientLock;
+    /** Dispatcher for handling peer object requests */
+    qcc::Timer dispatcher;
 
-    /**
-     * Types of request that can be queued.
-     */
-    typedef enum {
-        SECURE_PEER,
-        AUTH_CHALLENGE,
-        EXPAND_HEADER,
-        ACCEPT_SESSION
-    } RequestType;
-
-    /**
-     * Class for handling deferred peer requests.
-     */
-    class RequestThread : public qcc::Thread {
-      public:
-        RequestThread(AllJoynPeerObj& peerObj) : qcc::Thread("RequestThread"), peerObj(peerObj) { }
-
-        QStatus QueueRequest(Message& msg, RequestType reqType, const qcc::String data = "");
-
-      private:
-        qcc::ThreadReturn STDCALL Run(void* args);
-
-        struct Request {
-            Message msg;
-            RequestType reqType;
-            const qcc::String data;
-        };
-
-        qcc::Mutex lock;
-        AllJoynPeerObj& peerObj;
-        std::queue<Request> queue;
-
-    };
-
-    RequestThread requestThread;
-
+    /** Queue of messages waiting for an authentication to complete */
+    std::deque<Message> msgsPendingAuth;
 };
 
 }

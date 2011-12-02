@@ -27,6 +27,7 @@
 #include <qcc/atomic.h>
 #include <qcc/XmlElement.h>
 #include <qcc/StringSource.h>
+#include <qcc/FileStream.h>
 
 #include <assert.h>
 #include <algorithm>
@@ -55,9 +56,9 @@
 #include "BusInternal.h"
 #include "AllJoynPeerObj.h"
 #include "XmlHelper.h"
+#include "LaunchdTransport.h"
 
 #define QCC_MODULE "ALLJOYN"
-
 
 using namespace std;
 using namespace qcc;
@@ -73,12 +74,12 @@ BusAttachment::Internal::Internal(const char* appName, BusAttachment& bus, Trans
     transportList(bus, factories),
     keyStore(application),
     authManager(keyStore),
-    globalGuid(qcc::GUID()),
-    msgSerial(qcc::Rand32()),
+    globalGuid(qcc::GUID128()),
+    msgSerial(1),
     router(router ? router : new ClientRouter),
     localEndpoint(transportList.GetLocalTransport()->GetLocalEndpoint()),
     timer("BusTimer", true),
-    dispatcher("BusDispatcher", true),
+    dispatcher("BusDispatcher", true, 4),
     allowRemoteMessages(allowRemoteMessages),
     listenAddresses(listenAddresses ? listenAddresses : ""),
     stopLock(),
@@ -118,39 +119,36 @@ BusAttachment::Internal::~Internal()
     router = NULL;
 }
 
-void BusAttachment::Internal::ThreadExit(qcc::Thread* thread)
-{
-    QStatus status = transportList.Stop();
-    if (ER_OK != status) {
-        QCC_LogError(status, ("TransportList::Stop() failed"));
-    }
-}
-
 class LocalTransportFactoryContainer : public TransportFactoryContainer {
   public:
     LocalTransportFactoryContainer()
     {
-#ifdef QCC_OS_WINDOWS
+#if defined(QCC_OS_WINDOWS)
         Add(new TransportFactory<TCPTransport>("tcp", true));
+#elif defined(QCC_OS_DARWIN)
+        Add(new TransportFactory<LaunchdTransport>("launchd", true));
 #else
         Add(new TransportFactory<UnixTransport>("unix", true));
 #endif
-
     }
 } localTransportsContainer;
 
 BusAttachment::BusAttachment(const char* applicationName, bool allowRemoteMessages) :
+    hasStarted(false),
     isStarted(false),
     isStopping(false),
-    busInternal(new Internal(applicationName, *this, localTransportsContainer, NULL, allowRemoteMessages, NULL))
+    busInternal(new Internal(applicationName, *this, localTransportsContainer, NULL, allowRemoteMessages, NULL)),
+    joinObj(this)
 {
     QCC_DbgTrace(("BusAttachment client constructor (%p)", this));
 }
 
 BusAttachment::BusAttachment(Internal* busInternal) :
+    hasStarted(false),
     isStarted(false),
     isStopping(false),
-    busInternal(busInternal)
+    busInternal(busInternal),
+    joinObj(this)
 {
     QCC_DbgTrace(("BusAttachment daemon constructor"));
 }
@@ -159,14 +157,25 @@ BusAttachment::~BusAttachment(void)
 {
     QCC_DbgTrace(("BusAttachment Destructor (%p)", this));
 
-    Stop(true);
+    StopInternal(true);
 
     /*
-     * Other threads may be attempting to stop the bus. We need to wait for
-     * ALL callers of BusAttachment::Stop() to exit before deleting the object
+     * Other threads may be attempting to stop the bus. We need to wait for ALL
+     * callers of BusAttachment::StopInternal() to exit before deleting the
+     * object
      */
     while (busInternal->stopCount) {
-        qcc::Sleep(5);
+        /*
+         * We want to allow other calling threads to complete.  This means we
+         * need to yield the CPU.  Sleep(0) yields the CPU to all threads of
+         * equal or greater priority.  Other callers may be of lesser priority
+         * so We need to yield the CPU to them, too.  We need to get ourselves
+         * off of the ready queue, so we need to really execute a sleep.  The
+         * Sleep(1) will translate into a mimimum sleep of one scheduling quantum
+         * which is, for example, one Jiffy in Liux which is 1/250 second or
+         * 4 ms.  It's not as arbitrary as it might seem.
+         */
+        qcc::Sleep(1);
     }
 
     delete busInternal;
@@ -179,39 +188,203 @@ QStatus BusAttachment::Start()
 
     QCC_DbgTrace(("BusAttachment::Start()"));
 
+    /*
+     * The variable isStarted indicates that the bus has been Start()ed, and has
+     * not yet been Stop()ed.  As soon as a Join is completed, isStarted is set
+     * to false.  We want to prevent the bus attachment from being started
+     * multiple times to prevent very hard to debug problems where users try to
+     * reuse bus attachments in the mistaken belief that it will somehow be more
+     * efficient.  There are three state variables here and we check them all
+     * separately (in order to be specific with error messages) before
+     * continuing to allow a Start.
+     */
+    if (hasStarted) {
+        status = ER_BUS_BUS_ALREADY_STARTED;
+        QCC_LogError(status, ("BusAttachment::Start(): Start may not ever be called more than once"));
+        return status;
+    }
+
     if (isStarted) {
         status = ER_BUS_BUS_ALREADY_STARTED;
-        QCC_LogError(status, ("BusAttachment::Start already started"));
-    } else if (isStopping) {
+        QCC_LogError(status, ("BusAttachment::Start(): Start called, but currently started."));
+        return status;
+    }
+
+    if (isStopping) {
         status = ER_BUS_STOPPING;
-        QCC_LogError(status, ("BusAttachment::Start bus is stopping call WaitStop() before calling Start()"));
-    } else {
-        isStarted = true;
-        /*
-         * Start the alljoyn signal dispatcher first because the dispatcher thread is responsible,
-         * via the Internal::ThreadListener, for stopping the timer thread and the transports.
-         */
-        status = busInternal->dispatcher.Start(NULL, busInternal);
-        if (ER_OK == status) {
-            /* Start the timer */
-            status = busInternal->timer.Start();
+        QCC_LogError(status, ("BusAttachment::Start(): Start called while stopping"));
+        return status;
+    }
+
+    isStarted = hasStarted = true;
+
+    /*
+     * Start the alljoyn signal dispatcher first because the dispatcher thread is responsible,
+     * via the Internal::ThreadListener, for stopping the timer thread and the transports.
+     */
+    status = busInternal->dispatcher.Start();
+    if (ER_OK == status) {
+        /* Start the timer */
+        status = busInternal->timer.Start();
+    }
+
+    if (ER_OK == status) {
+        /* Start the transports */
+        status = busInternal->transportList.Start(busInternal->GetListenAddresses());
+    }
+
+    if ((status == ER_OK) && isStopping) {
+        status = ER_BUS_STOPPING;
+        QCC_LogError(status, ("BusAttachment::Start bus was stopped while starting"));
+    }
+
+    if (status != ER_OK) {
+        QCC_LogError(status, ("BusAttachment::Start failed to start"));
+        busInternal->dispatcher.Stop();
+        busInternal->timer.Stop();
+        busInternal->transportList.Stop();
+        WaitStopInternal();
+    }
+    return status;
+}
+
+#if defined(QCC_OS_ANDROID)
+static qcc::String bundleConnectSpec;
+static bool isBundleDaemonStarted = false;
+
+/* We only try to load alternate daemons on Android platform with steps:
+ * 1) Try to connect to the preinstalled (BT capable daemon) whose connect path is unix:abstract=alljoyn
+ * 2) If #1 fails, issue an Intent to start the daemon APK, wait for it to launch and then try to connect
+ *    to this daemon. The connect path is unix:abstract=alljoyn-service.
+ * 3) If #2 fails, look for a daemon that may have been bundled with the application itself and launch/connect to it if found.
+ *    The connect path is unix:abstract=alljoyn-{UUID}
+ */
+QStatus BusAttachment::TryAlternativeDaemon(RemoteEndpoint** newep)
+{
+    QCC_DbgTrace(("BusAttachment::TryAlternativeDaemon()"));
+    QStatus status = ER_FAIL;
+    bool shouldWaitReady = false;
+    const uint32_t TRY_PERIOD_IN_MS = 100;
+    const uint32_t MAX_CONNECT_TRIES = 3;
+
+    /* Try Android apk daemon*/
+    qcc::String apkConnSpec = "unix:abstract=alljoyn-service";
+    QCC_DbgPrintf(("BusAttachment::TryAlternativeDaemon::try apkConnSpec = %s", apkConnSpec.c_str()));
+
+    status = TryConnect(apkConnSpec.c_str(), newep);
+    /* Maybe the APK daemon is installed but not started yet, so try issue an intent to start it*/
+    if (ER_OK != status) {
+        if (system("am startservice -W -a org.alljoyn.bus.START_DAEMON") != -1) {
+            uint32_t numOfTries = 0;
+            /* Try connect to the APK daemon again every 100ms*/
+            while (numOfTries < MAX_CONNECT_TRIES && status != ER_OK) {
+                QCC_DbgPrintf(("Wait %d ms before trying connect", TRY_PERIOD_IN_MS));
+                qcc::Event timerEvent(TRY_PERIOD_IN_MS, 0);
+                qcc::Event::Wait(timerEvent, TRY_PERIOD_IN_MS);
+                status = TryConnect(apkConnSpec.c_str(), newep);
+                numOfTries++;
+            }
         }
-        if (ER_OK == status) {
-            /* Start the transports */
-            status = busInternal->transportList.Start(busInternal->GetListenAddresses());
-        }
-        if ((status == ER_OK) && isStopping) {
-            status = ER_BUS_STOPPING;
-            QCC_LogError(status, ("BusAttachment::Start bus was stopped while starting"));
-        }
-        if (status != ER_OK) {
-            QCC_LogError(status, ("BusAttachment::Start failed to start"));
-            busInternal->dispatcher.Stop();
-            busInternal->timer.Stop();
-            busInternal->transportList.Stop();
-            WaitStop();
+    }
+
+    if (ER_OK == status) {
+        this->connectSpec = apkConnSpec; /* Save the connect spec so that Disconnect() will use it*/
+        return status;
+    }
+
+    /* Next try the daemon bundled with the application. When we issue an intent to start the BundleDaemonService,
+     * the connect spec is saved in the global variable bundleConnectSpec. We should use the saved bundleConnectSpec to connect to the
+     * daemon if daemon is already running.
+     */
+
+    /* If bundle daemon connect spec is not set yet, then generate a unique connect spec using UUID*/
+    if (bundleConnectSpec.empty()) {
+        qcc::GUID128 specGuid;
+        bundleConnectSpec = "unix:abstract=alljoyn-" + specGuid.ToString();
+    }
+
+    if (!isBundleDaemonStarted) {
+        /* To start the BundleDaemonService of the application associated with this process, we should explicitly give the component name of the service.
+         * The component name includes the application package name and the service name. Here we read the package name from file /proc/${PID}/cmdline.
+         * Android uses package name as process name by default*/
+        qcc::String packageName;
+        const uint32_t MAX_PID_STR_SIZE = 32;
+        char pidStr [MAX_PID_STR_SIZE];
+        pid_t pid = getpid();
+        snprintf(pidStr, MAX_PID_STR_SIZE, "%d", pid);
+        qcc::String fileName = "/proc/";
+        fileName += pidStr;
+        fileName += "/cmdline";
+        QCC_DbgHLPrintf(("Read fileName %s ", fileName.c_str()));
+        FileSource source(fileName);
+        const uint32_t maxBufferLen = 128;
+        char pkgBuffer[maxBufferLen];
+        uint32_t actualRead = 0;
+        if (source.IsValid()) {
+            source.PullBytes(pkgBuffer, maxBufferLen - 1, actualRead);
+            pkgBuffer[actualRead] = '\0';
+            packageName += pkgBuffer;
+
+            while (actualRead == (maxBufferLen - 1)) {
+                actualRead = 0;
+                source.PullBytes(pkgBuffer, maxBufferLen - 1, actualRead);
+                pkgBuffer[actualRead] = '\0';
+                packageName += pkgBuffer;
+            }
+        } else {
+            /*It may fail to read from the file /proc/${PID}/cmdline if Android locks the dir /proc in the future, then fallback to use the application name*/
+            QCC_DbgHLPrintf(("Fail to read file %s, use application name instead.", fileName.c_str()));
+            packageName = busInternal->application;
         }
 
+        QCC_DbgHLPrintf(("BusAttachment::Try to start bundle daemon: packageName =%s\n", packageName.c_str()));
+        qcc::String intent = "am startservice -W -n "; /* Using "-W" will wait until the launch finishes*/
+        intent += packageName;
+        intent += "/org.alljoyn.bus.alljoyn.BundleDaemonService  -d ";
+        intent += bundleConnectSpec.c_str(); /*We piggyback the connect spec in the Data Uri of the intent*/
+        QCC_DbgHLPrintf(("Send intent = %s to start BundleDaemonService", intent.c_str()));
+        if (system(intent.c_str()) == -1) {
+            QCC_LogError(status, ("BusAttachment::Connect fail to start bundle daemon via system() call"));
+        } else {
+            isBundleDaemonStarted = true;
+            shouldWaitReady = true;
+        }
+    }
+
+    /* Try connect to the bundle daemon*/
+    if (shouldWaitReady) {
+        uint32_t numOfTries = 0;
+        while (numOfTries < MAX_CONNECT_TRIES && status != ER_OK) {
+            QCC_DbgPrintf(("Wait %d ms before trying connect", TRY_PERIOD_IN_MS));
+            qcc::Event timerEvent(TRY_PERIOD_IN_MS, 0);
+            qcc::Event::Wait(timerEvent, TRY_PERIOD_IN_MS);
+            status = TryConnect(bundleConnectSpec.c_str(), newep);
+            numOfTries++;
+        }
+    } else {
+        status = TryConnect(bundleConnectSpec.c_str(), newep);
+    }
+
+    if (status == ER_OK) {
+        this->connectSpec = bundleConnectSpec; /* Save the connect spec so that Disconnect() will use it*/
+    }
+
+    return status;
+}
+
+#endif
+
+QStatus BusAttachment::TryConnect(const char* connectSpec, RemoteEndpoint** newep)
+{
+    QCC_DbgTrace(("BusAttachment::TryConnect to %s", connectSpec));
+    QStatus status = ER_OK;
+    /* Get or create transport for connection */
+    Transport* trans = busInternal->transportList.GetTransport(connectSpec);
+    if (trans) {
+        SessionOpts emptyOpts;
+        status = trans->Connect(connectSpec, emptyOpts, newep);
+    } else {
+        status = ER_BUS_TRANSPORT_NOT_AVAILABLE;
     }
     return status;
 }
@@ -222,22 +395,30 @@ QStatus BusAttachment::Connect(const char* connectSpec, RemoteEndpoint** newep)
     bool isDaemon = busInternal->GetRouter().IsDaemon();
 
     if (!isStarted) {
+#if OPTIONAL_START
+        /*
+         * Optional implies it may not already be called.
+         */
+        QCC_DbgTrace(("BusAttachment::Connect(): Exercising optional Start()"));
+        status = Start();
+#else
         status = ER_BUS_BUS_NOT_STARTED;
+#endif
     } else if (isStopping) {
         status = ER_BUS_STOPPING;
         QCC_LogError(status, ("BusAttachment::Connect cannot connect while bus is stopping"));
     } else if (IsConnected() && !isDaemon) {
         status = ER_BUS_ALREADY_CONNECTED;
     } else {
+        this->connectSpec = connectSpec;
+        status = TryConnect(connectSpec, newep);
 
-        /* Get or create transport for connection */
-        Transport* trans = busInternal->transportList.GetTransport(connectSpec);
-        if (trans) {
-            status = trans->Connect(connectSpec, newep);
-        } else {
-            status = ER_BUS_TRANSPORT_NOT_AVAILABLE;
+#if defined(QCC_OS_ANDROID)
+        /* If the connect sepc is "unix:abstract=alljoyn", then try other daemon options with the precedence of preinstalled daemon > APK daemon > bundle daemon */
+        if (status != ER_OK && !isDaemon && (strcmp(connectSpec, "unix:abstract=alljoyn") == 0)) {
+            status = TryAlternativeDaemon(newep);
         }
-
+#endif
         /* If this is a client (non-daemon) bus attachment, then register signal handlers for BusListener */
         if ((ER_OK == status) && !isDaemon) {
             const InterfaceDescription* iface = GetInterface(org::freedesktop::DBus::InterfaceName);
@@ -278,6 +459,13 @@ QStatus BusAttachment::Connect(const char* connectSpec, RemoteEndpoint** newep)
                                                NULL);
             }
             if (ER_OK == status) {
+                assert(ajIface);
+                status = RegisterSignalHandler(busInternal,
+                                               static_cast<MessageReceiver::SignalHandler>(&BusAttachment::Internal::AllJoynSignalHandler),
+                                               ajIface->GetMember("MPSessionChanged"),
+                                               NULL);
+            }
+            if (ER_OK == status) {
                 Message reply(*this);
                 MsgArg arg("s", "type='signal',interface='org.alljoyn.Bus'");
                 const ProxyBusObject& dbusObj = this->GetDBusProxyObj();
@@ -305,10 +493,10 @@ QStatus BusAttachment::Disconnect(const char* connectSpec)
         status = ER_BUS_NOT_CONNECTED;
     } else {
         /* Terminate transport for connection */
-        Transport* trans = busInternal->transportList.GetTransport(connectSpec);
+        Transport* trans = busInternal->transportList.GetTransport(this->connectSpec.c_str());
 
         if (trans) {
-            status = trans->Disconnect(connectSpec);
+            status = trans->Disconnect(this->connectSpec.c_str());
         } else {
             status = ER_BUS_TRANSPORT_NOT_AVAILABLE;
         }
@@ -317,28 +505,34 @@ QStatus BusAttachment::Disconnect(const char* connectSpec)
         if ((ER_OK == status) && !isDaemon) {
             const InterfaceDescription* dbusIface = GetInterface(org::freedesktop::DBus::InterfaceName);
             if (dbusIface) {
-                UnregisterSignalHandler(this,
+                UnregisterSignalHandler(busInternal,
                                         static_cast<MessageReceiver::SignalHandler>(&BusAttachment::Internal::AllJoynSignalHandler),
                                         dbusIface->GetMember("NameOwnerChanged"),
                                         NULL);
             }
             const InterfaceDescription* alljoynIface = GetInterface(org::alljoyn::Bus::InterfaceName);
             if (alljoynIface) {
-                UnregisterSignalHandler(this,
+                UnregisterSignalHandler(busInternal,
                                         static_cast<MessageReceiver::SignalHandler>(&BusAttachment::Internal::AllJoynSignalHandler),
-                                        alljoynIface->GetMember("FoundName"),
+                                        alljoynIface->GetMember("FoundAdvertisedName"),
                                         NULL);
             }
             if (alljoynIface) {
-                UnregisterSignalHandler(this,
+                UnregisterSignalHandler(busInternal,
                                         static_cast<MessageReceiver::SignalHandler>(&BusAttachment::Internal::AllJoynSignalHandler),
                                         alljoynIface->GetMember("LostAdvertisedName"),
                                         NULL);
             }
             if (alljoynIface) {
-                UnregisterSignalHandler(this,
+                UnregisterSignalHandler(busInternal,
                                         static_cast<MessageReceiver::SignalHandler>(&BusAttachment::Internal::AllJoynSignalHandler),
                                         alljoynIface->GetMember("SessionLost"),
+                                        NULL);
+            }
+            if (alljoynIface) {
+                UnregisterSignalHandler(busInternal,
+                                        static_cast<MessageReceiver::SignalHandler>(&BusAttachment::Internal::AllJoynSignalHandler),
+                                        alljoynIface->GetMember("MPSessionChanged"),
                                         NULL);
             }
         }
@@ -350,12 +544,17 @@ QStatus BusAttachment::Disconnect(const char* connectSpec)
     return status;
 }
 
+QStatus BusAttachment::Stop(void)
+{
+    return StopInternal(false);
+}
+
 /*
  * Note if called with blockUntilStopped == false this function must not do anything that might block.
  * Because we don't know what kind of cleanup various transports may do on Stop() the transports are
  * stopped on the ThreadExit callback for the dispatch thread.
  */
-QStatus BusAttachment::Stop(bool blockUntilStopped)
+QStatus BusAttachment::StopInternal(bool blockUntilStopped)
 {
     QStatus status = ER_OK;
     if (isStarted) {
@@ -363,47 +562,55 @@ QStatus BusAttachment::Stop(bool blockUntilStopped)
         /*
          * Let bus listeners know the bus is stopping.
          */
-        busInternal->listenersLock.Lock();
+        busInternal->listenersLock.Lock(MUTEX_CONTEXT);
         list<BusListener*>::iterator it = busInternal->listeners.begin();
         while (it != busInternal->listeners.end()) {
             (*it++)->BusStopping();
         }
-        busInternal->listenersLock.Unlock();
-        /*
-         * Stop the timer thread
-         */
+        busInternal->listenersLock.Unlock(MUTEX_CONTEXT);
+        /* Stop the timer thread */
         status = busInternal->timer.Stop();
         if (ER_OK != status) {
             QCC_LogError(status, ("Timer::Stop() failed"));
         }
-        /*
-         * When the dispatcher thread exits BusAttachment::Internal::ThreadExit() will
-         * be called which will finish the stop operation.
-         */
+        /* Stop the dispatcher */
         status = busInternal->dispatcher.Stop();
         if (ER_OK != status) {
             QCC_LogError(status, ("Dispatcher::Stop() failed"));
         }
+        /* Stop the transport list */
+        status = busInternal->transportList.Stop();
+        if (ER_OK != status) {
+            QCC_LogError(status, ("TransportList::Stop() failed"));
+        }
+
         if ((status == ER_OK) && blockUntilStopped) {
-            WaitStop();
+            WaitStopInternal();
         }
     }
     return status;
 }
 
-void BusAttachment::WaitStop()
+QStatus BusAttachment::Join()
 {
-    QCC_DbgTrace(("BusAttachment::WaitStop"));
+    QCC_DbgTrace(("BusAttachment::Join"));
+    WaitStopInternal();
+    return ER_OK;
+}
+
+void BusAttachment::WaitStopInternal()
+{
+    QCC_DbgTrace(("BusAttachment::WaitStopInternal"));
     if (isStarted) {
         /*
          * We use a combination of a mutex and a counter to ensure that all threads that are
          * blocked waiting for the bus attachment to stop are actually blocked.
          */
         IncrementAndFetch(&busInternal->stopCount);
-        busInternal->stopLock.Lock();
+        busInternal->stopLock.Lock(MUTEX_CONTEXT);
 
         /*
-         * In the case where more than one thread has called WaitStop() the first thread in will
+         * In the case where more than one thread has called WaitStopInternal() the first thread in will
          * clear the isStarted flag.
          */
         if (isStarted) {
@@ -421,7 +628,7 @@ void BusAttachment::WaitStop()
             isStopping = false;
         }
 
-        busInternal->stopLock.Unlock();
+        busInternal->stopLock.Unlock(MUTEX_CONTEXT);
         DecrementAndFetch(&busInternal->stopCount);
     }
 }
@@ -475,9 +682,9 @@ const InterfaceDescription* BusAttachment::GetInterface(const char* name) const
     }
 }
 
-void BusAttachment::RegisterKeyStoreListener(KeyStoreListener& listener)
+QStatus BusAttachment::RegisterKeyStoreListener(KeyStoreListener& listener)
 {
-    busInternal->keyStore.SetListener(listener);
+    return busInternal->keyStore.SetListener(listener);
 }
 
 void BusAttachment::ClearKeyStore()
@@ -485,8 +692,14 @@ void BusAttachment::ClearKeyStore()
     busInternal->keyStore.Clear();
 }
 
-const qcc::String& BusAttachment::GetUniqueName() const
+const qcc::String BusAttachment::GetUniqueName() const
 {
+    /*
+     * Cannot have a valid unique name if not connected to the bus.
+     */
+    if (!IsConnected()) {
+        return "";
+    }
     return busInternal->localEndpoint.GetUniqueName();
 }
 
@@ -546,22 +759,42 @@ void BusAttachment::UnregisterBusObject(BusObject& object)
 
 QStatus BusAttachment::EnablePeerSecurity(const char* authMechanisms,
                                           AuthListener* listener,
-                                          const char* keyStoreFileName)
+                                          const char* keyStoreFileName,
+                                          bool isShared)
 {
-    QStatus status = busInternal->keyStore.Load(keyStoreFileName);
-    if (status == ER_OK) {
-        /* Register peer-to-peer authentication mechanisms */
-        busInternal->authManager.RegisterMechanism(AuthMechSRP::Factory, AuthMechSRP::AuthName());
-        busInternal->authManager.RegisterMechanism(AuthMechRSA::Factory, AuthMechRSA::AuthName());
-        busInternal->authManager.RegisterMechanism(AuthMechLogon::Factory, AuthMechLogon::AuthName());
-        /* Validate the list of auth mechanisms */
-        status =  busInternal->authManager.CheckNames(authMechanisms);
+    QStatus status = ER_OK;
+
+    /* If there are no auth mechanisms peer security is being disabled. */
+    if (authMechanisms) {
+        status = busInternal->keyStore.Init(keyStoreFileName, isShared);
         if (status == ER_OK) {
-            AllJoynPeerObj* peerObj = busInternal->localEndpoint.GetPeerObj();
-            peerObj->SetupPeerAuthentication(authMechanisms, listener);
+            /* Register peer-to-peer authentication mechanisms */
+            busInternal->authManager.RegisterMechanism(AuthMechSRP::Factory, AuthMechSRP::AuthName());
+            busInternal->authManager.RegisterMechanism(AuthMechRSA::Factory, AuthMechRSA::AuthName());
+            busInternal->authManager.RegisterMechanism(AuthMechLogon::Factory, AuthMechLogon::AuthName());
+            /* Validate the list of auth mechanisms */
+            status =  busInternal->authManager.CheckNames(authMechanisms);
+        }
+    }
+    if (status == ER_OK) {
+        AllJoynPeerObj* peerObj = busInternal->localEndpoint.GetPeerObj();
+        if (peerObj) {
+            peerObj->SetupPeerAuthentication(authMechanisms, authMechanisms ? listener : NULL);
+        } else {
+            return ER_FAIL;
         }
     }
     return status;
+}
+
+bool BusAttachment::IsPeerSecurityEnabled()
+{
+    AllJoynPeerObj* peerObj = busInternal->localEndpoint.GetPeerObj();
+    if (peerObj) {
+        return peerObj->AuthenticationEnabled();
+    } else {
+        return false;
+    }
 }
 
 QStatus BusAttachment::AddLogonEntry(const char* authMechanism, const char* userName, const char* password)
@@ -903,22 +1136,22 @@ QStatus BusAttachment::CancelAdvertiseName(const char* name, TransportMask trans
 
 void BusAttachment::RegisterBusListener(BusListener& listener)
 {
-    busInternal->listenersLock.Lock();
+    busInternal->listenersLock.Lock(MUTEX_CONTEXT);
     busInternal->listeners.push_back(&listener);
     /* Let listener know which bus attachment it has been registered on */
     listener.ListenerRegistered(this);
-    busInternal->listenersLock.Unlock();
+    busInternal->listenersLock.Unlock(MUTEX_CONTEXT);
 }
 
 void BusAttachment::UnregisterBusListener(BusListener& listener)
 {
-    busInternal->listenersLock.Lock();
+    busInternal->listenersLock.Lock(MUTEX_CONTEXT);
     list<BusListener*>::iterator it = std::find(busInternal->listeners.begin(), busInternal->listeners.end(), &listener);
     if (it != busInternal->listeners.end()) {
         busInternal->listeners.erase(it);
         listener.ListenerUnregistered();
     }
-    busInternal->listenersLock.Unlock();
+    busInternal->listenersLock.Unlock(MUTEX_CONTEXT);
 }
 
 QStatus BusAttachment::NameHasOwner(const char* name, bool& hasOwner)
@@ -1010,9 +1243,9 @@ QStatus BusAttachment::BindSessionPort(SessionPort& sessionPort, const SessionOp
             }
         }
         if (status == ER_OK) {
-            busInternal->listenersLock.Lock();
+            busInternal->listenersLock.Lock(MUTEX_CONTEXT);
             busInternal->sessionPortListeners[sessionPort] = &listener;
-            busInternal->listenersLock.Unlock();
+            busInternal->listenersLock.Unlock(MUTEX_CONTEXT);
         }
     }
     return status;
@@ -1058,9 +1291,9 @@ QStatus BusAttachment::UnbindSessionPort(SessionPort sessionPort)
             }
         }
         if (status == ER_OK) {
-            busInternal->sessionListenersLock.Lock();
+            busInternal->sessionListenersLock.Lock(MUTEX_CONTEXT);
             busInternal->sessionPortListeners.erase(sessionPort);
-            busInternal->sessionListenersLock.Unlock();
+            busInternal->sessionListenersLock.Unlock(MUTEX_CONTEXT);
         }
     }
     return status;
@@ -1093,14 +1326,23 @@ QStatus BusAttachment::JoinSessionAsync(const char* sessionHost, SessionPort ses
     const ProxyBusObject& alljoynObj = this->GetAllJoynProxyObj();
     QStatus status = alljoynObj.MethodCallAsync(org::alljoyn::Bus::InterfaceName,
                                                 "JoinSession",
-                                                this,
-                                                static_cast<MessageReceiver::ReplyHandler>(&BusAttachment::JoinSessionMethodCB),
+                                                busInternal,
+                                                static_cast<MessageReceiver::ReplyHandler>(&BusAttachment::Internal::JoinSessionMethodCB),
                                                 args, ArraySize(args),
                                                 reinterpret_cast<void*>(new _JoinSessionMethodCBContext(callback, sessionListener, context)));
     return status;
 }
 
-void BusAttachment::JoinSessionMethodCB(Message& reply, void* context)
+void BusAttachment::Internal::JoinSessionMethodCB(Message& reply, void* context)
+{
+    /* Dispatch reply */
+    QStatus status = DispatchMessage(*this, reply, context);
+    if (status != ER_OK) {
+        QCC_LogError(status, ("DispatchMessage for JoinSessionMethodCB failed"));
+    }
+}
+
+void BusAttachment::Internal::DoJoinSessionMethodCB(Message& reply, void* context)
 {
     _JoinSessionMethodCBContext* ctx = reinterpret_cast<_JoinSessionMethodCBContext*>(context);
 
@@ -1164,9 +1406,9 @@ void BusAttachment::JoinSessionMethodCB(Message& reply, void* context)
                               errMsg.c_str()));
     }
     if (ctx->sessionListener && (status == ER_OK)) {
-        busInternal->listenersLock.Lock();
-        busInternal->sessionListeners[sessionId] = ctx->sessionListener;
-        busInternal->listenersLock.Unlock();
+        listenersLock.Lock(MUTEX_CONTEXT);
+        sessionListeners[sessionId] = ctx->sessionListener;
+        listenersLock.Unlock(MUTEX_CONTEXT);
     }
 
     /* Call the callback */
@@ -1250,9 +1492,9 @@ QStatus BusAttachment::JoinSession(const char* sessionHost, SessionPort sessionP
                               errMsg.c_str()));
     }
     if (listener && (status == ER_OK)) {
-        busInternal->listenersLock.Lock();
+        busInternal->listenersLock.Lock(MUTEX_CONTEXT);
         busInternal->sessionListeners[sessionId] = listener;
-        busInternal->listenersLock.Unlock();
+        busInternal->listenersLock.Unlock(MUTEX_CONTEXT);
     }
     return status;
 }
@@ -1334,7 +1576,56 @@ QStatus BusAttachment::GetSessionFd(SessionId sessionId, SocketFd& sockFd)
     return status;
 }
 
-QStatus BusAttachment::Internal::DispatchMessage(AlarmListener& listener, Message& msg, uint32_t delay)
+QStatus BusAttachment::SetLinkTimeout(SessionId sessionId, uint32_t& linkTimeout)
+{
+    if (!IsConnected()) {
+        return ER_BUS_NOT_CONNECTED;
+    }
+
+    Message reply(*this);
+    MsgArg args[2];
+
+    args[0].Set("u", sessionId);
+    args[1].Set("u", linkTimeout);
+
+    QStatus status = this->GetAllJoynProxyObj().MethodCall(org::alljoyn::Bus::InterfaceName, "SetLinkTimeout", args, ArraySize(args), reply);
+    if (status != ER_OK) {
+        String errMsg;
+        const char* errName = reply->GetErrorName(&errMsg);
+        QCC_LogError(status, ("%s.SetLinkTimeout returned ERROR_MESSAGE (error=%s, \"%s\")",
+                              org::alljoyn::Bus::InterfaceName,
+                              errName,
+                              errMsg.c_str()));
+        status = ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NOT_SUPPORTED;
+    } else {
+        uint32_t disposition;
+        uint32_t replyLinkTimeout = 0;
+        status = reply->GetArgs("uu", &disposition, &replyLinkTimeout);
+        if (status == ER_OK) {
+            switch (disposition) {
+            case ALLJOYN_SETLINKTIMEOUT_REPLY_SUCCESS:
+                linkTimeout = replyLinkTimeout;
+                break;
+
+            case ALLJOYN_SETLINKTIMEOUT_REPLY_NO_DEST_SUPPORT:
+                status = ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NO_DEST_SUPPORT;
+                break;
+
+            case ALLJOYN_SETLINKTIMEOUT_REPLY_NO_SESSION:
+                status = ER_BUS_NO_SESSION;
+                break;
+
+            default:
+            case ALLJOYN_SETLINKTIMEOUT_REPLY_FAILED:
+                status = ER_ALLJOYN_SETLINKTIMEOUT_REPLY_FAILED;
+                break;
+            }
+        }
+    }
+    return status;
+}
+
+QStatus BusAttachment::Internal::DispatchMessage(AlarmListener& listener, Message& msg, void* context, uint32_t delay)
 {
     QStatus status;
 
@@ -1343,11 +1634,11 @@ QStatus BusAttachment::Internal::DispatchMessage(AlarmListener& listener, Messag
     } else if (bus.isStopping) {
         status = ER_BUS_STOPPING;
     } else {
-        Message* mp = new Message(msg);
-        Alarm alarm(delay, &listener, 0, mp);
+        pair<Message, void*>* alarmContext = new pair<Message, void*>(msg, context);
+        Alarm alarm(delay, &listener, 0, alarmContext);
         status = dispatcher.AddAlarm(alarm);
         if (status != ER_OK) {
-            delete mp;
+            delete alarmContext;
         }
     }
     return status;
@@ -1368,14 +1659,19 @@ QStatus BusAttachment::Internal::Dispatch(AlarmListener& listener, void* context
     return status;
 }
 
+void BusAttachment::Internal::RemoveDispatchListener(AlarmListener& listener)
+{
+    dispatcher.RemoveAlarmsWithListener(listener);
+}
+
 void BusAttachment::Internal::LocalEndpointDisconnected()
 {
-    listenersLock.Lock();
+    listenersLock.Lock(MUTEX_CONTEXT);
     list<BusListener*>::iterator it = listeners.begin();
     while (it != listeners.end()) {
         (*it++)->BusDisconnected();
     }
-    listenersLock.Unlock();
+    listenersLock.Unlock(MUTEX_CONTEXT);
 }
 
 void BusAttachment::Internal::AllJoynSignalHandler(const InterfaceDescription::Member* member,
@@ -1383,54 +1679,72 @@ void BusAttachment::Internal::AllJoynSignalHandler(const InterfaceDescription::M
                                                    Message& message)
 {
     /* Call listeners back on a non-Rx thread */
-    DispatchMessage(*this, message);
+    DispatchMessage(*this, message, NULL);
 }
 
 void BusAttachment::Internal::AlarmTriggered(const Alarm& alarm, QStatus reason)
 {
     /* Dispatch thread for BusListener callbacks */
-    Message& msg = *(reinterpret_cast<Message*>(alarm.GetContext()));
+    pair<Message, void*>* alarmContext = reinterpret_cast<pair<Message, void*>*>(alarm.GetContext());
+    Message& msg = alarmContext->first;
     size_t numArgs;
     const MsgArg* args;
     msg->GetArgs(numArgs, args);
 
     if (reason == ER_OK) {
-        if (0 == strcmp("FoundAdvertisedName", msg->GetMemberName())) {
-            listenersLock.Lock();
-            list<BusListener*>::iterator it = listeners.begin();
-            while (it != listeners.end()) {
-                (*it++)->FoundAdvertisedName(args[0].v_string.str, args[1].v_uint16, args[2].v_string.str);
+        if (msg->GetType() == MESSAGE_SIGNAL) {
+            if (0 == strcmp("FoundAdvertisedName", msg->GetMemberName())) {
+                listenersLock.Lock(MUTEX_CONTEXT);
+                list<BusListener*>::iterator it = listeners.begin();
+                while (it != listeners.end()) {
+                    (*it++)->FoundAdvertisedName(args[0].v_string.str, args[1].v_uint16, args[2].v_string.str);
+                }
+                listenersLock.Unlock(MUTEX_CONTEXT);
+            } else if (0 == strcmp("LostAdvertisedName", msg->GetMemberName())) {
+                listenersLock.Lock(MUTEX_CONTEXT);
+                list<BusListener*>::iterator it = listeners.begin();
+                while (it != listeners.end()) {
+                    (*it++)->LostAdvertisedName(args[0].v_string.str, args[1].v_uint16, args[2].v_string.str);
+                }
+                listenersLock.Unlock(MUTEX_CONTEXT);
+            } else if (0 == strcmp("SessionLost", msg->GetMemberName())) {
+                sessionListenersLock.Lock(MUTEX_CONTEXT);
+                SessionId id = static_cast<SessionId>(args[0].v_uint32);
+                map<SessionId, SessionListener*>::iterator slit = sessionListeners.find(id);
+                if ((slit != sessionListeners.end()) && slit->second) {
+                    slit->second->SessionLost(id);
+                }
+                sessionListenersLock.Unlock(MUTEX_CONTEXT);
+            } else if (0 == strcmp("NameOwnerChanged", msg->GetMemberName())) {
+                listenersLock.Lock(MUTEX_CONTEXT);
+                list<BusListener*>::iterator it = listeners.begin();
+                while (it != listeners.end()) {
+                    (*it++)->NameOwnerChanged(args[0].v_string.str,
+                                              (0 < args[1].v_string.len) ? args[1].v_string.str : NULL,
+                                              (0 < args[2].v_string.len) ? args[2].v_string.str : NULL);
+                }
+                listenersLock.Unlock(MUTEX_CONTEXT);
+            } else if (0 == strcmp("MPSessionChanged", msg->GetMemberName())) {
+                sessionListenersLock.Lock(MUTEX_CONTEXT);
+                SessionId id = static_cast<SessionId>(args[0].v_uint32);
+                const char* member = args[1].v_string.str;
+                map<SessionId, SessionListener*>::iterator slit = sessionListeners.find(id);
+                if ((slit != sessionListeners.end()) && slit->second) {
+                    if (args[2].v_bool) {
+                        slit->second->SessionMemberAdded(id, member);
+                    } else {
+                        slit->second->SessionMemberRemoved(id, member);
+                    }
+                }
+                sessionListenersLock.Unlock(MUTEX_CONTEXT);
+            } else {
+                QCC_DbgPrintf(("Unrecognized signal \"%s.%s\" received", msg->GetInterface(), msg->GetMemberName()));
             }
-            listenersLock.Unlock();
-        } else if (0 == strcmp("LostAdvertisedName", msg->GetMemberName())) {
-            listenersLock.Lock();
-            list<BusListener*>::iterator it = listeners.begin();
-            while (it != listeners.end()) {
-                (*it++)->LostAdvertisedName(args[0].v_string.str, args[1].v_uint16, args[2].v_string.str);
-            }
-            listenersLock.Unlock();
-        } else if (0 == strcmp("SessionLost", msg->GetMemberName())) {
-            sessionListenersLock.Lock();
-            SessionId id = static_cast<SessionId>(args[0].v_uint32);
-            map<SessionId, SessionListener*>::iterator slit = sessionListeners.find(id);
-            if ((slit != sessionListeners.end()) && slit->second) {
-                slit->second->SessionLost(id);
-            }
-            sessionListenersLock.Unlock();
-        } else if (0 == strcmp("NameOwnerChanged", msg->GetMemberName())) {
-            listenersLock.Lock();
-            list<BusListener*>::iterator it = listeners.begin();
-            while (it != listeners.end()) {
-                (*it++)->NameOwnerChanged(args[0].v_string.str,
-                                          (0 < args[1].v_string.len) ? args[1].v_string.str : NULL,
-                                          (0 < args[2].v_string.len) ? args[2].v_string.str : NULL);
-            }
-            listenersLock.Unlock();
-        } else {
-            QCC_LogError(ER_FAIL, ("Unrecognized signal \"%s.%s\" received", msg->GetInterface(), msg->GetMemberName()));
+        } else if (msg->GetType() == MESSAGE_METHOD_RET) {
+            DoJoinSessionMethodCB(msg, alarmContext->second);
         }
     }
-    delete &msg;
+    delete alarmContext;
 }
 
 uint32_t BusAttachment::GetTimestamp()
@@ -1462,14 +1776,14 @@ bool BusAttachment::Internal::CallAcceptListeners(SessionPort sessionPort, const
     bool isAccepted = false;
 
     /* Call sessionPortListener */
-    listenersLock.Lock();
+    listenersLock.Lock(MUTEX_CONTEXT);
     map<SessionPort, SessionPortListener*>::iterator it = sessionPortListeners.find(sessionPort);
     if (it != sessionPortListeners.end()) {
         isAccepted = it->second->AcceptSessionJoiner(sessionPort, joiner, opts);
     } else {
         QCC_LogError(ER_FAIL, ("Unable to find sessionPortListener for port=%d", sessionPort));
     }
-    listenersLock.Unlock();
+    listenersLock.Unlock(MUTEX_CONTEXT);
 
     return isAccepted;
 }
@@ -1477,7 +1791,7 @@ bool BusAttachment::Internal::CallAcceptListeners(SessionPort sessionPort, const
 void BusAttachment::Internal::CallJoinedListeners(SessionPort sessionPort, SessionId sessionId, const char* joiner)
 {
     /* Call sessionListener */
-    listenersLock.Lock();
+    listenersLock.Lock(MUTEX_CONTEXT);
     map<SessionPort, SessionPortListener*>::iterator it = sessionPortListeners.find(sessionPort);
     if (it != sessionPortListeners.end()) {
         /* Add entry to sessionListeners */
@@ -1489,19 +1803,19 @@ void BusAttachment::Internal::CallJoinedListeners(SessionPort sessionPort, Sessi
     } else {
         QCC_LogError(ER_FAIL, ("Unable to find sessionPortListener for port=%d", sessionPort));
     }
-    listenersLock.Unlock();
+    listenersLock.Unlock(MUTEX_CONTEXT);
 }
 
 QStatus BusAttachment::Internal::SetSessionListener(SessionId id, SessionListener* listener)
 {
     QStatus status = ER_BUS_NO_SESSION;
-    listenersLock.Lock();
+    listenersLock.Lock(MUTEX_CONTEXT);
     map<SessionId, SessionListener*>::iterator it = sessionListeners.find(id);
     if (it != sessionListeners.end()) {
         sessionListeners[id] = listener;
         status = ER_OK;
     }
-    listenersLock.Unlock();
+    listenersLock.Unlock(MUTEX_CONTEXT);
     return status;
 }
 
@@ -1530,15 +1844,52 @@ QStatus BusAttachment::ReloadKeyStore()
 
 QStatus BusAttachment::ClearKeys(const qcc::String& guid)
 {
-    if (!qcc::GUID::IsGUID(guid)) {
+    if (!qcc::GUID128::IsGUID(guid)) {
         return ER_INVALID_GUID;
     } else {
-        qcc::GUID g(guid);
+        qcc::GUID128 g(guid);
         if (busInternal->keyStore.HasKey(g)) {
             return busInternal->keyStore.DelKey(g);
         } else {
             return ER_BUS_KEY_UNAVAILABLE;
         }
+    }
+}
+
+QStatus BusAttachment::SetKeyExpiration(const qcc::String& guid, uint32_t timeout)
+{
+    if (timeout == 0) {
+        return ClearKeys(guid);
+    }
+    if (!qcc::GUID128::IsGUID(guid)) {
+        return ER_INVALID_GUID;
+    } else {
+        qcc::GUID128 g(guid);
+        uint64_t millis = 1000ull * timeout;
+        Timespec expiration(millis, TIME_RELATIVE);
+        return busInternal->keyStore.SetKeyExpiration(g, expiration);
+    }
+}
+
+QStatus BusAttachment::GetKeyExpiration(const qcc::String& guid, uint32_t& timeout)
+{
+    if (!qcc::GUID128::IsGUID(guid)) {
+        return ER_INVALID_GUID;
+    } else {
+        qcc::GUID128 g(guid);
+        Timespec expiration;
+        QStatus status = busInternal->keyStore.GetKeyExpiration(g, expiration);
+        if (status == ER_OK) {
+            int64_t deltaMillis = expiration - Timespec(0, TIME_RELATIVE);
+            if (deltaMillis < 0) {
+                timeout = 0;
+            } else if (deltaMillis > (0xFFFFFFFFll * 1000)) {
+                timeout = 0xFFFFFFFF;
+            } else {
+                timeout = (uint32_t)((deltaMillis + 500ull) / 1000ull);
+            }
+        }
+        return status;
     }
 }
 

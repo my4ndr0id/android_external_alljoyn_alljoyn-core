@@ -78,6 +78,12 @@ class NameService : public qcc::Thread {
     static const char* INTERFACES_WILDCARD;
 
     /**
+     * @brief The property name used to define the interfaces (e.g., eth0) used
+     * in discovery.
+     */
+    static const char* BROADCAST_PROPERTY;
+
+    /**
      * @brief The maximum size of a name, in general.
      */
     static const uint32_t MAX_NAME_SIZE = 255;
@@ -136,10 +142,16 @@ class NameService : public qcc::Thread {
     static const uint32_t RETRY_INTERVAL = 5;
 
     /**
-     * The modulus indicating the time between interface lazy updates.
+     * The modulus indicating the minimum time between interface lazy updates.
      * Units are seconds.
      */
-    static const uint32_t LAZY_UPDATE_INTERVAL = 15;
+    static const uint32_t LAZY_UPDATE_MIN_INTERVAL = 5;
+
+    /**
+     * The modulus indicating the maximum time between interface lazy updates.
+     * Units are seconds.
+     */
+    static const uint32_t LAZY_UPDATE_MAX_INTERVAL = 15;
 
     /**
      * @brief The time value indicating an advertisement is valid forever.
@@ -203,6 +215,7 @@ class NameService : public qcc::Thread {
       public:
         qcc::String m_name;
         qcc::String m_addr;
+        uint32_t m_prefixlen;
         uint32_t m_family;
 
         static const uint32_t UP = 1;
@@ -243,6 +256,10 @@ class NameService : public qcc::Thread {
      * @param enableIPv6 If true, advertise and listen over interfaces that
      *     have IPv6 addresses assigned.  If false, this bit trumps any
      *     OpenInterface() requests for specific IPv6 addresses.
+     * @param disableBroadcast If true, do not send IPv4 subnet directed
+     *     broadcasts.  Note that sending these broadcasts is often the only
+     *     way to get IPv4 name service  packets out on APs that block
+     *     multicast.
      * @param loopback If true, receive our own advertisements.
      *     Typically used for test programs to listen to themselves talk.
      *
@@ -250,7 +267,12 @@ class NameService : public qcc::Thread {
      *
      * @see OpenInterface()
      */
-    QStatus Init(const qcc::String& guid, bool enableIPv4, bool enableIPv6, bool loopback = false);
+    QStatus Init(
+        const qcc::String& guid,
+        bool enableIPv4,
+        bool enableIPv6,
+        bool disableBroadcast,
+        bool loopback = false);
 
     /**
      * @brief Provide parameters to define the general operation of the protocol.
@@ -649,6 +671,19 @@ class NameService : public qcc::Thread {
     static const uint16_t MULTICAST_PORT;
 
     /**
+     * @brief The IPv4 broadcast address for the fallback case when Access
+     * Points disable multicast.
+     */
+    static const char* IPV4_GLOBAL_BROADCAST_ADDR;
+
+    /**
+     * @brief The port number for the broadcast name service packets.
+     * Typically the same port as the multicast case, but can be made
+     * different (with a litle work).
+     */
+    static const uint16_t BROADCAST_PORT;
+
+    /**
      * @brief
      * Private notion of what state the implementation object is in.
      */
@@ -675,9 +710,11 @@ class NameService : public qcc::Thread {
     class LiveInterface : public InterfaceSpecifier {
       public:
         qcc::IPAddress m_address;           /**< The address of the interface we are talking to */
+        uint32_t m_prefixlen;               /**< The address prefix (cf netmask) of the interface we are talking to */
         qcc::SocketFd m_sockFd;             /**< The socket we are using to talk over */
         uint32_t m_mtu;                     /**< The MTU of the protocol/device we are using */
         uint32_t m_index;                   /**< The interface index of the protocol/device we are using if IPv6 */
+        uint32_t m_flags;                   /**< The interface flags we found during the ifconfig that found us */
     };
 
     /**
@@ -724,7 +761,13 @@ class NameService : public qcc::Thread {
      * @internal
      * @brief Send a protocol message out on the multicast group.
      */
-    void SendProtocolMessage(qcc::SocketFd sockFd, bool sockFdIsIpv4, Header& header);
+    void SendProtocolMessage(
+        qcc::SocketFd sockFd,
+        qcc::IPAddress interfaceAddress,
+        uint32_t interfaceAddressPrefixLen,
+        uint32_t flags,
+        bool sockFdIsIPv4,
+        Header& header);
 
     /**
      * @internal
@@ -830,6 +873,13 @@ class NameService : public qcc::Thread {
 
     /**
      * @internal
+     * @brief Send name service packets via IPv4 subnet directed broadcast if
+     * true.
+     */
+    bool m_broadcast;
+
+    /**
+     * @internal
      * @brief Advertise and listen over IPv4 if true.
      */
     bool m_enableIPv4;
@@ -875,6 +925,14 @@ class NameService : public qcc::Thread {
      * the multicast group.
      */
     std::list<Header> m_outbound;
+
+#if defined(QCC_OS_WINDOWS)
+    /**
+     * @internal @brief A socket to hold to keep winsock initialized
+     * as long as the name service is alive.
+     */
+    qcc::SocketFd m_refSockFd;
+#endif
 
     /**
      * @internal

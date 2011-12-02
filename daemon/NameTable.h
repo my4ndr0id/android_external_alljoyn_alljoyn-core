@@ -82,7 +82,7 @@ class NameTable {
      *
      * @param guid   The bus guid.
      */
-    void SetGUID(const qcc::GUID& guid);
+    void SetGUID(const qcc::GUID128& guid);
 
     /**
      * Register a listener that will be called whenever ownership of a bus name
@@ -186,30 +186,38 @@ class NameTable {
     /**
      * Get all bus names from name table.
      *
-     * @param names  [OUT] Vector of names.
+     * @param[out] names Vector of names.
      */
     void GetBusNames(std::vector<qcc::String>& names) const;
 
     /**
      * Get all unique names and their alias (well-known) names.
      *
-     * @param  nameVec   Vector of (uniqueName, aliases) pairs where aliases is a vector of alias names.
+     * @param[out]  nameVec   Vector of (uniqueName, aliases) pairs where aliases is a vector of alias names.
      */
     void GetUniqueNamesAndAliases(std::vector<std::pair<qcc::String, std::vector<qcc::String> > >& nameVec) const;
 
     /**
-     * Lock table.
+     * Get all the unique names that are in queue for the same alias (well-known) name
+     *
+     * @param[in] busName (well-known) name
+     * @param[out] names vecter of uniqueNames in queue for the
      */
-    void Lock() { lock.Lock(); }
+    void GetQueuedNames(const qcc::String& busName, std::vector<qcc::String>& names);
 
     /**
      * Lock table.
      */
-    void Unlock() { lock.Unlock(); }
+    void Lock() { lock.Lock(MUTEX_CONTEXT); }
+
+    /**
+     * Lock table.
+     */
+    void Unlock() { lock.Unlock(MUTEX_CONTEXT); }
 
   private:
     typedef struct {
-        BusEndpoint* endpoint;
+        qcc::String endpointName;
         uint32_t flags;
     } NameQueueEntry;
 

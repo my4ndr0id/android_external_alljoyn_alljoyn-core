@@ -55,13 +55,26 @@ class BusController {
     BusController(Bus& bus, QStatus& status);
 
     /**
+     * Destructor
+     */
+    virtual ~BusController();
+
+    /**
      * Return the daemon bus object responsible for org.alljoyn.Bus.
      *
      * @return The AllJoynObj.
      */
     AllJoynObj& GetAllJoynObj() { return alljoynObj; }
 
+    /**
+     * ObjectRegistered callback.
+     *
+     * @param obj   BusObject that has been registered
+     */
+    void ObjectRegistered(BusObject* obj);
+
   private:
+    Bus& bus;
 
 #ifndef NDEBUG
     /** BusObject responsible for org.alljoyn.Debug */
@@ -73,7 +86,6 @@ class BusController {
 
     /** BusObject responsible for org.alljoyn.Bus */
     AllJoynObj alljoynObj;
-
 };
 
 }

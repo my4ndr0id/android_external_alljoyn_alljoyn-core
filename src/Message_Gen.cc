@@ -392,7 +392,7 @@ QStatus _Message::MarshalArgs(const MsgArg* arg, size_t numArgs)
             break;
 
         case ALLJOYN_OBJECT_PATH:
-            if (!arg->v_string.str || (arg->v_string.len == 0)) {
+            if (!arg->v_objPath.str || (arg->v_objPath.len == 0)) {
                 status = ER_BUS_BAD_OBJ_PATH;
                 break;
             }
@@ -484,6 +484,8 @@ QStatus _Message::Deliver(RemoteEndpoint& endpoint)
     size_t len = bufEOD - buf;
     size_t pushed;
 
+    QCC_DbgPrintf(("Deliver %s", this->Description().c_str()));
+
     if (len == 0) {
         status = ER_BUS_EMPTY_MESSAGE;
         QCC_LogError(status, ("Message is empty"));
@@ -505,12 +507,34 @@ QStatus _Message::Deliver(RemoteEndpoint& endpoint)
         return ER_OK;
     }
     /*
+     * Check if message needs to be encrypted
+     */
+    if (encrypt) {
+        status = EncryptMessage();
+        /*
+         * Need to authenticate if we don't have a key
+         */
+        if (status == ER_BUS_KEY_UNAVAILABLE) {
+            QCC_DbgHLPrintf(("Deliver: Key not available requesting authentication", Description().c_str()));
+            Message msg(this);
+            status = bus.GetInternal().GetLocalEndpoint().GetPeerObj()->RequestAuthentication(msg, &endpoint);
+            /*
+             * Delivery is retried when the authentication completes
+             */
+            if (status == ER_OK) {
+                return ER_OK;
+            }
+        }
+    }
+    /*
      * Push the message to the endpoint sink (only push handles in the first chunk)
      */
-    if (handles) {
-        status = sink.PushBytesAndFds(buf, len, pushed, handles, numHandles, endpoint.GetProcessId());
-    } else {
-        status = sink.PushBytes(buf, len, pushed);
+    if (status == ER_OK) {
+        if (handles) {
+            status = sink.PushBytesAndFds(buf, len, pushed, handles, numHandles, endpoint.GetProcessId());
+        } else {
+            status = sink.PushBytes(buf, len, pushed);
+        }
     }
     /*
      * Continue pushing until we are done
@@ -521,7 +545,7 @@ QStatus _Message::Deliver(RemoteEndpoint& endpoint)
         status = sink.PushBytes(buf, len, pushed);
     }
     if (status == ER_OK) {
-        QCC_DbgHLPrintf(("Deliver message %s", Description().c_str()));
+        QCC_DbgHLPrintf(("Deliver message %s to %s", Description().c_str(), endpoint.GetUniqueName().c_str()));
         QCC_DbgPrintf(("%s", ToString().c_str()));
     } else {
         QCC_LogError(status, ("Failed to deliver message %s", Description().c_str()));
@@ -577,16 +601,22 @@ void _Message::MarshalHeaderFields()
              * We relocate the string pointers in the fields to point to the marshaled versions to
              * so the lifetime of the message is not bound to the lifetime of values passed in.
              */
-            const char* str;
-            switch (field->typeId) {
+            const char* tPos;
+            uint32_t tLen;
+            AllJoynTypeId id = field->typeId;
+            switch (id) {
             case ALLJOYN_SIGNATURE:
                 Marshal1(1);
                 Marshal1((uint8_t)ALLJOYN_SIGNATURE);
                 Marshal1(0);
                 Marshal1(field->v_signature.len);
-                str = field->v_signature.sig;
-                field->v_signature.sig = (char*)bufPos;
-                MarshalBytes((void*)str, field->v_signature.len + 1);
+                tPos = (char*)bufPos;
+                tLen = field->v_signature.len;
+                MarshalBytes((void*)field->v_signature.sig, field->v_signature.len + 1);
+                field->Clear();
+                field->typeId = ALLJOYN_SIGNATURE;
+                field->v_signature.sig = tPos;
+                field->v_signature.len = tLen;
                 break;
 
             case ALLJOYN_UINT32:
@@ -603,16 +633,20 @@ void _Message::MarshalHeaderFields()
             case ALLJOYN_OBJECT_PATH:
             case ALLJOYN_STRING:
                 Marshal1(1);
-                Marshal1((uint8_t)field->typeId);
+                Marshal1((uint8_t)id);
                 Marshal1(0);
                 if (endianSwap) {
                     MarshalReversed(&field->v_string.len, 4);
                 } else {
                     Marshal4(field->v_string.len);
                 }
-                str = field->v_string.str;
-                field->v_string.str = (char*)bufPos;
-                MarshalBytes((void*)str, field->v_string.len + 1);
+                tPos = (char*)bufPos;
+                tLen = field->v_signature.len;
+                MarshalBytes((void*)field->v_string.str, field->v_string.len + 1);
+                field->Clear();
+                field->typeId = id;
+                field->v_string.str = tPos;
+                field->v_string.len = tLen;
                 break;
 
             default:
@@ -655,6 +689,24 @@ size_t _Message::ComputeHeaderLen()
     return ROUNDUP8(sizeof(msgHeader) + hdrLen);
 }
 
+QStatus _Message::EncryptMessage()
+{
+    QStatus status;
+    PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
+    KeyBlob key;
+    status = peerStateTable->GetPeerState(GetDestination())->GetKey(key, PEER_SESSION_KEY);
+    if (status == ER_OK) {
+        size_t argsLen = msgHeader.bodyLen - ajn::Crypto::ExpansionBytes;
+        size_t hdrLen = ROUNDUP8(sizeof(msgHeader) + msgHeader.headerLen);
+        status = ajn::Crypto::Encrypt(*this, key, (uint8_t*)msgBuf, hdrLen, argsLen);
+        if (status == ER_OK) {
+            authMechanism = key.GetTag();
+            assert(msgHeader.bodyLen == argsLen);
+            encrypt = false;
+        }
+    }
+    return status;
+}
 
 QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
                                  const qcc::String& destination,
@@ -679,6 +731,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     /*
      * We marshal new messages in native endianess
      */
+    encrypt = (flags & ALLJOYN_FLAG_ENCRYPTED) ? true : false;
     endianSwap = false;
     msgHeader.endian = this->myEndian;
     msgHeader.msgType = (uint8_t)msgType;
@@ -689,7 +742,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
      * Encryption will typically make the body length slightly larger because the encryption
      * algorithm adds appends a MAC block to the end of the encrypted data.
      */
-    if (flags & ALLJOYN_FLAG_ENCRYPTED) {
+    if (encrypt) {
         QCC_DbgHLPrintf(("Encrypting messge to %s", destination.empty() ? "broadcast listeners" : destination.c_str()));
         msgHeader.bodyLen = static_cast<uint32_t>(argsLen + ajn::Crypto::ExpansionBytes);
     } else {
@@ -714,6 +767,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     /*
      * Add the destination if there is one.
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_DESTINATION].Clear();
     if (!destination.empty()) {
         hdrFields.field[ALLJOYN_HDR_FIELD_DESTINATION].typeId = ALLJOYN_STRING;
         hdrFields.field[ALLJOYN_HDR_FIELD_DESTINATION].v_string.str = destination.c_str();
@@ -723,6 +777,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
      * Sender is obtained from the bus
      */
     const qcc::String& sender = bus.GetInternal().GetLocalEndpoint().GetUniqueName();
+    hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].Clear();
     if (!sender.empty()) {
         hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].typeId = ALLJOYN_STRING;
         hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str = sender.c_str();
@@ -731,6 +786,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     /*
      * If there are arguments build the signature
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_SIGNATURE].Clear();
     if (numArgs > 0) {
         size_t sigLen = 0;
         status = SignatureUtils::MakeSignature(args, numArgs, signature, sigLen);
@@ -744,7 +800,6 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
         }
     } else {
         signature[0] = 0;
-        hdrFields.field[ALLJOYN_HDR_FIELD_SIGNATURE].typeId = ALLJOYN_INVALID;
     }
     /*
      * Check the signature computed from the args matches the expected signature.
@@ -755,21 +810,19 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
         goto ExitMarshalMessage;
     }
     /* Check if we are adding a session id */
+    hdrFields.field[ALLJOYN_HDR_FIELD_SESSION_ID].Clear();
     if (sessionId != 0) {
         hdrFields.field[ALLJOYN_HDR_FIELD_SESSION_ID].v_uint32 = sessionId;
         hdrFields.field[ALLJOYN_HDR_FIELD_SESSION_ID].typeId = ALLJOYN_UINT32;
-    } else {
-        hdrFields.field[ALLJOYN_HDR_FIELD_SESSION_ID].typeId = ALLJOYN_INVALID;
     }
     /*
      * Check if we are to do header compression. We must do this last after all the other fields
      * have been initialized.
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].Clear();
     if ((msgHeader.flags & ALLJOYN_FLAG_COMPRESSED)) {
         hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].v_uint32 = bus.GetInternal().GetCompressionRules().GetToken(hdrFields);
         hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].typeId = ALLJOYN_UINT32;
-    } else {
-        hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].typeId = ALLJOYN_INVALID;
     }
     /*
      * Calculate space required for the header fields
@@ -786,7 +839,8 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     /*
      * Allocate buffer for entire message.
      */
-    msgBuf = new uint64_t[(hdrLen + msgHeader.bodyLen + 7) / 8];
+    bufSize = (hdrLen + msgHeader.bodyLen + 7);
+    msgBuf = new uint64_t[bufSize / 8];
     /*
      * Initialize the buffer and copy in the message header
      */
@@ -836,45 +890,6 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
      * Assert that our two different body size computations agree
      */
     assert((bufPos - bodyPtr) == (ptrdiff_t)argsLen);
-    /*
-     * Encrypt and/or authenticate the message.
-     */
-    if (msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED) {
-        PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
-        KeyBlob key;
-        KeyBlob nonce;
-        /*
-         * Broadcast messages an encrypted with the group key, point-to-point messages use the session key.
-         */
-        if (destination.empty()) {
-            peerStateTable->GetGroupKeyAndNonce(key, nonce);
-        } else {
-            status = peerStateTable->GetPeerState(destination)->GetKeyAndNonce(key, nonce, PEER_SESSION_KEY);
-        }
-        if (status != ER_OK) {
-            goto ExitMarshalMessage;
-        }
-        /*
-         * Make the nonce unique for this message.
-         */
-        nonce.Xor((uint8_t*)(&msgHeader.serialNum), sizeof(msgHeader.serialNum));
-        /*
-         * If the message header is compressed a hash of the compressed header fields is xor'd with
-         * the nonce. This is to prevent a security attack where an attacker provides a bogus
-         * expansion rule.
-         */
-        if (msgHeader.flags & ALLJOYN_FLAG_COMPRESSED) {
-            KeyBlob hdrHash;
-            ajn::Crypto::HashHeaderFields(hdrFields, hdrHash);
-            nonce ^= hdrHash;
-        }
-        status = ajn::Crypto::Encrypt(key, (uint8_t*)msgBuf, hdrLen, argsLen, nonce);
-        if (status != ER_OK) {
-            goto ExitMarshalMessage;
-        }
-        authMechanism = key.GetTag();
-        assert(msgHeader.bodyLen == argsLen);
-    }
     bufEOD = bodyPtr + msgHeader.bodyLen;
     while (numArgs--) {
         QCC_DbgPrintf(("\n%s\n", args->ToString().c_str()));
@@ -912,17 +927,9 @@ QStatus _Message::HelloMessage(bool isBusToBus, bool allowRemote, uint32_t& seri
     ClearHeader();
     if (isBusToBus) {
         /* org.alljoyn.Bus.BusHello */
-        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].typeId = ALLJOYN_OBJECT_PATH;
-        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.str = org::alljoyn::Bus::ObjectPath;
-        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.len = strlen(org::alljoyn::Bus::ObjectPath);
-
-        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].typeId = ALLJOYN_STRING;
-        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.str = org::alljoyn::Bus::InterfaceName;
-        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.len = strlen(org::alljoyn::Bus::InterfaceName);
-
-        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].typeId = ALLJOYN_STRING;
-        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.str = "BusHello";
-        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.len = 8;
+        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].Set("o", org::alljoyn::Bus::ObjectPath);
+        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].Set("s", org::alljoyn::Bus::InterfaceName);
+        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].Set("s", "BusHello");
 
         qcc::String guid = bus.GetInternal().GetGlobalGUID().ToString();
         MsgArg args[2];
@@ -937,17 +944,9 @@ QStatus _Message::HelloMessage(bool isBusToBus, bool allowRemote, uint32_t& seri
                                 0);
     } else {
         /* Standard org.freedesktop.DBus.Hello */
-        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].typeId = ALLJOYN_OBJECT_PATH;
-        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.str = org::freedesktop::DBus::ObjectPath;
-        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.len = strlen(org::freedesktop::DBus::ObjectPath);
-
-        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].typeId = ALLJOYN_STRING;
-        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.str = org::freedesktop::DBus::InterfaceName;
-        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.len = strlen(org::freedesktop::DBus::InterfaceName);
-
-        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].typeId = ALLJOYN_STRING;
-        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.str = "Hello";
-        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.len = 5;
+        hdrFields.field[ALLJOYN_HDR_FIELD_PATH].Set("o", org::freedesktop::DBus::ObjectPath);
+        hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].Set("s", org::freedesktop::DBus::InterfaceName);
+        hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].Set("s", "Hello");
 
         status = MarshalMessage("",
                                 org::freedesktop::DBus::WellKnownName,
@@ -980,8 +979,7 @@ QStatus _Message::HelloReply(bool isBusToBus, const qcc::String& uniqueName)
     /*
      * Return serial number
      */
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].typeId = ALLJOYN_UINT32;
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = msgHeader.serialNum;
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Set("u", msgHeader.serialNum);
 
     if (isBusToBus) {
         guidStr = bus.GetInternal().GetGlobalGUID().ToString();
@@ -1031,18 +1029,22 @@ QStatus _Message::CallMsg(const qcc::String& signature,
         status = ER_BUS_BAD_OBJ_PATH;
         goto ExitCallMsg;
     }
+    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].Clear();
     hdrFields.field[ALLJOYN_HDR_FIELD_PATH].typeId = ALLJOYN_OBJECT_PATH;
-    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.str = objPath.c_str();
-    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.len = objPath.size();
+    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_objPath.str = objPath.c_str();
+    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_objPath.len = objPath.size();
+
     /*
      * Member name is required
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].Clear();
     hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].typeId = ALLJOYN_STRING;
     hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.str = methodName.c_str();
     hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.len = methodName.size();
     /*
      * Interface name can be NULL
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].Clear();
     if (!iface.empty()) {
         hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].typeId = ALLJOYN_STRING;
         hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.str = iface.c_str();
@@ -1085,7 +1087,7 @@ QStatus _Message::SignalMsg(const qcc::String& signature,
     QStatus status;
 
     /*
-     * Validate flags - ENCRYPTED and COMPRESSED are the only flag applicable to signals
+     * Validate flags - ENCRYPTED, COMPRESSED, and ALLJOYN_FLAG_GLOBAL_BROADCAST are the flags applicable to signals
      */
     if (flags & ~(ALLJOYN_FLAG_ENCRYPTED | ALLJOYN_FLAG_COMPRESSED | ALLJOYN_FLAG_GLOBAL_BROADCAST)) {
         return ER_BUS_BAD_HDR_FLAGS;
@@ -1110,6 +1112,8 @@ QStatus _Message::SignalMsg(const qcc::String& signature,
     /*
      * If signal has a ttl timestamp the message and set the ttl and timestamp headers.
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_TIME_TO_LIVE].Clear();
+    hdrFields.field[ALLJOYN_HDR_FIELD_TIMESTAMP].Clear();
     if (timeToLive) {
         timestamp = GetTimestamp();
         ttl = timeToLive;
@@ -1119,14 +1123,17 @@ QStatus _Message::SignalMsg(const qcc::String& signature,
         hdrFields.field[ALLJOYN_HDR_FIELD_TIMESTAMP].v_uint32 = timestamp;
     }
 
+    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].Clear();
     hdrFields.field[ALLJOYN_HDR_FIELD_PATH].typeId = ALLJOYN_OBJECT_PATH;
-    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.str = objPath.c_str();
-    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_string.len = objPath.size();
+    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_objPath.str = objPath.c_str();
+    hdrFields.field[ALLJOYN_HDR_FIELD_PATH].v_objPath.len = objPath.size();
 
+    hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].Clear();
     hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].typeId = ALLJOYN_STRING;
     hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.str = signalName.c_str();
     hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].v_string.len = signalName.size();
 
+    hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].Clear();
     hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].typeId = ALLJOYN_STRING;
     hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.str = iface.c_str();
     hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].v_string.len = iface.size();
@@ -1141,18 +1148,17 @@ ExitSignalMsg:
 }
 
 
-QStatus _Message::ReplyMsg(const MsgArg* args,
-                           size_t numArgs)
+QStatus _Message::ReplyMsg(const Message& call, const MsgArg* args, size_t numArgs)
 {
     QStatus status;
-    SessionId sessionId = GetSessionId();
+    SessionId sessionId = call->GetSessionId();
 
     /*
      * Destination is sender of method call
      */
-    qcc::String destination = hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str;
+    qcc::String destination = call->hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str;
 
-    assert(msgHeader.msgType == MESSAGE_METHOD_CALL);
+    assert(call->msgHeader.msgType == MESSAGE_METHOD_CALL);
 
     /*
      * Clear any stale header fields
@@ -1161,25 +1167,26 @@ QStatus _Message::ReplyMsg(const MsgArg* args,
     /*
      * Return serial number from call
      */
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Clear();
     hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].typeId = ALLJOYN_UINT32;
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = msgHeader.serialNum;
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = call->msgHeader.serialNum;
     /*
      * Build method return message (encrypted if the method call was encrypted)
      */
-    status = MarshalMessage(replySignature, destination, MESSAGE_METHOD_RET, args,
-                            numArgs, msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, sessionId);
+    status = MarshalMessage(call->replySignature, destination, MESSAGE_METHOD_RET, args,
+                            numArgs, call->msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, sessionId);
+
     return status;
 }
 
 
-QStatus _Message::ErrorMsg(const char* errorName,
-                           const char* description)
+QStatus _Message::ErrorMsg(const Message& call, const char* errorName, const char* description)
 {
     QStatus status;
-    qcc::String destination = hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str;
-    SessionId sessionId = GetSessionId();
+    qcc::String destination = call->hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str;
+    SessionId sessionId = call->GetSessionId();
 
-    assert(msgHeader.msgType == MESSAGE_METHOD_CALL);
+    assert(call->msgHeader.msgType == MESSAGE_METHOD_CALL);
 
     /*
      * Clear any stale header fields
@@ -1192,22 +1199,19 @@ QStatus _Message::ErrorMsg(const char* errorName,
         status = ER_BUS_BAD_ERROR_NAME;
         goto ExitErrorMsg;
     }
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].typeId = ALLJOYN_STRING;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.str = errorName;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.len = strlen(errorName);
+    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].Set("s", errorName);
     /*
      * Return serial number
      */
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].typeId = ALLJOYN_UINT32;
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = msgHeader.serialNum;
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Set("u", call->msgHeader.serialNum);
     /*
      * Build error message
      */
     if ('\0' == description[0]) {
-        status = MarshalMessage("", destination, MESSAGE_ERROR, NULL, 0, msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, sessionId);
+        status = MarshalMessage("", destination, MESSAGE_ERROR, NULL, 0, call->msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, sessionId);
     } else {
         MsgArg arg("s", description);
-        status = MarshalMessage("s", destination, MESSAGE_ERROR, &arg, 1, msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, sessionId);
+        status = MarshalMessage("s", destination, MESSAGE_ERROR, &arg, 1, call->msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, sessionId);
     }
 
 ExitErrorMsg:
@@ -1215,13 +1219,13 @@ ExitErrorMsg:
 }
 
 
-QStatus _Message::ErrorMsg(QStatus status)
+QStatus _Message::ErrorMsg(const Message& call, QStatus status)
 {
-    qcc::String destination = hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str;
+    qcc::String destination = call->hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].v_string.str;
     qcc::String msg = QCC_StatusText(status);
     uint16_t msgStatus = status;
 
-    assert(msgHeader.msgType == MESSAGE_METHOD_CALL);
+    assert(call->msgHeader.msgType == MESSAGE_METHOD_CALL);
     /*
      * Clear any stale header fields
      */
@@ -1229,28 +1233,24 @@ QStatus _Message::ErrorMsg(QStatus status)
     /*
      * Error name is required
      */
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].typeId = ALLJOYN_STRING;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.str = org::alljoyn::Bus::ErrorName;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.len = strlen(org::alljoyn::Bus::ErrorName);
+    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].Set("s", org::alljoyn::Bus::ErrorName);
     /*
      * Return serial number
      */
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].typeId = ALLJOYN_UINT32;
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = msgHeader.serialNum;
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Set("u", call->msgHeader.serialNum);
     /*
      * Build error message
      */
     MsgArg args[2];
     size_t numArgs = 2;
     MsgArg::Set(args, numArgs, "sq", msg.c_str(), msgStatus);
-    return MarshalMessage("sq", destination, MESSAGE_ERROR, args, numArgs, msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, GetSessionId());
+    return MarshalMessage("sq", destination, MESSAGE_ERROR, args, numArgs, call->msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED, GetSessionId());
 }
 
 
 void _Message::ErrorMsg(const char* errorName,
                         uint32_t replySerial)
 {
-    SessionId sessionId = GetSessionId();
     /*
      * Clear any stale header fields
      */
@@ -1261,18 +1261,15 @@ void _Message::ErrorMsg(const char* errorName,
     if ((errorName == NULL) || (*errorName == 0)) {
         errorName = "err.unknown";
     }
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].typeId = ALLJOYN_STRING;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.str = errorName;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.len = strlen(errorName);
+    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].Set("s", errorName);
     /*
      * Return serial number
      */
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].typeId = ALLJOYN_UINT32;
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = replySerial;
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Set("u", replySerial);
     /*
      * Build error message
      */
-    MarshalMessage("", "", MESSAGE_ERROR, NULL, 0, 0, sessionId);
+    MarshalMessage("", "", MESSAGE_ERROR, NULL, 0, 0, 0);
 }
 
 void _Message::ErrorMsg(QStatus status,
@@ -1280,24 +1277,19 @@ void _Message::ErrorMsg(QStatus status,
 {
     qcc::String msg = QCC_StatusText(status);
     uint16_t msgStatus = status;
-    SessionId sessionId = GetSessionId();
 
     /*
      * Clear any stale header fields
      */
     ClearHeader();
 
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].typeId = ALLJOYN_STRING;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.str = org::alljoyn::Bus::ErrorName;
-    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].v_string.len = strlen(org::alljoyn::Bus::ErrorName);
-
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].typeId = ALLJOYN_UINT32;
-    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].v_uint32 = replySerial;
+    hdrFields.field[ALLJOYN_HDR_FIELD_ERROR_NAME].Set("s", org::alljoyn::Bus::ErrorName);
+    hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Set("u", replySerial);
 
     MsgArg args[2];
     size_t numArgs = 2;
     MsgArg::Set(args, numArgs, "sq", msg.c_str(), msgStatus);
-    MarshalMessage("sq", "", MESSAGE_ERROR, args, numArgs, 0, sessionId);
+    MarshalMessage("sq", "", MESSAGE_ERROR, args, numArgs, 0, 0);
 }
 
 QStatus _Message::GetExpansion(uint32_t token, MsgArg& replyArg)

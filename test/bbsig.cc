@@ -71,10 +71,9 @@ static String g_wellKnownName = ::org::alljoyn::alljoyn_test::DefaultWellKnownNa
 static String g_advertiseName = ::org::alljoyn::alljoyn_test::DefaultAdvertiseName;
 static Event g_discoverEvent;
 
-static bool stopNow = false;
-
 static bool compress = false;
 static bool encryption = false;
+static bool broacast = false;
 static unsigned long timeToLive = 0;
 
 /** AllJoynListener receives discovery events from AllJoyn */
@@ -120,18 +119,11 @@ class MyBusListener : public BusListener, public SessionListener {
 static MyBusListener g_busListener;
 
 
-/** Signal handler */
+static volatile sig_atomic_t g_interrupt = false;
+
 static void SigIntHandler(int sig)
 {
-    if (!stopNow) {
-        stopNow = true;
-        if (NULL != g_msgBus) {
-            QStatus status = g_msgBus->Stop(false);
-            if (ER_OK != status) {
-                QCC_LogError(status, ("BusAttachment::Stop() failed"));
-            }
-        }
-    }
+    g_interrupt = true;
 }
 
 class LocalTestObject : public BusObject {
@@ -186,7 +178,11 @@ class LocalTestObject : public BusObject {
         if (encryption) {
             flags |= ALLJOYN_FLAG_ENCRYPTED;
         }
-        return Signal(NULL, g_busListener.GetSessionId(), *my_signal_member, &arg, 1, timeToLive, flags);
+        if (broacast) {
+            return Signal(NULL, 0, *my_signal_member, &arg, 1, timeToLive, flags);
+        } else {
+            return Signal(NULL, g_busListener.GetSessionId(), *my_signal_member, &arg, 1, timeToLive, flags);
+        }
     }
 
     void SignalHandler(const InterfaceDescription::Member* member,
@@ -203,20 +199,9 @@ class LocalTestObject : public BusObject {
 
     void RegisterSignalHandler()
     {
-        QStatus status;
-        MsgArg arg("s", "type='signal',interface='org.alljoyn.alljoyn_test',member='my_signal'");
-        Message reply(bus);
-        const ProxyBusObject& dbusObj = bus.GetDBusProxyObj();
-
-        status = dbusObj.MethodCall(ajn::org::freedesktop::DBus::InterfaceName,
-                                    "AddMatch",
-                                    &arg,
-                                    1,
-                                    reply);
+        QStatus status = bus.AddMatch("type='signal',interface='org.alljoyn.alljoyn_test',member='my_signal'");
         if (status != ER_OK) {
-            QCC_SyncPrintf("Failed to register Match rule for 'org.alljoyn.alljoyn_test.my_signal': %s\n",
-                           QCC_StatusText(status));
-            QCC_SyncPrintf("reply msg: %s\n", reply->ToString().c_str());
+            QCC_LogError(status, ("Failed to register Match rule for 'org.alljoyn.alljoyn_test.my_signal'"));
         }
     }
 
@@ -417,7 +402,7 @@ static void usage(void)
     printf("   -x              = Compress headers\n");
     printf("   -e[k] [RSA|SRP] = Encrypt the test interface using specified auth mechanism, -ek means clear keys\n");
     printf("   -d              = discover remote bus with test service\n");
-    printf("   -w              = Wait for a CTRL-C to stop the bus\n");
+    printf("   -b              = Signal is broadcast rather than multicast\n");
 }
 
 
@@ -432,7 +417,6 @@ int main(int argc, char** argv)
     unsigned long authCount = 1000;
 
     bool doStress = false;
-    bool waitStop = false;
     bool useSignalHandler = false;
     bool discoverRemote = false;
     unsigned int pid;
@@ -541,8 +525,8 @@ int main(int argc, char** argv)
             }
         } else if (0 == strcmp("-x", argv[i])) {
             compress = true;
-        } else if (0 == strcmp("-w", argv[i])) {
-            waitStop = true;
+        } else if (0 == strcmp("-b", argv[i])) {
+            broacast = true;
         } else if ((0 == strcmp("-e", argv[i])) || (0 == strcmp("-ek", argv[i]))) {
             if (!authMechs.empty()) {
                 authMechs += " ";
@@ -647,7 +631,42 @@ int main(int argc, char** argv)
          * remote bus that is advertising bbservice's well-known name.
          */
         if (discoverRemote && (ER_OK == status)) {
-            status = Event::Wait(g_discoverEvent);
+            for (bool discovered = false; !discovered;) {
+                /*
+                 * We want to wait for the discover event, but we also want to
+                 * be able to interrupt discovery with a control-C.  The AllJoyn
+                 * idiom for waiting for more than one thing this is to create a
+                 * vector of things to wait on.  To provide quick response we
+                 * poll the g_interrupt bit every 100 ms using a 100 ms timer
+                 * event.
+                 */
+                qcc::Event timerEvent(100, 100);
+                vector<qcc::Event*> checkEvents, signaledEvents;
+                checkEvents.push_back(&g_discoverEvent);
+                checkEvents.push_back(&timerEvent);
+                status = qcc::Event::Wait(checkEvents, signaledEvents);
+                if (status != ER_OK && status != ER_TIMEOUT) {
+                    break;
+                }
+
+                /*
+                 * If it was the discover event that popped, we're done.
+                 */
+                for (vector<qcc::Event*>::iterator i = signaledEvents.begin(); i != signaledEvents.end(); ++i) {
+                    if (*i == &g_discoverEvent) {
+                        discovered = true;
+                        break;
+                    }
+                }
+                /*
+                 * If we see the g_interrupt bit, we're also done.  Set an error
+                 * condition so we don't do anything else.
+                 */
+                if (g_interrupt) {
+                    status = ER_FAIL;
+                    break;
+                }
+            }
         }
 
         /* Register the signal handler and start sending signals */
@@ -667,6 +686,9 @@ int main(int argc, char** argv)
                 if (testObj->signalDelay > 0) {
                     qcc::Sleep(testObj->signalDelay);
                 }
+                if (g_interrupt) {
+                    break;
+                }
             }
             /* If we are not sending signals we wait for signals to be sent to us */
             if (useSignalHandler && (testObj->maxSignals == 0)) {
@@ -679,25 +701,16 @@ int main(int argc, char** argv)
             qcc::Sleep(testObj->disconnectDelay);
         }
 
-        if (waitStop) {
-            g_msgBus->WaitStop();
-        } else {
-            /* Stop the bus */
-            status = g_msgBus->Stop();
-            if (ER_OK != status) {
-                QCC_LogError(status, ("BusAttachment::Stop() failed"));
-            }
-        }
-
-        /* Clean up the test object for the next stress loop iteration */
-        delete testObj;
-
         /* Clean up msg bus for next stress loop iteration*/
         BusAttachment* deleteMe = g_msgBus;
         g_msgBus = NULL;
         delete deleteMe;
 
-    } while ((ER_OK == status) && doStress && !stopNow);
+        /* Clean up the test object for the next stress loop iteration */
+        delete testObj;
+        testObj = NULL;
+
+    } while ((ER_OK == status) && doStress && !g_interrupt);
 
 
     if (g_msgBus) {

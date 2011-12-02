@@ -35,9 +35,9 @@
 
 namespace ajn {
 
-static const size_t ALLJOYN_MAX_NAME_LEN   =       255; /*!<  The maximum length of certain bus names */
-static const size_t ALLJOYN_MAX_PACKET_LEN = 134217728; /*!<  The maximum packet length (2^27) is defined by the specification */
-static const size_t ALLJOYN_MAX_ARRAY_LEN  =  67108864; /*!<  The maximum array length (2^26) is defined by the specification */
+static const size_t ALLJOYN_MAX_NAME_LEN   =     255;  /*!<  The maximum length of certain bus names */
+static const size_t ALLJOYN_MAX_ARRAY_LEN  =  131072;  /*!<  DBus limits array length to 2^26. AllJoyn limits it to 2^17 */
+static const size_t ALLJOYN_MAX_PACKET_LEN =  (ALLJOYN_MAX_ARRAY_LEN + 4096);  /*!<  DBus limits packet length to 2^27. AllJoyn limits it further to 2^17 + 4096 to allow for 2^17 payload */
 
 /** @name Endianess indicators */
 // @{
@@ -136,6 +136,14 @@ class HeaderFields {
      */
     qcc::String ToString(size_t indent =  0) const;
 
+    /** Default constructor */
+    HeaderFields() { }
+
+    /** Copy constructor */
+    HeaderFields(const HeaderFields& other);
+
+    /** Assignment */
+    HeaderFields& operator=(const HeaderFields& other);
 };
 
 
@@ -175,6 +183,13 @@ class _Message {
      * @param bus  The bus that this message is sent or received on.
      */
     _Message(BusAttachment& bus);
+
+    /**
+     * Copy constructor for a message
+     *
+     * @param other  Message to copy from.
+     */
+    _Message(const _Message& other);
 
     /**
      * Determine if message is a broadcast signal.
@@ -268,11 +283,19 @@ class _Message {
     QStatus GetArgs(const char* signature, ...);
 
     /**
-     * Accessor function to get serial number for the message. Only meaningful for
-     * #MESSAGE_METHOD_CALL
+     * Accessor function to get serial number for the message. Usually only important for
+     * #MESSAGE_METHOD_CALL for matching up the reply to the call.
+     *
      * @return the serial number of the %Message
      */
-    uint32_t GetCallSerial() { return msgHeader.serialNum; }
+    uint32_t GetCallSerial() const { return msgHeader.serialNum; }
+
+    /**
+     * Get a reference to all of the header fields for this message.
+     *
+     * @return A const reference to the header fields for this message.
+     */
+    const HeaderFields& GetHeaderFields() const { return hdrFields; }
 
     /**
      * Accessor function to get the signature for this message
@@ -468,40 +491,41 @@ class _Message {
     /// @cond ALLJOYN_DEV
     /**
      * @internal
-     * Turn a method call message into a method reply message
+     * Generate an method reply message from a method call.
      *
+     * @param call        The call message - can be this message.
      * @param args        The arguments for the reply (can be NULL)
      * @param numArgs     The number of arguments
      * @return
      *      - #ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus ReplyMsg(const MsgArg* args,
-                     size_t numArgs);
+    QStatus ReplyMsg(const Message& call, const MsgArg* args, size_t numArgs);
 
     /**
      * @internal
-     * Turn a method call message into an error message
+     * Generate an error message from a method call.
      *
+     * @param call        The call message - can be this message.
      * @param errorName   The name of this error
      * @param description Informational string describing details of the error
      * @return
      *      - #ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus ErrorMsg(const char* errorName,
-                     const char* description);
+    QStatus ErrorMsg(const Message& call, const char* errorName, const char* description);
 
     /**
      * @internal
-     * Turn a method call message into an error message
+     * Generate an error message from a method call.
      *
+     * @param call        The call message - can be this message.
      * @param status      The status code for this error
      * @return
      *      - #ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus ErrorMsg(QStatus status);
+    QStatus ErrorMsg(const Message& call, QStatus status);
 
     /**
      * @internal
@@ -566,7 +590,7 @@ class _Message {
      * @param numArgs     The number of arguments
      * @param flags       A logical OR of the AllJoyn flags.
      * @param timeToLive  Time-to-live in milliseconds. Signals that cannot be sent within this time
-     *                    limit are discarded. Zero (the default) indicates reliable delivery.
+     *                    limit are discarded. Zero indicates reliable delivery.
      * @return
      *      - #ER_OK if successful
      *      - An error status otherwise
@@ -633,16 +657,9 @@ class _Message {
   private:
 
     /**
-     * Copy constructor.
-     *
-     * @param other   Copy from %_Message.
-     */
-    _Message(const _Message& other);
-
-    /**
      * Assignment operator.
      *
-     * @param otehr   RHS of assignment.
+     * @param other   RHS of assignment.
      */
     _Message operator=(const _Message& other);
 
@@ -713,14 +730,16 @@ class _Message {
     static const char myEndian = ALLJOYN_BIG_ENDIAN;    ///< Native endianness of host system we are running on: big endian.
 #endif
 
+    BusAttachment& bus;          ///< The bus this message was received or will be sent on.
+
     bool endianSwap;             ///< true if endianness will be swapped.
 
     MessageHeader msgHeader;     ///< Current message header.
 
-    uint8_t numMsgArgs;          ///< Number of message args (signature cannot be longer than 255 chars).
-    MsgArg* msgArgs;             ///< Pointer to the unmarshaled arguments.
-
     uint64_t* msgBuf;            ///< Pointer to the current msg buffer (uint64_t to ensure 8 byte alignment).
+    MsgArg* msgArgs;             ///< Pointer to the unmarshaled arguments.
+    uint8_t numMsgArgs;          ///< Number of message args (signature cannot be longer than 255 chars).
+
     size_t bufSize;              ///< The current allocated size of the msg buffer.
     uint8_t* bufEOD;             ///< End of data currently in buffer.
     uint8_t* bufPos;             ///< Pointer to the position in buffer.
@@ -728,8 +747,6 @@ class _Message {
 
     uint16_t ttl;                ///< Time to live
     uint32_t timestamp;          ///< Timestamp (local time) for messages with a ttl.
-
-    BusAttachment& bus;          ///< The bus this message was received or will be sent on.
 
     qcc::String replySignature;  ///< Expected reply signature for a method call
 
@@ -739,6 +756,7 @@ class _Message {
 
     qcc::SocketFd* handles;      ///< Array of file/socket descriptors.
     size_t numHandles;           ///< Number of handles in the handles array
+    bool encrypt;                ///< True if the message is to be encrypted
 
     /**
      * The header fields for this message. Which header fields are present depends on the message
@@ -769,6 +787,8 @@ class _Message {
     QStatus HeaderChecks(bool pedantic);
 
     /* Internal methods marshal side */
+
+    QStatus EncryptMessage();
 
     QStatus MarshalMessage(const qcc::String& signature,
                            const qcc::String& destination,

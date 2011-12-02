@@ -37,6 +37,7 @@
 #include <qcc/KeyBlob.h>
 #include <qcc/ManagedObj.h>
 #include <qcc/Mutex.h>
+#include <qcc/Event.h>
 #include <qcc/time.h>
 
 #include <Status.h>
@@ -79,7 +80,8 @@ class _PeerState {
         firstClockAdjust(true),
         lastDriftAdjustTime(0),
         expectedSerial(0),
-        isSecure(false)
+        isSecure(false),
+        authEvent(NULL)
     {
         ::memset(window, 0, sizeof(window));
     }
@@ -113,40 +115,42 @@ class _PeerState {
      *
      * @return  Returns the GUID for this peer.
      */
-    const qcc::GUID& GetGuid() { return guid; }
+    const qcc::GUID128& GetGuid() { return guid; }
 
     /**
      * Sets the GUID for this peer.
      */
-    void SetGuid(const qcc::GUID& guid) { this->guid = guid; }
+    void SetGuid(const qcc::GUID128& guid) { this->guid = guid; }
 
     /**
-     * Sets the session key and nonce for this peer
+     * Sets the session key for this peer
      *
      * @param key        The session key to set.
-     * @param nonce      The nonce to set.
      * @param keyType    Indicate if this is the unicast or broadcast key.
      */
-    void SetKeyAndNonce(const qcc::KeyBlob& key, const qcc::KeyBlob& nonce, PeerKeyType keyType) {
+    void SetKey(const qcc::KeyBlob& key, PeerKeyType keyType) {
         keys[keyType] = key;
-        nonces[keyType] = nonce;
-        isSecure = nonce.IsValid() && key.IsValid();
+        isSecure = key.IsValid();
     }
 
     /**
-     * Gets the session key and nonce for this peer.
+     * Gets the session key for this peer.
      *
      * @param key    [out]Returns the session key.
-     * @param nonce  [out]Returns the nonce.
      *
      * @return  - ER_OK if there is a session key set for this peer.
      *          - ER_BUS_KEY_UNAVAILABLE if no session key has been set for this peer.
+     *          - ER_BUS_KEY_EXPIRED if there was a session key but the key has expired.
      */
-    QStatus GetKeyAndNonce(qcc::KeyBlob& key, qcc::KeyBlob& nonce, PeerKeyType keyType) {
+    QStatus GetKey(qcc::KeyBlob& key, PeerKeyType keyType) {
         if (isSecure) {
             key = keys[keyType];
-            nonce = nonces[keyType];
-            return ER_OK;
+            if (key.HasExpired()) {
+                ClearKeys();
+                return ER_BUS_KEY_EXPIRED;
+            } else {
+                return ER_OK;
+            }
         } else {
             return ER_BUS_KEY_UNAVAILABLE;
         }
@@ -167,6 +171,24 @@ class _PeerState {
      * @return  Returns true if a session key has been set for this peer.
      */
     bool IsSecure() { return isSecure; }
+
+    /**
+     * Returns the auth event for this peer. The auth event is set by the peer object while the peer
+     * is being authenticated and is used to prevent multiple threads from attempting to
+     * simultaneously authenticate the same peer.
+     *
+     * @return  Returns the auth event for this peer.
+     */
+    qcc::Event* GetAuthEvent() { return authEvent; }
+
+    /**
+     * Set the auth event for this peer. The auth event is set by the peer object while the peer
+     * is being authenticated and is used to prevent multiple threads from attempting to
+     * simultaneously authenticate the same peer.
+     *
+     * @param event  The event to set or NULL if the event is being cleared.
+     */
+    void SetAuthEvent(qcc::Event* event) { authEvent = event; }
 
     /**
      * Tests if this peer is the local peer.
@@ -216,14 +238,14 @@ class _PeerState {
     bool isSecure;
 
     /**
-     * The GUID for this peer.
+     * Event used to prevent simultaneous authorization requests to this peer.
      */
-    qcc::GUID guid;
+    qcc::Event* authEvent;
 
     /**
-     * The security nonces (unicast and broadcast) for this peer
+     * The GUID for this peer.
      */
-    qcc::KeyBlob nonces[2];
+    qcc::GUID128 guid;
 
     /**
      * The session keys (unicast and broadcast) for this peer.
@@ -247,6 +269,11 @@ class PeerStateTable {
   public:
 
     /**
+     * Constructor
+     */
+    PeerStateTable();
+
+    /**
      * Get the peer state for given a bus name.
      *
      * @param busName   The bus name for a remote connection
@@ -263,9 +290,9 @@ class PeerStateTable {
      * @return  Returns true if the peer is known.
      */
     bool IsKnownPeer(const qcc::String& busName) {
-        lock.Lock();
+        lock.Lock(MUTEX_CONTEXT);
         bool known = peerMap.count(busName) > 0;
-        lock.Unlock();
+        lock.Unlock(MUTEX_CONTEXT);
         return known;
     }
 
@@ -280,6 +307,18 @@ class PeerStateTable {
     PeerState GetPeerState(const qcc::String& uniqueName, const qcc::String& aliasName);
 
     /**
+     * Are two bus names known to refer to the same peer.
+     *
+     * @param name1  The first bus name
+     * @param name1  The second bus name
+     *
+     * @return  Returns true if the two bus names are known to refer to the same peer.
+     */
+    bool IsAlias(const qcc::String& name1, const qcc::String& name2) {
+        return (name1 == name2) || (GetPeerState(name1).iden(GetPeerState(name2)));
+    }
+
+    /**
      * Delete peer state for a busName that is no longer in use
      *
      * @param busName  The bus name that may was been previously associated with peer state.
@@ -287,30 +326,24 @@ class PeerStateTable {
     void DelPeerState(const qcc::String& busName);
 
     /**
-     * Gets the group (broadcast) key and nonce for the local peer. This is used to encrypt
+     * Gets the group (broadcast) key for the local peer. This is used to encrypt
      * broadcast messages sent by this peer.
      *
      * @param key   [out]Returns the broadcast key.
-     * @param nonce [out]Returns the nonce.
      */
-    void GetGroupKeyAndNonce(qcc::KeyBlob& key, qcc::KeyBlob& nonce);
+    void GetGroupKey(qcc::KeyBlob& key);
 
     /**
      * Clear all peer state.
      */
     void Clear();
 
+    /**
+     * Destructor
+     */
+    ~PeerStateTable();
+
   private:
-
-    /**
-     * The broadcast key for the local peer
-     */
-    qcc::KeyBlob groupKey;
-
-    /**
-     * The broadcast nonce for the local peer
-     */
-    qcc::KeyBlob groupNonce;
 
     /**
      * Mapping table from bus names to peer state.

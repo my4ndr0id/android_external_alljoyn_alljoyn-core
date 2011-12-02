@@ -25,6 +25,7 @@
 
 #include <deque>
 
+#include <qcc/atomic.h>
 #include <qcc/String.h>
 #include <qcc/GUID.h>
 #include <qcc/Mutex.h>
@@ -92,6 +93,7 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
      * Constructor
      *
      * @param bus            Message bus associated with transport.
+     * @param incoming       true iff this is an incoming connection.
      * @param connectSpec    AllJoyn connection specification for this endpoint.
      * @param stream         Socket Stream used to communicate with media.
      * @param type           Base name for thread.
@@ -140,10 +142,12 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
     /**
      * Request endpoint to stop AFTER the endpoint's txqueue empties out.
      *
+     * @param maxWaitMS    Max number of ms to wait before stopping or 0 for wait indefinitely.
+     *
      * @return
      *     - ER_OK if successful.
      */
-    QStatus StopAfterTxEmpty();
+    QStatus StopAfterTxEmpty(uint32_t maxWaitMs = 0);
 
     /**
      * Request endpoint to pause receiving (wihtout stopping) AFTER next METHOD_REPLY is received.
@@ -212,7 +216,7 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
      *
      * @return GUID of the remote side of a bus-to-bus endpoint.
      */
-    const qcc::GUID& GetRemoteGUID() const { return auth.GetRemoteGUID(); }
+    const qcc::GUID128& GetRemoteGUID() const { return auth.GetRemoteGUID(); }
 
     /**
      * Get the connect spec for this endpoint.
@@ -285,6 +289,15 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
     qcc::SocketFd GetSocketFd();
 
     /**
+     * Set link timeout
+     *
+     * @param idleTimeout    [IN/OUT] Seconds of unresponsive link time (including any transport
+     *                       specific idle probes and retries) before link will be shutdown.
+     * @return ER_OK if successful.
+     */
+    virtual QStatus SetLinkTimeout(uint32_t& idleTimeout) { idleTimeout = 0; return ER_OK; }
+
+    /**
      * Return the features for this BusEndpoint
      *
      * @return   Returns the features for this BusEndpoint.
@@ -293,15 +306,39 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
 
     /**
      * Increment the reference count for this remote endpoint.
-     * RemoteEndpoints are destroyed when the number of references reaches zero.
+     * RemoteEndpoints are stopped when the number of references reaches zero.
      */
     void IncrementRef();
 
     /**
      * Decremeent the reference count for this remote endpoing.
-     * RemoteEndpoints are destroyed when the number of refereneces reaches zero.
+     * RemoteEndpoints are stopped when the number of refereneces reaches zero.
      */
     void DecrementRef();
+
+    /**
+     * Increment numWaiters count for this endpoint.
+     * Endpoint will not be deleted until this count goes to zero.
+     */
+    void IncrementWaiters() { IncrementAndFetch(&numWaiters); }
+
+    /**
+     * Decremeent numWaiters count for this endpoint.
+     * Endpoint will not be deleted until this count goes to zero.
+     */
+    void DecrementWaiters() { DecrementAndFetch(&numWaiters); }
+
+  protected:
+
+    /**
+     * Set link timeout params (with knowledge of the underlying transport characteristics)
+     *
+     * @param idleTimeout    Seconds of RX idle time before a ProbeReq will be sent (0 means infinite).
+     * @param probeTimeout   Seconds to wait for ProbeAck.
+     * @param maxIdleProbes  Number of ProbeReqs to send before delclaring the link dead.
+     * @return ER_OK if successful.
+     */
+    QStatus SetLinkTimeout(uint32_t idleTimeout, uint32_t probeTimeout, uint32_t maxIdleProbes);
 
   private:
 
@@ -309,6 +346,24 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
      * Assignment operator is private - LocalEndpoints cannot be assigned.
      */
     RemoteEndpoint& operator=(const RemoteEndpoint& other) { return *this; }
+
+    /**
+     * Utility function used to generate an idle probe (req or ack)
+     *
+     * @param isAck   If true, message is a ProbeAck. If false, message is ProbeReq.
+     * @param msg     [OUT] Message.
+     * @return   ER_OK if successful
+     */
+    QStatus GenProbeMsg(bool isAck, Message msg);
+
+    /**
+     * Determine if message is a ProbeReq or ProbeAck message.
+     *
+     * @param msg    Message to examine.
+     * @param isAck  [OUT] True if msg ProbeAck.
+     * @return  true if message is ProbeReq or ProbeAck.
+     */
+    bool IsProbeMsg(const Message& msg, bool& isAck);
 
     /**
      * Thread used to receive endpoint data.
@@ -381,6 +436,10 @@ class RemoteEndpoint : public BusEndpoint, public qcc::ThreadListener {
     bool isSocket;                           /**< True iff this endpoint contains a SockStream as its 'stream' member */
     bool armRxPause;                         /**< Pause Rx after receiving next METHOD_REPLY message */
     int32_t numWaiters;                      /**< Number of threads currently running in PushMessage */
+    uint32_t idleTimeoutCount;               /**< Number of consecutive idle timeouts */
+    uint32_t maxIdleProbes;                  /**< Maximum number of missed idle probes before shutdown */
+    uint32_t idleTimeout;                    /**< RX idle seconds before sending probe */
+    uint32_t probeTimeout;                   /**< Probe timeout in seconds */
 };
 
 }

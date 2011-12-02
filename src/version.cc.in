@@ -4,8 +4,6 @@
  */
 
 /******************************************************************************
- * $Revision: $
- *
  * Copyright 2010-2011, Qualcomm Innovation Center, Inc.
  * 
  *    Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,8 +23,8 @@
 
 static const char product[] = "Alljoyn Library";
 static const unsigned int architecture = 2;
-static const unsigned int apiLevel = 0;
-static const unsigned int release = 1;
+static const unsigned int apiLevel = 2;
+static const unsigned int release = 0;
 
 
 static const char version[] = "##VERSION_STRING##";

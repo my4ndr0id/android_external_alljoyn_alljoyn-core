@@ -33,10 +33,10 @@ extern "C" {
 /*
  * Class:     org_alljoyn_bus_samples_chat_Chat
  * Method:    jniOnCreate
- * Signature: ()I
+ * Signature: (Ljava/lang/String;)I
  */
 JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnCreate
-    (JNIEnv *, jobject);
+    (JNIEnv *, jobject, jstring);
 
 /*
  * Class:     org_alljoyn_bus_samples_chat_Chat
@@ -53,14 +53,6 @@ JNIEXPORT void JNICALL Java_org_alljoyn_bus_samples_chat_Chat_jniOnDestroy
  */
 JNIEXPORT jint JNICALL Java_org_alljoyn_bus_samples_chat_Chat_sendChatMsg
     (JNIEnv *, jobject, jstring);
-
-/*
- * Class:     org_alljoyn_bus_samples_chat_Chat
- * Method:    disconnect
- * Signature: ()Z
- */
-JNIEXPORT jboolean JNICALL Java_org_alljoyn_bus_samples_chat_Chat_disconnect
-    (JNIEnv *, jobject);
 
 /*
  * Class:     org_alljoyn_bus_samples_chat_Chat

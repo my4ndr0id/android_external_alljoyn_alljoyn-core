@@ -32,6 +32,7 @@
 #include <qcc/XmlElement.h>
 #include <qcc/Util.h>
 #include <qcc/Event.h>
+#include <qcc/Mutex.h>
 
 #include <alljoyn/BusAttachment.h>
 #include <alljoyn/DBusStd.h>
@@ -67,7 +68,6 @@ struct ProxyBusObject::Components {
 
     /** List of threads that are waiting in sync method calls */
     vector<Thread*> waitingThreads;
-
 };
 
 QStatus ProxyBusObject::GetAllProperties(const char* iface, MsgArg& value) const
@@ -166,6 +166,7 @@ QStatus ProxyBusObject::SetProperty(const char* iface, const char* property, Msg
 
 size_t ProxyBusObject::GetInterfaces(const InterfaceDescription** ifaces, size_t numIfaces) const
 {
+    lock->Lock(MUTEX_CONTEXT);
     size_t count = components->ifaces.size();
     if (ifaces) {
         count = min(count, numIfaces);
@@ -174,22 +175,28 @@ size_t ProxyBusObject::GetInterfaces(const InterfaceDescription** ifaces, size_t
             ifaces[i] = it->second;
         }
     }
+    lock->Unlock(MUTEX_CONTEXT);
     return count;
 }
 
 const InterfaceDescription* ProxyBusObject::GetInterface(const char* ifaceName) const
 {
     StringMapKey key = ifaceName;
+    lock->Lock(MUTEX_CONTEXT);
     map<StringMapKey, const InterfaceDescription*>::const_iterator it = components->ifaces.find(key);
-    return (it == components->ifaces.end()) ? NULL : it->second;
+    const InterfaceDescription* ret = (it == components->ifaces.end()) ? NULL : it->second;
+    lock->Unlock(MUTEX_CONTEXT);
+    return ret;
 }
 
 
 QStatus ProxyBusObject::AddInterface(const InterfaceDescription& iface) {
     StringMapKey key = iface.GetName();
     pair<StringMapKey, const InterfaceDescription*> item(key, &iface);
+    lock->Lock(MUTEX_CONTEXT);
     pair<map<StringMapKey, const InterfaceDescription*>::const_iterator, bool> ret = components->ifaces.insert(item);
     QStatus status = ret.second ? ER_OK : ER_BUS_IFACE_ALREADY_EXISTS;
+    lock->Unlock(MUTEX_CONTEXT);
 
     /* Add org.freedesktop.DBus.Properties interface implicitly if iface specified properties */
     if ((status == ER_OK) && !hasProperties && (iface.GetProperties() > 0)) {
@@ -217,6 +224,7 @@ QStatus ProxyBusObject::AddInterface(const char* ifaceName)
 
 size_t ProxyBusObject::GetChildren(ProxyBusObject** children, size_t numChildren)
 {
+    lock->Lock(MUTEX_CONTEXT);
     size_t count = components->children.size();
     if (children) {
         count = min(count, numChildren);
@@ -224,6 +232,7 @@ size_t ProxyBusObject::GetChildren(ProxyBusObject** children, size_t numChildren
             children[i] = &components->children[i];
         }
     }
+    lock->Unlock(MUTEX_CONTEXT);
     return count;
 }
 
@@ -243,6 +252,7 @@ ProxyBusObject* ProxyBusObject::GetChild(const char* inPath)
     /* Find each path element as a child within the parent's vector of children */
     size_t idx = path.size() + 1;
     ProxyBusObject* cur = this;
+    lock->Lock(MUTEX_CONTEXT);
     while (idx != qcc::String::npos) {
         size_t end = inPathStr.find_first_of('/', idx);
         qcc::String item = inPathStr.substr(0, (qcc::String::npos == end) ? end : end - 1);
@@ -256,10 +266,12 @@ ProxyBusObject* ProxyBusObject::GetChild(const char* inPath)
             ++it;
         }
         if (it == ch.end()) {
+            lock->Unlock(MUTEX_CONTEXT);
             return NULL;
         }
         idx = ((qcc::String::npos == end) || ((end + 1) == inPathStr.size())) ? qcc::String::npos : end + 1;
     }
+    lock->Unlock(MUTEX_CONTEXT);
     return cur;
 }
 
@@ -278,6 +290,7 @@ QStatus ProxyBusObject::AddChild(const ProxyBusObject& child)
     /* Add new children as necessary */
     size_t idx = path.size() + 1;
     ProxyBusObject* cur = this;
+    lock->Lock(MUTEX_CONTEXT);
     while (idx != qcc::String::npos) {
         size_t end = childPath.find_first_of('/', idx);
         qcc::String item = childPath.substr(0, (qcc::String::npos == end) ? end : end - 1);
@@ -293,6 +306,7 @@ QStatus ProxyBusObject::AddChild(const ProxyBusObject& child)
         if (it == ch.end()) {
             if (childPath == item) {
                 ch.push_back(child);
+                lock->Unlock(MUTEX_CONTEXT);
                 return ER_OK;
             } else {
                 ProxyBusObject ro(*bus, serviceName.c_str(), item.c_str(), sessionId);
@@ -302,6 +316,7 @@ QStatus ProxyBusObject::AddChild(const ProxyBusObject& child)
         }
         idx = ((qcc::String::npos == end) || ((end + 1) == childPath.size())) ? qcc::String::npos : end + 1;
     }
+    lock->Unlock(MUTEX_CONTEXT);
     return ER_BUS_OBJ_ALREADY_EXISTS;
 }
 
@@ -323,6 +338,7 @@ QStatus ProxyBusObject::RemoveChild(const char* inPath)
     /* Navigate to child and remove it */
     size_t idx = path.size() + 1;
     ProxyBusObject* cur = this;
+    lock->Lock(MUTEX_CONTEXT);
     while (idx != qcc::String::npos) {
         size_t end = childPath.find_first_of('/', idx);
         qcc::String item = childPath.substr(0, (qcc::String::npos == end) ? end : end - 1);
@@ -332,6 +348,7 @@ QStatus ProxyBusObject::RemoveChild(const char* inPath)
             if (it->GetPath() == item) {
                 if (end == qcc::String::npos) {
                     ch.erase(it);
+                    lock->Unlock(MUTEX_CONTEXT);
                     return ER_OK;
                 } else {
                     cur = &(*it);
@@ -342,12 +359,14 @@ QStatus ProxyBusObject::RemoveChild(const char* inPath)
         }
         if (it == ch.end()) {
             status = ER_BUS_OBJ_NOT_FOUND;
+            lock->Unlock(MUTEX_CONTEXT);
             QCC_LogError(status, ("Cannot find object path %s", item.c_str()));
             return status;
         }
         idx = ((qcc::String::npos == end) || ((end + 1) == childPath.size())) ? qcc::String::npos : end + 1;
     }
     /* Shouldn't get here */
+    lock->Unlock(MUTEX_CONTEXT);
     return ER_FAIL;
 }
 
@@ -382,15 +401,8 @@ QStatus ProxyBusObject::MethodCallAsync(const InterfaceDescription::Member& meth
     if (method.iface->IsSecure()) {
         flags |= ALLJOYN_FLAG_ENCRYPTED;
     }
-    if (flags & ALLJOYN_FLAG_ENCRYPTED) {
-        status = localEndpoint.GetPeerObj()->SecurePeerConnection(serviceName);
-        /*
-         * Not recoverable if the connection could not be secured
-         */
-        if (status != ER_OK) {
-            return status;
-        }
-        flags |= ALLJOYN_FLAG_ENCRYPTED;
+    if ((flags & ALLJOYN_FLAG_ENCRYPTED) && !bus->IsPeerSecurityEnabled()) {
+        return ER_BUS_SECURITY_NOT_ENABLED;
     }
     status = msg->CallMsg(method.signature,
                           serviceName,
@@ -433,11 +445,14 @@ QStatus ProxyBusObject::MethodCallAsync(const char* ifaceName,
                                         uint32_t timeout,
                                         uint8_t flags) const
 {
+    lock->Lock(MUTEX_CONTEXT);
     map<StringMapKey, const InterfaceDescription*>::const_iterator it = components->ifaces.find(StringMapKey(ifaceName));
     if (it == components->ifaces.end()) {
+        lock->Unlock(MUTEX_CONTEXT);
         return ER_BUS_NO_SUCH_INTERFACE;
     }
     const InterfaceDescription::Member* member = it->second->GetMember(methodName);
+    lock->Unlock(MUTEX_CONTEXT);
     if (NULL == member) {
         return ER_BUS_INTERFACE_NO_SUCH_MEMBER;
     }
@@ -481,13 +496,17 @@ QStatus ProxyBusObject::MethodCall(const InterfaceDescription::Member& method,
         goto MethodCallExit;
     }
     /*
-     * If the interface is secure or encryption is explicitly rerquested the method call must be encrypted.
+     * If the interface is secure or encryption is explicitly requested the method call must be encrypted.
      */
     if (method.iface->IsSecure()) {
         flags |= ALLJOYN_FLAG_ENCRYPTED;
     }
     if (flags & ALLJOYN_FLAG_ENCRYPTED) {
-        status = localEndpoint.GetPeerObj()->SecurePeerConnection(serviceName);
+        if (!bus->IsPeerSecurityEnabled()) {
+            status = ER_BUS_SECURITY_NOT_ENABLED;
+            goto MethodCallExit;
+        }
+        status = localEndpoint.GetPeerObj()->AuthenticatePeer(MESSAGE_METHOD_CALL, serviceName);
         /*
          * Not recoverable if the connection could not be secured
          */
@@ -530,16 +549,22 @@ QStatus ProxyBusObject::MethodCall(const InterfaceDescription::Member& method,
                                                     (flags & ALLJOYN_FLAG_ENCRYPTED) != 0,
                                                     &ctxt,
                                                     timeout);
-        if (ER_OK == status) {
+        if (status == ER_OK) {
             if (b2bEp) {
                 status = b2bEp->PushMessage(msg);
             } else {
                 status = bus->GetInternal().GetRouter().PushMessage(msg, localEndpoint);
             }
-            Thread* thisThread = Thread::GetThread();
-            if (ER_OK == status) {
+        }
+
+        Thread* thisThread = Thread::GetThread();
+        if (status == ER_OK) {
+            lock->Lock(MUTEX_CONTEXT);
+            if (!isExiting) {
                 components->waitingThreads.push_back(thisThread);
+                lock->Unlock(MUTEX_CONTEXT);
                 status = Event::Wait(ctxt.event);
+                lock->Lock(MUTEX_CONTEXT);
                 vector<Thread*>::iterator it = components->waitingThreads.begin();
                 while (it != components->waitingThreads.end()) {
                     if (*it == thisThread) {
@@ -549,18 +574,19 @@ QStatus ProxyBusObject::MethodCall(const InterfaceDescription::Member& method,
                     ++it;
                 }
             }
-            if ((ER_OK == status) && (SYNC_METHOD_ALERTCODE_OK == thisThread->GetAlertCode())) {
-                replyMsg = ctxt.replyMsg;
-            } else if (SYNC_METHOD_ALERTCODE_ABORT == thisThread->GetAlertCode()) {
-                /*
-                 * We can't touch anything in this case since the external thread that was waiting
-                 * can't know whether this object still exists.
-                 */
-                status = ER_BUS_METHOD_CALL_ABORTED;
-                goto MethodCallExit;
-            } else {
-                localEndpoint.UnregisterReplyHandler(serial);
-            }
+            lock->Unlock(MUTEX_CONTEXT);
+        }
+        if ((status == ER_OK) && (SYNC_METHOD_ALERTCODE_OK == thisThread->GetAlertCode())) {
+            replyMsg = ctxt.replyMsg;
+        } else if (SYNC_METHOD_ALERTCODE_ABORT == thisThread->GetAlertCode()) {
+            /*
+             * We can't touch anything in this case since the external thread that was waiting
+             * can't know whether this object still exists.
+             */
+            status = ER_BUS_METHOD_CALL_ABORTED;
+            goto MethodCallExit;
+        } else {
+            localEndpoint.UnregisterReplyHandler(serial);
         }
     }
 
@@ -586,11 +612,14 @@ QStatus ProxyBusObject::MethodCall(const char* ifaceName,
                                    uint32_t timeout,
                                    uint8_t flags) const
 {
+    lock->Lock(MUTEX_CONTEXT);
     map<StringMapKey, const InterfaceDescription*>::const_iterator it = components->ifaces.find(StringMapKey(ifaceName));
     if (it == components->ifaces.end()) {
+        lock->Unlock(MUTEX_CONTEXT);
         return ER_BUS_NO_SUCH_INTERFACE;
     }
     const InterfaceDescription::Member* member = it->second->GetMember(methodName);
+    lock->Unlock(MUTEX_CONTEXT);
     if (NULL == member) {
         return ER_BUS_INTERFACE_NO_SUCH_MEMBER;
     }
@@ -613,7 +642,26 @@ void ProxyBusObject::SyncReplyHandler(Message& msg, void* context)
 
 QStatus ProxyBusObject::SecureConnection(bool forceAuth)
 {
-    return bus->GetInternal().GetLocalEndpoint().GetPeerObj()->SecurePeerConnection(serviceName, forceAuth);
+    if (!bus->IsPeerSecurityEnabled()) {
+        return ER_BUS_SECURITY_NOT_ENABLED;
+    }
+    AllJoynPeerObj* peerObj =  bus->GetInternal().GetLocalEndpoint().GetPeerObj();
+    if (forceAuth) {
+        peerObj->ForceAuthentication(serviceName);
+    }
+    return peerObj->AuthenticatePeer(MESSAGE_METHOD_CALL, serviceName);
+}
+
+QStatus ProxyBusObject::SecureConnectionAsync(bool forceAuth)
+{
+    if (!bus->IsPeerSecurityEnabled()) {
+        return ER_BUS_SECURITY_NOT_ENABLED;
+    }
+    AllJoynPeerObj* peerObj =  bus->GetInternal().GetLocalEndpoint().GetPeerObj();
+    if (forceAuth) {
+        peerObj->ForceAuthentication(serviceName);
+    }
+    return peerObj->AuthenticatePeerAsync(serviceName);
 }
 
 QStatus ProxyBusObject::IntrospectRemoteObject()
@@ -718,15 +766,36 @@ QStatus ProxyBusObject::ParseXml(const char* xml, const char* ident)
 
 ProxyBusObject::~ProxyBusObject()
 {
-    if (components) {
+    DestructComponents();
+    if (lock) {
+        delete lock;
+        lock = NULL;
+    }
+}
+
+void ProxyBusObject::DestructComponents()
+{
+    if (lock && components) {
+        lock->Lock(MUTEX_CONTEXT);
+        isExiting = true;
         vector<Thread*>::iterator it = components->waitingThreads.begin();
         while (it != components->waitingThreads.end()) {
             (*it++)->Alert(SYNC_METHOD_ALERTCODE_ABORT);
         }
+
         if (bus) {
             bus->UnregisterAllHandlers(this);
         }
+
+        /* Wait for any waiting threads to exit this object's members */
+        while (components->waitingThreads.size() > 0) {
+            lock->Unlock(MUTEX_CONTEXT);
+            qcc::Sleep(5);
+            lock->Lock(MUTEX_CONTEXT);
+        }
         delete components;
+        components = NULL;
+        lock->Unlock(MUTEX_CONTEXT);
     }
 }
 
@@ -737,51 +806,70 @@ ProxyBusObject::ProxyBusObject(BusAttachment& bus, const char* service, const ch
     serviceName(service),
     sessionId(sessionId),
     hasProperties(false),
-    b2bEp(NULL)
+    b2bEp(NULL),
+    lock(new Mutex),
+    isExiting(false)
 {
     /* The Peer interface is implicitly defined for all objects */
     AddInterface(org::freedesktop::DBus::Peer::InterfaceName);
 }
 
-ProxyBusObject::ProxyBusObject() : bus(NULL), components(NULL), sessionId(0), hasProperties(false), b2bEp(NULL)
+ProxyBusObject::ProxyBusObject() :
+    bus(NULL),
+    components(NULL),
+    sessionId(0),
+    hasProperties(false),
+    b2bEp(NULL),
+    lock(NULL),
+    isExiting(false)
 {
 }
 
-ProxyBusObject::ProxyBusObject(const ProxyBusObject& other)
+ProxyBusObject::ProxyBusObject(const ProxyBusObject& other) :
+    bus(other.bus),
+    components(new Components),
+    path(other.path),
+    serviceName(other.serviceName),
+    sessionId(other.sessionId),
+    hasProperties(other.hasProperties),
+    b2bEp(other.b2bEp),
+    lock(new Mutex),
+    isExiting(false)
 {
-    components = new Components;
-    bus = other.bus;
-    path = other.path;
-    serviceName = other.serviceName;
-    sessionId = other.sessionId;
-    hasProperties = other.hasProperties;
-    b2bEp = other.b2bEp;
-    if (other.components) {
-        *components = *other.components;
-    }
+    *components = *other.components;
 }
 
 ProxyBusObject& ProxyBusObject::operator=(const ProxyBusObject& other)
 {
     if (this != &other) {
-        components = new Components;
+        DestructComponents();
+        if (other.components) {
+            components = new Components();
+            *components = *other.components;
+            if (!lock) {
+                lock = new Mutex();
+            }
+        } else {
+            components = NULL;
+            if (lock) {
+                delete lock;
+                lock = NULL;
+            }
+        }
         bus = other.bus;
         path = other.path;
         serviceName = other.serviceName;
         sessionId = other.sessionId;
+        hasProperties = other.hasProperties;
         b2bEp = other.b2bEp;
-        if (other.components) {
-            *components = *other.components;
-        }
+        isExiting = false;
     }
     return *this;
 }
 
-QStatus ProxyBusObject::SetB2BEndpoint(const char* b2bEpName)
+void ProxyBusObject::SetB2BEndpoint(RemoteEndpoint* b2bEp)
 {
-    BusEndpoint* ep =  bus->GetInternal().GetRouter().FindEndpoint(b2bEpName);
-    b2bEp = (ep && (ep->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_BUS2BUS)) ? static_cast<RemoteEndpoint*>(ep) : NULL;
-    return b2bEp ? ER_OK : ER_BUS_NO_ENDPOINT;
+    this->b2bEp = b2bEp;
 }
 
 }

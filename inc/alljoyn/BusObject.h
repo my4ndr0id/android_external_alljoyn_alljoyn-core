@@ -95,7 +95,7 @@ class BusObject : public MessageReceiver {
     BusAttachment& bus;
 
     /**
-     * Reply to a method call
+     * Reply to a method call.
      *
      * @param msg      The method call message
      * @param args     The reply arguments (can be NULL)
@@ -104,10 +104,10 @@ class BusObject : public MessageReceiver {
      *      - #ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus MethodReply(Message& msg, const MsgArg* args = NULL, size_t numArgs = 0);
+    QStatus MethodReply(const Message& msg, const MsgArg* args = NULL, size_t numArgs = 0);
 
     /**
-     * Reply to a method call with an error message
+     * Reply to a method call with an error message.
      *
      * @param msg              The method call message
      * @param error            The name of the error
@@ -116,10 +116,10 @@ class BusObject : public MessageReceiver {
      *      - #ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus MethodReply(Message& msg, const char* error, const char* errorMessage = NULL);
+    QStatus MethodReply(const Message& msg, const char* error, const char* errorMessage = NULL);
 
     /**
-     * Reply to a method call with an error message
+     * Reply to a method call with an error message.
      *
      * @param msg        The method call message
      * @param status     The status code for the error
@@ -127,7 +127,7 @@ class BusObject : public MessageReceiver {
      *      - #ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus MethodReply(Message& msg, QStatus status);
+    QStatus MethodReply(const Message& msg, QStatus status);
 
     /**
      * Send a signal.
@@ -369,6 +369,20 @@ class BusObject : public MessageReceiver {
      */
     QStatus RemoveChild(BusObject& obj);
 
+    /**
+     * Indicate that this BusObject is being used by an alternate thread.
+     * This BusObject should not be deleted till the remote thread has completed
+     * using this object.
+     * This will incrament a counter for each thread that calls this method
+     */
+    void InUseIncrement();
+
+    /**
+     * Indicate that this BusObject is no longer being used by an alternate thread.
+     * It is safe to delete the object when the inUse counter has reached zero.
+     */
+    void InUseDecrement();
+
     struct Components;
     Components* components; /**< Internal components of this object */
 
@@ -383,6 +397,8 @@ class BusObject : public MessageReceiver {
 
     /** true if object is a placeholder (i.e. only exists to be the parent of a more meaningful object instance) */
     bool isPlaceholder;
+
+
 };
 
 }

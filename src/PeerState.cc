@@ -39,6 +39,7 @@ using namespace qcc;
 
 namespace ajn {
 
+
 uint32_t _PeerState::EstimateTimestamp(uint32_t remote)
 {
     uint32_t local = qcc::GetTimestamp();
@@ -81,12 +82,17 @@ bool _PeerState::IsValidSerial(uint32_t serial, bool secure, bool unreliable)
 
 }
 
+PeerStateTable::PeerStateTable()
+{
+    Clear();
+}
+
 PeerState PeerStateTable::GetPeerState(const qcc::String& busName)
 {
-    lock.Lock();
+    lock.Lock(MUTEX_CONTEXT);
     QCC_DbgHLPrintf(("PeerStateTable::GetPeerState() %s state for %s", peerMap.count(busName) ? "got" : "no", busName.c_str()));
     PeerState result = peerMap[busName];
-    lock.Unlock();
+    lock.Unlock(MUTEX_CONTEXT);
 
     return result;
 }
@@ -95,7 +101,7 @@ PeerState PeerStateTable::GetPeerState(const qcc::String& uniqueName, const qcc:
 {
     assert(uniqueName[0] == ':');
     PeerState result;
-    lock.Lock();
+    lock.Lock(MUTEX_CONTEXT);
     std::map<const qcc::String, PeerState>::iterator iter = peerMap.find(uniqueName);
     if (iter == peerMap.end()) {
         QCC_DbgHLPrintf(("PeerStateTable::GetPeerState() no state stored for %s aka %s", uniqueName.c_str(), aliasName.c_str()));
@@ -106,54 +112,46 @@ PeerState PeerStateTable::GetPeerState(const qcc::String& uniqueName, const qcc:
         result = iter->second;
         peerMap[aliasName] = result;
     }
-    lock.Unlock();
+    lock.Unlock(MUTEX_CONTEXT);
     return result;
 }
 
 void PeerStateTable::DelPeerState(const qcc::String& busName)
 {
-    lock.Lock();
+    lock.Lock(MUTEX_CONTEXT);
     QCC_DbgHLPrintf(("PeerStateTable::DelPeerState() %s for %s", peerMap.count(busName) ? "remove state" : "no state to remove", busName.c_str()));
     peerMap.erase(busName);
-    if (groupKey.IsValid()) {
-        /*
-         * If none of the remaining peers are secure clear the group key.
-         */
-        std::map<const qcc::String, PeerState>::iterator iter = peerMap.begin();
-        for (iter = peerMap.begin(); iter != peerMap.end(); ++iter) {
-            if (iter->second->IsSecure() && !iter->second->IsLocalPeer()) {
-                break;
-            }
-        }
-        if (iter == peerMap.end()) {
-            QCC_DbgHLPrintf(("Deleting stale group key"));
-            groupKey.Erase();
-        }
-    }
-    lock.Unlock();
+    lock.Unlock(MUTEX_CONTEXT);
 }
 
-void PeerStateTable::GetGroupKeyAndNonce(qcc::KeyBlob& key, qcc::KeyBlob& nonce)
+void PeerStateTable::GetGroupKey(qcc::KeyBlob& key)
 {
     /*
-     * If we don't have a group key generate it now.
+     * The group key is carried by the null-name peer
      */
-    if (!groupKey.IsValid()) {
-        QCC_DbgHLPrintf(("Allocating fresh group key"));
-        groupKey.Rand(Crypto_AES::AES128_SIZE, KeyBlob::AES);
-        groupNonce.Rand(Crypto::NonceBytes, KeyBlob::GENERIC);
-    }
-    key = groupKey;
-    nonce = groupNonce;
+    GetPeerState("")->GetKey(key, PEER_SESSION_KEY);
+
 }
 
 void PeerStateTable::Clear()
 {
-    lock.Lock();
-    groupKey.Erase();
-    groupNonce.Erase();
+    qcc::KeyBlob key;
+    lock.Lock(MUTEX_CONTEXT);
     peerMap.clear();
-    lock.Unlock();
+    PeerState nullPeer;
+    QCC_DbgHLPrintf(("Allocating group key"));
+    key.Rand(Crypto_AES::AES128_SIZE, KeyBlob::AES);
+    key.SetTag("GroupKey", KeyBlob::NO_ROLE);
+    nullPeer->SetKey(key, PEER_SESSION_KEY);
+    peerMap[""] = nullPeer;
+    lock.Unlock(MUTEX_CONTEXT);
+}
+
+PeerStateTable::~PeerStateTable()
+{
+    lock.Lock(MUTEX_CONTEXT);
+    peerMap.clear();
+    lock.Unlock(MUTEX_CONTEXT);
 }
 
 }

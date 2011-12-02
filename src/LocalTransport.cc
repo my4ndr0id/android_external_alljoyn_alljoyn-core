@@ -178,6 +178,9 @@ QStatus LocalEndpoint::Start()
         bus.GetInternal().GetRouter().RegisterEndpoint(*this, true);
     }
 
+    if (!bus.GetInternal().GetRouter().IsDaemon()) {
+        permVerifyThread.Start(this, NULL);
+    }
     return status;
 }
 
@@ -192,21 +195,22 @@ QStatus LocalEndpoint::Stop(void)
     /*
      * Unregister all registered bus objects
      */
-    objectsLock.Lock();
+    objectsLock.Lock(MUTEX_CONTEXT);
     hash_map<const char*, BusObject*, hash<const char*>, PathEq>::iterator it = localObjects.begin();
     while (it != localObjects.end()) {
         BusObject* obj = it->second;
-        objectsLock.Unlock();
+        objectsLock.Unlock(MUTEX_CONTEXT);
         UnregisterBusObject(*obj);
-        objectsLock.Lock();
+        objectsLock.Lock(MUTEX_CONTEXT);
         it = localObjects.begin();
     }
     if (peerObj) {
         peerObj->Stop();
     }
-    objectsLock.Unlock();
+    objectsLock.Unlock(MUTEX_CONTEXT);
     DecrementAndFetch(&refCount);
 
+    permVerifyThread.Stop();
     return ER_OK;
 }
 
@@ -215,6 +219,7 @@ QStatus LocalEndpoint::Join(void)
     if (peerObj) {
         peerObj->Join();
     }
+    permVerifyThread.Join();
     return ER_OK;
 }
 
@@ -246,7 +251,7 @@ QStatus LocalEndpoint::PeerInterface(Message& message)
         if (ER_OK != status) {
             return status;
         }
-        message->ReplyMsg(NULL, 0);
+        message->ReplyMsg(message, NULL, 0);
         return bus.GetInternal().GetRouter().PushMessage(message, *this);
     }
     if (strcmp(message->GetMemberName(), "GetMachineId") == 0) {
@@ -259,7 +264,7 @@ QStatus LocalEndpoint::PeerInterface(Message& message)
         qcc::String guidStr = bus.GetInternal().GetGlobalGUID().ToString();
         replyArg.v_string.str = guidStr.c_str();
         replyArg.v_string.len = guidStr.size();
-        message->ReplyMsg(&replyArg, 1);
+        message->ReplyMsg(message, &replyArg, 1);
         return bus.GetInternal().GetRouter().PushMessage(message, *this);
     }
     return ER_BUS_OBJECT_NO_SUCH_MEMBER;
@@ -321,7 +326,7 @@ QStatus LocalEndpoint::RegisterBusObject(BusObject& object)
         return status;
     }
 
-    objectsLock.Lock();
+    objectsLock.Lock(MUTEX_CONTEXT);
 
     /* Register placeholder parents as needed */
     size_t off = 0;
@@ -351,7 +356,7 @@ QStatus LocalEndpoint::RegisterBusObject(BusObject& object)
         status = DoRegisterBusObject(object, lastParent, false);
     }
 
-    objectsLock.Unlock();
+    objectsLock.Unlock(MUTEX_CONTEXT);
 
     return status;
 }
@@ -400,15 +405,15 @@ void LocalEndpoint::UnregisterBusObject(BusObject& object)
     methodTable.RemoveAll(&object);
 
     /* Remove from object list */
-    objectsLock.Lock();
+    objectsLock.Lock(MUTEX_CONTEXT);
     localObjects.erase(object.GetPath());
-    objectsLock.Unlock();
+    objectsLock.Unlock(MUTEX_CONTEXT);
 
     /* Notify object and detach from bus*/
     object.ObjectUnregistered();
 
     /* Detach object from parent */
-    objectsLock.Lock();
+    objectsLock.Lock(MUTEX_CONTEXT);
     if (NULL != object.parent) {
         object.parent->RemoveChild(object);
     }
@@ -432,14 +437,14 @@ void LocalEndpoint::UnregisterBusObject(BusObject& object)
             ++dit;
         }
     }
-    objectsLock.Unlock();
+    objectsLock.Unlock(MUTEX_CONTEXT);
 }
 
 BusObject* LocalEndpoint::FindLocalObject(const char* objectPath) {
-    objectsLock.Lock();
+    objectsLock.Lock(MUTEX_CONTEXT);
     hash_map<const char*, BusObject*, hash<const char*>, PathEq>::iterator iter = localObjects.find(objectPath);
     BusObject* ret = (iter == localObjects.end()) ? NULL : iter->second;
-    objectsLock.Unlock();
+    objectsLock.Unlock(MUTEX_CONTEXT);
     return ret;
 }
 
@@ -465,9 +470,9 @@ QStatus LocalEndpoint::RegisterReplyHandler(MessageReceiver* receiver,
             Alarm(timeout, this, 0, (void*)serial)
         };
         QCC_DbgPrintf(("LocalEndpoint::RegisterReplyHandler - Adding serial=%u", serial));
-        replyMapLock.Lock();
+        replyMapLock.Lock(MUTEX_CONTEXT);
         replyMap.insert(pair<uint32_t, ReplyContext>(serial, reply));
-        replyMapLock.Unlock();
+        replyMapLock.Unlock(MUTEX_CONTEXT);
 
         /* Set a timeout */
         status = bus.GetInternal().GetTimer().AddAlarm(reply.alarm);
@@ -480,17 +485,36 @@ QStatus LocalEndpoint::RegisterReplyHandler(MessageReceiver* receiver,
 
 void LocalEndpoint::UnregisterReplyHandler(uint32_t serial)
 {
-    replyMapLock.Lock();
+    replyMapLock.Lock(MUTEX_CONTEXT);
     map<uint32_t, ReplyContext>::iterator iter = replyMap.find(serial);
     if (iter != replyMap.end()) {
         QCC_DbgPrintf(("LocalEndpoint::UnregisterReplyHandler - Removing serial=%u", serial));
         ReplyContext rc = iter->second;
         replyMap.erase(iter);
-        replyMapLock.Unlock();
+        replyMapLock.Unlock(MUTEX_CONTEXT);
         bus.GetInternal().GetTimer().RemoveAlarm(rc.alarm);
     } else {
-        replyMapLock.Unlock();
+        replyMapLock.Unlock(MUTEX_CONTEXT);
     }
+}
+
+QStatus LocalEndpoint::ExtendReplyHandlerTimeout(uint32_t serial, uint32_t extension)
+{
+    QStatus status;
+    replyMapLock.Lock();
+    map<uint32_t, ReplyContext>::iterator iter = replyMap.find(serial);
+    if (iter != replyMap.end()) {
+        QCC_DbgPrintf(("LocalEndpoint::ExtendReplyHandlerTimeout - extending timeout for serial=%u", serial));
+        Alarm newAlarm(Timespec(iter->second.alarm.GetAlarmTime() + extension), this, 0, (void*)serial);
+        status = bus.GetInternal().GetTimer().ReplaceAlarm(iter->second.alarm, newAlarm, false);
+        if (status == ER_OK) {
+            iter->second.alarm = newAlarm;
+        }
+    } else {
+        status = ER_BUS_UNKNOWN_SERIAL;
+    }
+    replyMapLock.Unlock();
+    return status;
 }
 
 QStatus LocalEndpoint::RegisterSignalHandler(MessageReceiver* receiver,
@@ -538,7 +562,7 @@ QStatus LocalEndpoint::UnregisterAllHandlers(MessageReceiver* receiver)
     /*
      * Remove any reply handlers for this receiver
      */
-    replyMapLock.Lock();
+    replyMapLock.Lock(MUTEX_CONTEXT);
     bool removed;
     do {
         removed = false;
@@ -551,7 +575,7 @@ QStatus LocalEndpoint::UnregisterAllHandlers(MessageReceiver* receiver)
             }
         }
     } while (removed);
-    replyMapLock.Unlock();
+    replyMapLock.Unlock(MUTEX_CONTEXT);
     return ER_OK;
 }
 
@@ -580,21 +604,23 @@ void LocalEndpoint::AlarmTriggered(const Alarm& alarm, QStatus reason)
         HandleMethodReply(msg);
     } else {
         /* Call ObjectRegistered for any unregistered bus object */
-        objectsLock.Lock();
+        objectsLock.Lock(MUTEX_CONTEXT);
         hash_map<const char*, BusObject*, hash<const char*>, PathEq>::iterator iter = localObjects.begin();
         while (iter != localObjects.end()) {
             if (!iter->second->isRegistered) {
                 BusObject* bo = iter->second;
                 bo->isRegistered = true;
-                objectsLock.Unlock();
+                bo->InUseIncrement();
+                objectsLock.Unlock(MUTEX_CONTEXT);
                 bo->ObjectRegistered();
-                objectsLock.Lock();
+                objectsLock.Lock(MUTEX_CONTEXT);
+                bo->InUseDecrement();
                 iter = localObjects.begin();
             } else {
                 ++iter;
             }
         }
-        objectsLock.Unlock();
+        objectsLock.Unlock(MUTEX_CONTEXT);
 
         /* Decrement refcount to indicate we are done calling out */
         DecrementAndFetch(&refCount);
@@ -630,7 +656,36 @@ QStatus LocalEndpoint::HandleMethodCall(Message& message)
     if (status == ER_OK) {
         /* Call the method handler */
         if (entry) {
-            (entry->object->*entry->handler)(entry->member, message);
+            if (bus.GetInternal().GetRouter().IsDaemon() || entry->member->accessPerms.size() == 0) {
+                (entry->object->*entry->handler)(entry->member, message);
+            } else {
+                QCC_DbgPrintf(("Method(%s::%s) requires permission %s", message->GetInterface(), message->GetMemberName(), entry->member->accessPerms.c_str()));
+                chkMsgListLock.Lock(MUTEX_CONTEXT);
+                PermCheckedEntry permChkEntry(message->GetSender(), message->GetObjectPath(), message->GetInterface(), message->GetMemberName());
+                std::map<PermCheckedEntry, bool>::const_iterator it = permCheckedCallMap.find(permChkEntry);
+                if (it != permCheckedCallMap.end()) {
+                    if (permCheckedCallMap[permChkEntry]) {
+                        (entry->object->*entry->handler)(entry->member, message);
+                    } else {
+                        QCC_LogError(ER_ALLJOYN_ACCESS_PERMISSION_ERROR, ("Endpoint(%s) has no permission to call method (%s::%s)",
+                                                                          message->GetSender(), message->GetInterface(), message->GetMemberName()));
+                        if (!(message->GetFlags() & ALLJOYN_FLAG_NO_REPLY_EXPECTED)) {
+                            qcc::String errStr;
+                            qcc::String errMsg;
+                            errStr += "org.alljoyn.Bus.";
+                            errStr += QCC_StatusText(ER_ALLJOYN_ACCESS_PERMISSION_ERROR);
+                            errMsg = message->Description();
+                            message->ErrorMsg(message, errStr.c_str(), errMsg.c_str());
+                            bus.GetInternal().GetRouter().PushMessage(message, *this);
+                        }
+                    }
+                } else {
+                    ChkPendingMsg msgInfo(message, entry, entry->member->accessPerms);
+                    chkPendingMsgList.push_back(msgInfo);
+                    wakeEvent.SetEvent();
+                }
+                chkMsgListLock.Unlock(MUTEX_CONTEXT);
+            }
         }
     } else if (message->GetType() == MESSAGE_METHOD_CALL && !(message->GetFlags() & ALLJOYN_FLAG_NO_REPLY_EXPECTED)) {
         /* We are rejecting a method call that expects a response so reply with an error message. */
@@ -662,7 +717,7 @@ QStatus LocalEndpoint::HandleMethodCall(Message& message)
             errMsg = message->Description();
             break;
         }
-        message->ErrorMsg(errStr.c_str(), errMsg.c_str());
+        message->ErrorMsg(message, errStr.c_str(), errMsg.c_str());
         status = bus.GetInternal().GetRouter().PushMessage(message, *this);
     } else {
         QCC_LogError(status, ("Ignoring message %s", message->Description().c_str()));
@@ -715,9 +770,34 @@ QStatus LocalEndpoint::HandleSignal(Message& message)
             status = ER_OK;
         }
     } else {
-        list<SignalTable::Entry>::const_iterator callit;
-        for (callit = callList.begin(); callit != callList.end(); ++callit) {
-            (callit->object->*callit->handler)(callit->member, message->GetObjectPath(), message);
+        list<SignalTable::Entry>::const_iterator first = callList.begin();
+        if (bus.GetInternal().GetRouter().IsDaemon() || first->member->accessPerms.size() == 0) {
+            list<SignalTable::Entry>::const_iterator callit;
+            for (callit = callList.begin(); callit != callList.end(); ++callit) {
+                (callit->object->*callit->handler)(callit->member, message->GetObjectPath(), message);
+            }
+        } else {
+            QCC_DbgPrintf(("Signal(%s::%s) requires permission %s", message->GetInterface(), message->GetMemberName(), first->member->accessPerms.c_str()));
+            PermCheckedEntry permChkEntry(message->GetSender(), message->GetObjectPath(), message->GetInterface(), message->GetMemberName());
+            chkMsgListLock.Lock(MUTEX_CONTEXT);
+            std::map<PermCheckedEntry, bool>::const_iterator it = permCheckedCallMap.find(permChkEntry);
+            if (it == permCheckedCallMap.end()) {
+                ChkPendingMsg msgInfo(message, callList, first->member->accessPerms);
+                chkPendingMsgList.push_back(msgInfo);
+                wakeEvent.SetEvent();
+            } else {
+                if (permCheckedCallMap[permChkEntry]) {
+                    list<SignalTable::Entry>::const_iterator callit;
+                    for (callit = callList.begin(); callit != callList.end(); ++callit) {
+                        (callit->object->*callit->handler)(callit->member, message->GetObjectPath(), message);
+                    }
+                } else {
+                    /* Do not return Error message because signal does not require reply */
+                    QCC_LogError(ER_ALLJOYN_ACCESS_PERMISSION_ERROR, ("Endpoint(%s) has no permission to issue signal (%s::%s)",
+                                                                      message->GetSender(), message->GetInterface(), message->GetMemberName()));
+                }
+            }
+            chkMsgListLock.Unlock(MUTEX_CONTEXT);
         }
     }
     return status;
@@ -727,18 +807,22 @@ QStatus LocalEndpoint::HandleMethodReply(Message& message)
 {
     QStatus status = ER_OK;
 
-    replyMapLock.Lock();
+    replyMapLock.Lock(MUTEX_CONTEXT);
     map<uint32_t, ReplyContext>::iterator iter = replyMap.find(message->GetReplySerial());
     if (iter != replyMap.end()) {
         ReplyContext rc = iter->second;
         replyMap.erase(iter);
-        replyMapLock.Unlock();
+        replyMapLock.Unlock(MUTEX_CONTEXT);
         bus.GetInternal().GetTimer().RemoveAlarm(rc.alarm);
         if (rc.secure && !message->IsEncrypted()) {
             /*
-             * If the reply was not encrypted but should have been return an error to the caller.
+             * If the response was an internally generated error response just keep that error.
+             * Otherwise if reply was not encrypted so return an error to the caller. Internally
+             * generated messages can be identified by their sender field.
              */
-            status = ER_BUS_MESSAGE_NOT_ENCRYPTED;
+            if ((message->GetType() == MESSAGE_METHOD_RET) || (bus.GetInternal().GetLocalEndpoint().GetUniqueName() != message->GetSender())) {
+                status = ER_BUS_MESSAGE_NOT_ENCRYPTED;
+            }
         } else {
             QCC_DbgPrintf(("Matched reply for serial #%d", message->GetReplySerial()));
             if (message->GetType() == MESSAGE_METHOD_RET) {
@@ -764,7 +848,7 @@ QStatus LocalEndpoint::HandleMethodReply(Message& message)
         }
         ((rc.object)->*(rc.handler))(message, rc.context);
     } else {
-        replyMapLock.Unlock();
+        replyMapLock.Unlock(MUTEX_CONTEXT);
         status = ER_BUS_UNMATCHED_REPLY_SERIAL;
         QCC_DbgHLPrintf(("%s does not match any current method calls: %s", message->Description().c_str(), QCC_StatusText(status)));
     }
@@ -786,6 +870,120 @@ void LocalEndpoint::BusIsConnected()
     }
 }
 
+void*  LocalEndpoint::PermVerifyThread::Run(void* arg)
+{
+    QStatus status = ER_OK;
+    LocalEndpoint* localEp = reinterpret_cast<LocalEndpoint*>(arg);
+    vector<Event*> checkEvents, signaledEvents;
+    checkEvents.push_back(&stopEvent);
+    checkEvents.push_back(&(localEp->wakeEvent));
+    const uint32_t MAX_PERM_CHECKEDCALL_SIZE = 500;
+    while (!IsStopping()) {
+        signaledEvents.clear();
+        status = Event::Wait(checkEvents, signaledEvents);
+        if (ER_OK != status) {
+            QCC_LogError(status, ("Event::Wait failed"));
+            break;
+        }
+
+        for (vector<Event*>::iterator i = signaledEvents.begin(); i != signaledEvents.end(); ++i) {
+            (*i)->ResetEvent();
+            if (*i == &stopEvent) {
+                continue;
+            }
+
+            while (!localEp->chkPendingMsgList.empty()) {
+                localEp->chkMsgListLock.Lock(MUTEX_CONTEXT);
+                ChkPendingMsg& msgInfo = localEp->chkPendingMsgList.front();
+                Message& message = msgInfo.msg;
+                qcc::String& permsStr = msgInfo.perms;
+
+                /* Split permissions that are concated by ";". The permission string is in form of "PERM0;PERM1;..." */
+                std::set<qcc::String> permsReq;
+                size_t pos;
+                while ((pos = permsStr.find_first_of(";")) != String::npos) {
+                    qcc::String tmp = permsStr.substr(0, pos);
+                    permsReq.insert(tmp);
+                    permsStr.erase(0, pos + 1);
+                }
+                if (permsStr.size() > 0) {
+                    permsReq.insert(permsStr);
+                }
+
+                bool allowed = true;
+#if defined(QCC_OS_ANDROID)
+                uint32_t userId = -1;
+                /* Ask daemon about the user id of the sender */
+                MsgArg arg("s", message->GetSender());
+                Message reply(localEp->GetBus());
+                status = localEp->GetDBusProxyObj().MethodCall(org::freedesktop::DBus::InterfaceName,
+                                                               "GetConnectionUnixUser",
+                                                               &arg,
+                                                               1,
+                                                               reply);
+
+                if (status == ER_OK) {
+                    userId = reply->GetArg(0)->v_uint32;
+                }
+                /* The permission check is only required for UnixEndpoint */
+                if (userId != (uint32_t)-1) {
+                    allowed = localEp->permDb.VerifyPeerPermissions(userId, permsReq);
+                }
+#else
+                QCC_LogError(ER_FAIL, ("Peer permission verification is not Supported!"));
+#endif
+
+                QCC_DbgPrintf(("VerifyPeerPermissions result: allowed = %d", allowed));
+                localEp->chkMsgListLock.Lock(MUTEX_CONTEXT);
+                /* Be defensive. Limit the map cache size to be no more than MAX_PERM_CHECKEDCALL_SIZE */
+                if (localEp->permCheckedCallMap.size() > MAX_PERM_CHECKEDCALL_SIZE) {
+                    localEp->permCheckedCallMap.clear();
+                }
+                PermCheckedEntry permChkEntry(message->GetSender(), message->GetObjectPath(), message->GetInterface(), message->GetMemberName());
+                localEp->permCheckedCallMap[permChkEntry] = allowed; /* Cache the result */
+                localEp->chkMsgListLock.Unlock(MUTEX_CONTEXT);
+
+                /* Handle the message based on the message type. */
+                AllJoynMessageType msgType = message->GetType();
+                if (msgType == MESSAGE_METHOD_CALL) {
+                    if (allowed) {
+                        const MethodTable::Entry* entry = msgInfo.methodEntry;
+                        (entry->object->*entry->handler)(entry->member, msgInfo.msg);
+                    } else {
+                        QCC_LogError(ER_ALLJOYN_ACCESS_PERMISSION_ERROR, ("Endpoint(%s) has no permission to call method (%s::%s)",
+                                                                          message->GetSender(), message->GetInterface(), message->GetMemberName()));
+                        if (!(message->GetFlags() & ALLJOYN_FLAG_NO_REPLY_EXPECTED)) {
+                            status = ER_ALLJOYN_ACCESS_PERMISSION_ERROR;
+                            qcc::String errStr;
+                            qcc::String errMsg;
+                            errStr += "org.alljoyn.Bus.";
+                            errStr += QCC_StatusText(status);
+                            errMsg = message->Description();
+                            message->ErrorMsg(message, errStr.c_str(), errMsg.c_str());
+                            localEp->bus.GetInternal().GetRouter().PushMessage(message, *localEp);
+                        }
+                    }
+                } else if (msgType == MESSAGE_SIGNAL) {
+                    if (allowed) {
+                        list<SignalTable::Entry>& callList = msgInfo.signalCallList;
+                        list<SignalTable::Entry>::const_iterator callit;
+                        for (callit = callList.begin(); callit != callList.end(); ++callit) {
+                            (callit->object->*callit->handler)(callit->member, (msgInfo.msg)->GetObjectPath(), message);
+                        }
+                    } else {
+                        QCC_LogError(ER_ALLJOYN_ACCESS_PERMISSION_ERROR, ("Endpoint(%s) has no permission to issue signal (%s::%s)",
+                                                                          message->GetSender(), message->GetInterface(), message->GetMemberName()));
+                    }
+                } else {
+                    QCC_LogError(status, ("PermVerifyThread::Wrong Message Type %d", msgType));
+                }
+                localEp->chkPendingMsgList.pop_front();
+                localEp->chkMsgListLock.Unlock(MUTEX_CONTEXT);
+            }
+        }
+    }
+    return (void*)status;
+}
 
 const ProxyBusObject& LocalEndpoint::GetAllJoynDebugObj() {
     if (!alljoynDebugObj) {

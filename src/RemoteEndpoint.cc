@@ -23,12 +23,14 @@
 
 #include <qcc/Debug.h>
 #include <qcc/String.h>
+#include <qcc/StringUtil.h>
 #include <qcc/atomic.h>
 #include <qcc/Thread.h>
 #include <qcc/SocketStream.h>
 #include <qcc/atomic.h>
 
 #include <alljoyn/BusAttachment.h>
+#include <alljoyn/AllJoynStd.h>
 
 #include "Router.h"
 #include "RemoteEndpoint.h"
@@ -49,6 +51,7 @@ namespace ajn {
 
 #define ENDPOINT_IS_DEAD_ALERTCODE  1
 
+static uint32_t threadCount = 0;
 
 /* Endpoint constructor */
 RemoteEndpoint::RemoteEndpoint(BusAttachment& bus,
@@ -65,16 +68,21 @@ RemoteEndpoint::RemoteEndpoint(BusAttachment& bus,
     txWaitQueue(),
     txQueueLock(),
     exitCount(0),
-    rxThread(bus, (qcc::String(incoming ? "rx-srv-" : "rx-cli-") + threadName).c_str(), incoming),
-    txThread(bus, (qcc::String(incoming ? "tx-srv-" : "tx-cli-") + threadName).c_str(), txQueue, txWaitQueue, txQueueLock),
+    rxThread(bus, (qcc::String(incoming ? "rx-srv-" : "rx-cli-") + threadName + "-" + U32ToString(threadCount)).c_str(), incoming),
+    txThread(bus, (qcc::String(incoming ? "tx-srv-" : "tx-cli-") + threadName + "-" + U32ToString(threadCount)).c_str(), txQueue, txWaitQueue, txQueueLock),
     connSpec(connectSpec),
     incoming(incoming),
     processId(-1),
     refCount(0),
     isSocket(isSocket),
     armRxPause(false),
-    numWaiters(0)
+    numWaiters(0),
+    idleTimeoutCount(0),
+    maxIdleProbes(0),
+    idleTimeout(0),
+    probeTimeout(0)
 {
+    ++threadCount;
 }
 
 RemoteEndpoint::~RemoteEndpoint()
@@ -84,6 +92,20 @@ RemoteEndpoint::~RemoteEndpoint()
 
     /* Wait for thread to shutdown */
     Join();
+}
+
+QStatus RemoteEndpoint::SetLinkTimeout(uint32_t idleTimeout, uint32_t probeTimeout, uint32_t maxIdleProbes)
+{
+    QCC_DbgTrace(("RemoteEndpoint::SetLinkTimeout(%u, %u, %u) for %s", idleTimeout, probeTimeout, maxIdleProbes, GetUniqueName().c_str()));
+
+    if (GetRemoteProtocolVersion() >= 3) {
+        this->idleTimeout = idleTimeout,
+        this->probeTimeout = probeTimeout;
+        this->maxIdleProbes = maxIdleProbes;
+        return ER_OK;
+    } else {
+        return ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NO_DEST_SUPPORT;
+    }
 }
 
 QStatus RemoteEndpoint::Start()
@@ -99,6 +121,9 @@ QStatus RemoteEndpoint::Start()
     if (features.isBusToBus) {
         endpointType = BusEndpoint::ENDPOINT_TYPE_BUS2BUS;
     }
+
+    /* Set the send timeout for this endpoint */
+    stream.SetSendTimeout(120000);
 
     /* Start the TX thread */
     status = txThread.Start(this, this);
@@ -139,13 +164,15 @@ void RemoteEndpoint::SetListener(EndpointListener* listener)
 
 QStatus RemoteEndpoint::Stop(void)
 {
+    QCC_DbgPrintf(("RemoteEndpoint::Stop(%s) called\n", GetUniqueName().c_str()));
+
     /* Alert any threads that are on the wait queue */
-    txQueueLock.Lock();
+    txQueueLock.Lock(MUTEX_CONTEXT);
     deque<Thread*>::iterator it = txWaitQueue.begin();
     while (it != txWaitQueue.end()) {
         (*it++)->Alert(ENDPOINT_IS_DEAD_ALERTCODE);
     }
-    txQueueLock.Unlock();
+    txQueueLock.Unlock(MUTEX_CONTEXT);
 
     /*
      * Don't call txThread.Stop() here; the logic in RemoteEndpoint::ThreadExit() takes care of
@@ -158,23 +185,26 @@ QStatus RemoteEndpoint::Stop(void)
     return rxThread.Stop();
 }
 
-QStatus RemoteEndpoint::StopAfterTxEmpty()
+QStatus RemoteEndpoint::StopAfterTxEmpty(uint32_t maxWaitMs)
 {
     QStatus status;
 
+    /* Init wait time */
+    uint32_t startTime = maxWaitMs ? GetTimestamp() : 0;
+
     /* Wait for txqueue to empty before triggering stop */
-    txQueueLock.Lock();
+    txQueueLock.Lock(MUTEX_CONTEXT);
     while (true) {
-        if (txQueue.empty()) {
+        if (txQueue.empty() || (maxWaitMs && (qcc::GetTimestamp() > (startTime + maxWaitMs)))) {
             status = Stop();
             break;
         } else {
-            txQueueLock.Unlock();
+            txQueueLock.Unlock(MUTEX_CONTEXT);
             qcc::Sleep(5);
-            txQueueLock.Lock();
+            txQueueLock.Lock(MUTEX_CONTEXT);
         }
     }
-    txQueueLock.Unlock();
+    txQueueLock.Unlock(MUTEX_CONTEXT);
     return status;
 }
 
@@ -205,8 +235,18 @@ void RemoteEndpoint::ThreadExit(Thread* thread)
     /* If one thread stops, the other must too */
     if ((&rxThread == thread) && txThread.IsRunning()) {
         txThread.Stop();
-    } else if (rxThread.IsRunning()) {
+    } else if ((&txThread == thread) && rxThread.IsRunning()) {
         rxThread.Stop();
+    } else {
+        /* This is notification of a txQueue waiter has died. Remove him */
+        txQueueLock.Lock(MUTEX_CONTEXT);
+        deque<Thread*>::iterator it = find(txWaitQueue.begin(), txWaitQueue.end(), thread);
+        if (it != txWaitQueue.end()) {
+            (*it)->RemoveAuxListener(this);
+            txWaitQueue.erase(it);
+        }
+        txQueueLock.Unlock(MUTEX_CONTEXT);
+        return;
     }
 
     /* Unregister endpoint when both rx and tx exit */
@@ -240,25 +280,42 @@ void* RemoteEndpoint::RxThread::Run(void* arg)
     qcc::Event& ev = ep->GetSource().GetSourceEvent();
     /* Receive messages until the socket is disconnected */
     while (!IsStopping() && (ER_OK == status)) {
-        status = Event::Wait(ev);
+        uint32_t timeout = (ep->idleTimeoutCount == 0) ? ep->idleTimeout : ep->probeTimeout;
+        status = Event::Wait(ev, (timeout > 0) ? (1000 * timeout) : Event::WAIT_FOREVER);
         if (ER_OK == status) {
             Message msg(bus);
             status = msg->Unmarshal(*ep, (validateSender && !bus2bus));
             switch (status) {
             case ER_OK :
-                status = router.PushMessage(msg, *ep);
-                if (status != ER_OK) {
-                    /*
-                     * There are three cases where a failure to push a message to the router is ok:
-                     *
-                     * 1) The message received did not match the expected signature.
-                     * 2) The message was a method reply that did not match up to a method call.
-                     * 3) A daemon is pushing the message to a connected client or service.
-                     *
-                     */
-                    if ((router.IsDaemon() && !bus2bus) || (status == ER_BUS_SIGNATURE_MISMATCH) || (status == ER_BUS_UNMATCHED_REPLY_SERIAL)) {
-                        QCC_DbgHLPrintf(("Discarding %s: %s", msg->Description().c_str(), QCC_StatusText(status)));
-                        status = ER_OK;
+                ep->idleTimeoutCount = 0;
+                bool isAck;
+                if (ep->IsProbeMsg(msg, isAck)) {
+                    QCC_DbgPrintf(("%s: Received %s\n", ep->GetUniqueName().c_str(), isAck ? "ProbeAck" : "ProbeReq"));
+                    if (!isAck) {
+                        /* Respond to probe request */
+                        Message probeMsg(bus);
+                        status = ep->GenProbeMsg(true, probeMsg);
+                        if (status == ER_OK) {
+                            status = ep->PushMessage(probeMsg);
+                        }
+                        QCC_DbgPrintf(("%s: Sent ProbeAck (%s)\n", ep->GetUniqueName().c_str(), QCC_StatusText(status)));
+                    }
+                } else {
+                    status = router.PushMessage(msg, *ep);
+                    if (status != ER_OK) {
+                        /*
+                         * There are four cases where a failure to push a message to the router is ok:
+                         *
+                         * 1) The message received did not match the expected signature.
+                         * 2) The message was a method reply that did not match up to a method call.
+                         * 3) A daemon is pushing the message to a connected client or service.
+                         * 4) Pushing a message to an endpoint that has closed.
+                         *
+                         */
+                        if ((router.IsDaemon() && !bus2bus) || (status == ER_BUS_SIGNATURE_MISMATCH) || (status == ER_BUS_UNMATCHED_REPLY_SERIAL) || (status == ER_BUS_ENDPOINT_CLOSING)) {
+                            QCC_DbgHLPrintf(("Discarding %s: %s", msg->Description().c_str(), QCC_StatusText(status)));
+                            status = ER_OK;
+                        }
                     }
                 }
                 break;
@@ -290,7 +347,7 @@ void* RemoteEndpoint::RxThread::Run(void* arg)
                  *
                  * In all other cases an invalid serial number cause the connection to be dropped.
                  */
-                if (msg->IsUnreliable() || (bus2bus && msg->IsBroadcastSignal()) || IsControlMessage(msg)) {
+                if (msg->IsUnreliable() || msg->IsBroadcastSignal() || IsControlMessage(msg)) {
                     QCC_DbgHLPrintf(("Invalid serial discarding %s", msg->Description().c_str()));
                     status = ER_OK;
                 } else {
@@ -306,6 +363,20 @@ void* RemoteEndpoint::RxThread::Run(void* arg)
             if (ep->armRxPause && !IsStopping() && (msg->GetType() == MESSAGE_METHOD_RET)) {
                 status = Event::Wait(Event::neverSet);
             }
+        } else if (status == ER_TIMEOUT) {
+            if (ep->idleTimeoutCount++ < ep->maxIdleProbes) {
+                Message probeMsg(bus);
+                status = ep->GenProbeMsg(false, probeMsg);
+                if (status == ER_OK) {
+                    status = ep->PushMessage(probeMsg);
+                }
+                QCC_DbgPrintf(("%s: Sent ProbeReq (%s)\n", ep->GetUniqueName().c_str(), QCC_StatusText(status)));
+            } else {
+                QCC_DbgPrintf(("%s: Maximum number of idle probe (%d) attempts reached", ep->GetUniqueName().c_str(), ep->maxIdleProbes));
+            }
+        } else if (status == ER_ALERTED_THREAD) {
+            GetStopEvent().ResetEvent();
+            status = ER_OK;
         }
     }
     if ((status != ER_OK) && (status != ER_STOPPING_THREAD) && (status != ER_SOCK_OTHER_END_CLOSED) && (status != ER_BUS_STOPPING)) {
@@ -334,8 +405,8 @@ void* RemoteEndpoint::TxThread::Run(void* arg)
         if (!IsStopping() && (ER_ALERTED_THREAD == status)) {
             stopEvent.ResetEvent();
             status = ER_OK;
-            queueLock.Lock();
-            while (!queue.empty() && !IsStopping()) {
+            queueLock.Lock(MUTEX_CONTEXT);
+            while ((status == ER_OK) && !queue.empty() && !IsStopping()) {
 
                 /* Get next message */
                 Message msg = queue.back();
@@ -349,19 +420,18 @@ void* RemoteEndpoint::TxThread::Run(void* arg)
                         QCC_LogError(status, ("Failed to alert thread blocked on full tx queue"));
                     }
                 }
-
-                queueLock.Unlock();
+                queueLock.Unlock(MUTEX_CONTEXT);
 
                 /* Deliver message */
                 status = msg->Deliver(*ep);
-                queueLock.Lock();
+                queueLock.Lock(MUTEX_CONTEXT);
                 queue.pop_back();
             }
-            queueLock.Unlock();
+            queueLock.Unlock(MUTEX_CONTEXT);
         }
     }
     /* Wake any thread waiting on tx queue availability */
-    queueLock.Lock();
+    queueLock.Lock(MUTEX_CONTEXT);
     while (0 < waitQueue.size()) {
         Thread* wakeMe = waitQueue.back();
         QStatus status = wakeMe->Alert();
@@ -370,7 +440,7 @@ void* RemoteEndpoint::TxThread::Run(void* arg)
         }
         waitQueue.pop_back();
     }
-    queueLock.Unlock();
+    queueLock.Unlock(MUTEX_CONTEXT);
 
     /* On an unexpected disconnect save the status that cause the thread exit */
     if (ep->disconnectStatus == ER_OK) {
@@ -383,7 +453,7 @@ void* RemoteEndpoint::TxThread::Run(void* arg)
 
 QStatus RemoteEndpoint::PushMessage(Message& msg)
 {
-    static const size_t MAX_TX_QUEUE_SIZE = 10;
+    static const size_t MAX_TX_QUEUE_SIZE = 30;
 
     QStatus status = ER_OK;
 
@@ -396,7 +466,7 @@ QStatus RemoteEndpoint::PushMessage(Message& msg)
         return ER_BUS_ENDPOINT_CLOSING;
     }
     IncrementAndFetch(&numWaiters);
-    txQueueLock.Lock();
+    txQueueLock.Lock(MUTEX_CONTEXT);
     size_t count = txQueue.size();
     bool wasEmpty = (count == 0);
     if (MAX_TX_QUEUE_SIZE > count) {
@@ -425,44 +495,38 @@ QStatus RemoteEndpoint::PushMessage(Message& msg)
                 status = ER_OK;
                 break;
             } else {
+                /* This thread will have to wait for room in the queue */
                 Thread* thread = Thread::GetThread();
                 assert(thread);
 
-                /* This thread will have to wait for room in the queue */
+                thread->AddAuxListener(this);
                 txWaitQueue.push_front(thread);
-                txQueueLock.Unlock();
+                txQueueLock.Unlock(MUTEX_CONTEXT);
                 status = Event::Wait(Event::neverSet, maxWait);
-                txQueueLock.Lock();
+                txQueueLock.Lock(MUTEX_CONTEXT);
+
+                /* Reset alert status */
                 if (ER_ALERTED_THREAD == status) {
                     if (thread->GetAlertCode() == ENDPOINT_IS_DEAD_ALERTCODE) {
                         status = ER_BUS_ENDPOINT_CLOSING;
-                    } else {
-                        thread->GetStopEvent().ResetEvent();
                     }
-                } else {
-                    /* There was a timeout or some other non-expected exit from wait. Remove thread from wait queue. */
-                    /* If thread isn't on queue, this means there is an alert in progress that we must clear */
-                    bool foundThread = false;
-                    deque<Thread*>::iterator eit = txWaitQueue.begin();
-                    while (eit != txWaitQueue.end()) {
-                        if (*eit == thread) {
-                            txWaitQueue.erase(eit);
-                            foundThread = true;
-                            break;
-                        }
-                        ++eit;
-                    }
-                    if (!foundThread) {
-                        thread->GetStopEvent().ResetEvent();
-                    }
+                    thread->GetStopEvent().ResetEvent();
                 }
+                /* Remove thread from wait queue. */
+                thread->RemoveAuxListener(this);
+                deque<Thread*>::iterator eit = find(txWaitQueue.begin(), txWaitQueue.end(), thread);
+                if (eit != txWaitQueue.end()) {
+                    txWaitQueue.erase(eit);
+                }
+
                 if ((ER_OK != status) && (ER_ALERTED_THREAD != status) && (ER_TIMEOUT != status)) {
                     break;
                 }
+
             }
         }
     }
-    txQueueLock.Unlock();
+    txQueueLock.Unlock(MUTEX_CONTEXT);
 
     if (wasEmpty) {
         status = txThread.Alert();
@@ -487,14 +551,22 @@ QStatus RemoteEndpoint::PushMessage(Message& msg)
 
 void RemoteEndpoint::IncrementRef()
 {
-    IncrementAndFetch(&refCount);
+    int refs = IncrementAndFetch(&refCount);
+    QCC_DbgPrintf(("RemoteEndpoint::IncrementRef(%s) refs=%d\n", GetUniqueName().c_str(), refs));
+
 }
 
 void RemoteEndpoint::DecrementRef()
 {
     int refs = DecrementAndFetch(&refCount);
+    QCC_DbgPrintf(("RemoteEndpoint::DecrementRef(%s) refs=%d\n", GetUniqueName().c_str(), refs));
     if (refs <= 0) {
-        Stop();
+        Thread* curThread = Thread::GetThread();
+        if ((curThread == &rxThread) || (curThread == &txThread)) {
+            Stop();
+        } else {
+            StopAfterTxEmpty(500);
+        }
     }
 }
 
@@ -507,6 +579,36 @@ SocketFd RemoteEndpoint::GetSocketFd()
     } else {
         return -1;
     }
+}
+
+bool RemoteEndpoint::IsProbeMsg(const Message& msg, bool& isAck)
+{
+    bool ret = false;
+    if (0 == ::strcmp(org::alljoyn::Daemon::InterfaceName, msg->GetInterface())) {
+        if (0 == ::strcmp("ProbeReq", msg->GetMemberName())) {
+            ret = true;
+            isAck = false;
+        } else if (0 == ::strcmp("ProbeAck", msg->GetMemberName())) {
+            ret = true;
+            isAck = true;
+        }
+    }
+    return ret;
+}
+
+QStatus RemoteEndpoint::GenProbeMsg(bool isAck, Message msg)
+{
+    QStatus status = msg->SignalMsg("",
+                                    NULL,
+                                    0,
+                                    "/",
+                                    org::alljoyn::Daemon::InterfaceName,
+                                    isAck ? "ProbeAck" : "ProbeReq",
+                                    NULL,
+                                    0,
+                                    0,
+                                    0);
+    return status;
 }
 
 }

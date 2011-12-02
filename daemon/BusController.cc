@@ -36,30 +36,47 @@ using namespace qcc;
 
 namespace ajn {
 
-BusController::BusController(Bus& bus, QStatus& status) :
+BusController::BusController(Bus& alljoynBus, QStatus& status) :
+    bus(alljoynBus),
 #ifndef NDEBUG
     alljoynDebugObj(bus),
 #endif
-    dbusObj(bus),
-    alljoynObj(bus)
+    dbusObj(bus, this),
+    alljoynObj(bus, this)
 {
     DaemonRouter& router(reinterpret_cast<DaemonRouter&>(bus.GetInternal().GetRouter()));
-    router.SetBusController(*this);
+    router.SetBusController(this);
     status = dbusObj.Init();
-    if (ER_OK == status) {
-        status = alljoynObj.Init();
+    if (ER_OK != status) {
+        QCC_LogError(status, ("DBusObj::Init failed"));
     }
+}
 
-#ifndef NDEBUG
-    // AlljoynDebugObj must be initialized last.
-    if (ER_OK == status) {
-        status = alljoynDebugObj.Init();
-    }
-#endif
+BusController::~BusController()
+{
+    DaemonRouter& router(reinterpret_cast<DaemonRouter&>(bus.GetInternal().GetRouter()));
+    router.SetBusController(NULL);
 }
 
 #ifndef NDEBUG
 debug::AllJoynDebugObj* debug::AllJoynDebugObj::self = NULL;
 #endif
+
+
+void BusController::ObjectRegistered(BusObject* obj)
+{
+    QStatus status = ER_OK;
+    if (obj == &dbusObj) {
+        status = alljoynObj.Init();
+#ifndef NDEBUG
+    } else if (obj == &alljoynObj) {
+        status = alljoynDebugObj.Init();
+#endif
+    }
+
+    if (status != ER_OK) {
+        QCC_LogError(status, ("BusController::ObjectRegistered failed"));
+    }
+}
 
 }

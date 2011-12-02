@@ -32,6 +32,11 @@
 
 #include <Status.h>
 
+namespace qcc {
+/** @internal Forward references */
+class Mutex;
+}
+
 namespace ajn {
 
 /** @internal Forward references */
@@ -115,6 +120,13 @@ class ProxyBusObject : public MessageReceiver {
      * @return Service name (typically a well-known service name but may be a unique name)
      */
     const qcc::String& GetServiceName(void) const { return serviceName; }
+
+    /**
+     * Return the session Id for this object.
+     *
+     * @return Session Id
+     */
+    SessionId GetSessionId(void) const { return sessionId; }
 
     /**
      * Query the remote object on the bus to determine the interfaces and
@@ -376,7 +388,7 @@ class ProxyBusObject : public MessageReceiver {
      * @param method       Method being invoked.
      * @param args         The arguments for the method call (can be NULL)
      * @param numArgs      The number of arguments
-     * @param replyMsg     The arguments for the method call (can be NULL)
+     * @param replyMsg     The reply message received for the method call
      * @param timeout      Timeout specified in milliseconds to wait for a reply
      * @param flags        Logical OR of the message flags for this method call. The following flags apply to method calls:
      *                     - If #ALLJOYN_FLAG_ENCRYPTED is set the message is authenticated and the payload if any is encrypted.
@@ -402,7 +414,7 @@ class ProxyBusObject : public MessageReceiver {
      * @param methodName   Name of method.
      * @param args         The arguments for the method call (can be NULL)
      * @param numArgs      The number of arguments
-     * @param replyMsg     The arguments for the method call (can be NULL)
+     * @param replyMsg     The reply message received for the method call
      * @param timeout      Timeout specified in milliseconds to wait for a reply
      * @param flags        Logical OR of the message flags for this method call. The following flags apply to method calls:
      *                     - If #ALLJOYN_FLAG_ENCRYPTED is set the message is authenticated and the payload if any is encrypted.
@@ -580,6 +592,25 @@ class ProxyBusObject : public MessageReceiver {
     QStatus SecureConnection(bool forceAuth = false);
 
     /**
+     * Aynchronously secure the connection to the remote peer for this proxy object. Peer-to-peer
+     * connections can only be secured if EnablePeerSecurity() was previously called on the bus
+     * attachment for this proxy object. If the peer-to-peer connection is already secure this
+     * function does nothing. Note that peer-to-peer connections are automatically secured when a
+     * method call or signal requiring encryption is sent or received.
+     *
+     * Notification of success or failure is via the AuthListener passed to EnablePeerSecurity().
+     *
+     * @param forceAuth  If true, forces an re-authentication even if the peer connection is already
+     *                   authenticated.
+     *
+     * @return
+     *          - #ER_OK if securing could begin.
+     *          - #ER_BUS_NO_AUTHENTICATION_MECHANISM if BusAttachment::EnablePeerSecurity() has not been called.
+     *          - Other error status codes indicating a failure.
+     */
+    QStatus SecureConnectionAsync(bool forceAuth = false);
+
+    /**
      * Assignment operator.
      *
      * @param other  The object being assigned from
@@ -623,7 +654,13 @@ class ProxyBusObject : public MessageReceiver {
      * Set the B2B endpoint to use for all communication with remote object.
      * This method is for internal use only.
      */
-    QStatus SetB2BEndpoint(const char* b2bEpName);
+    void SetB2BEndpoint(RemoteEndpoint* b2bEp);
+
+    /**
+     * @internal
+     * Helper used to destruct and cleanu-up  ProxyBusObject::components member.
+     */
+    void DestructComponents();
 
     /**
      * @internal
@@ -668,6 +705,8 @@ class ProxyBusObject : public MessageReceiver {
     SessionId sessionId;        /**< Session to use for communicating with remote object */
     bool hasProperties;         /**< True if proxy object implements properties */
     RemoteEndpoint* b2bEp;      /**< B2B endpoint to use or NULL to indicates normal sessionId based routing */
+    mutable qcc::Mutex* lock;   /**< Lock that protects access to components member */
+    bool isExiting;             /**< true iff ProxyBusObject is in the process of begin destroyed */
 };
 
 }

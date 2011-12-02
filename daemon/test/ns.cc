@@ -171,12 +171,15 @@ int main(int argc, char** argv)
     uint16_t port = 0;
 
     bool advertise = false;
+    bool useEth0 = false;
     bool runtests = false;
     bool wildcard = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp("-a", argv[i]) == 0) {
             advertise = true;
+        } else if (strcmp("-e", argv[i]) == 0) {
+            useEth0 = true;
         } else if (strcmp("-t", argv[i]) == 0) {
             runtests = true;
         } else if (strcmp("-w", argv[i]) == 0) {
@@ -198,7 +201,7 @@ int main(int argc, char** argv)
     //
     bool enableIPv4, enableIPv6, loopback;
     enableIPv4 = enableIPv6 = loopback = true;
-    status = ns.Init(qcc::GUID().ToString(), enableIPv4, enableIPv6, loopback);
+    status = ns.Init(qcc::GUID128().ToString(), enableIPv4, enableIPv6, false, loopback);
     if (status != ER_OK) {
         QCC_LogError(status, ("Init failed"));
         ERROR_EXIT;
@@ -217,24 +220,28 @@ int main(int argc, char** argv)
     printf("Checking out interfaces ...\n");
     qcc::String overrideInterface;
     for (uint32_t i = 0; i < entries.size(); ++i) {
+        if (!useEth0) {
+            if (entries[i].m_name == "eth0") {
+                printf("******** Ignoring eth0, use \"-e\" to enable \n");
+                continue;
+            }
+        }
         printf("    %s: ", entries[i].m_name.c_str());
         printf("0x%x = ", entries[i].m_flags);
         PrintFlags(entries[i].m_flags);
         if (entries[i].m_flags & NameService::IfConfigEntry::UP) {
-            if (entries[i].m_flags & NameService::IfConfigEntry::MULTICAST) {
-                printf(", MTU = %d, address = %s", entries[i].m_mtu, entries[i].m_addr.c_str());
-                if ((entries[i].m_flags & NameService::IfConfigEntry::LOOPBACK) == 0) {
-                    printf(" <--- Let's use this one");
-                    overrideInterface = entries[i].m_name;
-                    //
-                    // Tell the name service to talk and listen over the interface we chose
-                    // above.
-                    //
-                    status = ns.OpenInterface(entries[i].m_name);
-                    if (status != ER_OK) {
-                        QCC_LogError(status, ("OpenInterface failed"));
-                        ERROR_EXIT;
-                    }
+            printf(", MTU = %d, address = %s", entries[i].m_mtu, entries[i].m_addr.c_str());
+            if ((entries[i].m_flags & NameService::IfConfigEntry::LOOPBACK) == 0) {
+                printf(" <--- Let's use this one");
+                overrideInterface = entries[i].m_name;
+                //
+                // Tell the name service to talk and listen over the interface we chose
+                // above.
+                //
+                status = ns.OpenInterface(entries[i].m_name);
+                if (status != ER_OK) {
+                    QCC_LogError(status, ("OpenInterface failed"));
+                    ERROR_EXIT;
                 }
             }
         }
@@ -242,9 +249,14 @@ int main(int argc, char** argv)
     }
 
     srand(time(0));
+
+    //
+    // Pick a random port to advertise.  This is what would normally be the
+    // daemon TCP well-known endpoint (9955) but we just make one up.  N.B. this
+    // is not the name service multicast port.
+    //
     port = rand();
     printf("Picked random port %d\n", port);
-
     status = ns.SetEndpoints("", "", port);
 
     if (status != ER_OK) {

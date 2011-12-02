@@ -26,6 +26,8 @@
 #endif
 
 #include <qcc/platform.h>
+
+#include <set>
 #include <vector>
 
 #include <qcc/GUID.h>
@@ -185,13 +187,15 @@ class BTTransport :
      *                    - Valid keys are:
      *                        - @c addr = Bluetooth device address
      *                        - @c name = Bluetooth Bus name
+     * @param opts           Requested sessions opts.
+     * @param newep          [OUT] Endpoint created as a result of successful connect.
      *
      * @return
      *      - ER_OK if successful.
      *      - ER_BUS_BAD_TRANSPORT_ARGS if unable to parse the @c connectSpec param
      *      - An error status otherwise
      */
-    QStatus Connect(const char* connectSpec, RemoteEndpoint** newep);
+    QStatus Connect(const char* connectSpec, const SessionOpts& opts, RemoteEndpoint** newep);
 
     /**
      * Disconnect a bluetooth endpoint
@@ -241,7 +245,7 @@ class BTTransport :
      *
      * @param avail    true if BT device is powered on and available, false otherwise.
      */
-    void BTDeviceAvailable(bool avail) { btController->BTDeviceAvailable(avail); }
+    void BTDeviceAvailable(bool avail);
 
     /**
      * Check if it is OK to accept the incoming connection from the specified
@@ -251,7 +255,12 @@ class BTTransport :
      *
      * @return  true if OK to accept the connection, false otherwise.
      */
-    bool CheckIncomingAddress(const BDAddress& addr) const { return btController->CheckIncomingAddress(addr); }
+    bool CheckIncomingAddress(const BDAddress& addr) const;
+
+    /**
+     * Disconnect all endpoints.
+     */
+    void DisconnectAll();
 
     /**
      * Callback for BTEndpoint thead exit.
@@ -357,16 +366,19 @@ class BTTransport :
      *
      * @return  ER_OK if successful.
      */
-    QStatus Disconnect(const BTBusAddress& addr);
+    QStatus Disconnect(const qcc::String& busName);
 
     /**
      * Called by BTAccessor to inform transport of an AllJoyn capable device.
      *
-     * @param adBdAddr  BD Address of the device advertising names.
-     * @param uuidRev   UUID revision number of the device that was found.
+     * @param adBdAddr      BD Address of the device advertising names.
+     * @param uuidRev       UUID revision number of the device that was found.
+     * @param eirCapable    - true if found device was confirmed AllJoyn capable via EIR
+     *                      - false if found device is potential AllJoyn capable
      */
     void DeviceChange(const BDAddress& bdAddr,
-                      uint32_t uuidRev);
+                      uint32_t uuidRev,
+                      bool eirCapable);
 
     /**
      * Start the find operation for AllJoyn capable devices.  A duration may
@@ -467,15 +479,18 @@ class BTTransport :
 
     RemoteEndpoint* LookupEndpoint(const qcc::String& busName);
     void ReturnEndpoint(RemoteEndpoint* ep);
-    QStatus Disconnect(const qcc::String& busName);
 
+    QStatus IsMaster(const BDAddress& addr, bool& master) const;
+    void RequestBTRole(const BDAddress& addr, bt::BluetoothRole role);
+
+    bool IsEIRCapable() const;
 
     BusAttachment& bus;                            /**< The message bus for this transport */
     BTAccessor* btAccessor;                        /**< Object for accessing the Bluetooth device */
     BTController* btController;                    /**< Bus Object that manages the BT topology */
-    std::map<qcc::String, qcc::String> serverArgs; /**< Map of server configuration args */
-    std::vector<RemoteEndpoint*> threadList;       /**< List of active BT endpoints */
+    std::set<RemoteEndpoint*> threadList;          /**< List of active BT endpoints */
     qcc::Mutex threadListLock;                     /**< Mutex that protects threadList */
+    BTNodeDB connNodeDB;
     TransportListener* listener;
     bool transportIsStopping;                      /**< The transport has recevied a stop request */
     bool btmActive;                                /**< Indicates if the Bluetooth Topology Manager is registered */

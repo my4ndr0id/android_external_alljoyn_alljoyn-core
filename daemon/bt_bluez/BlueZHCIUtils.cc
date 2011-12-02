@@ -22,11 +22,15 @@
 #include <qcc/platform.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
 #include <qcc/Socket.h>
+#include <qcc/time.h>
 
 #include "BlueZ.h"
 #include "BlueZHCIUtils.h"
+#include "BTTransportConsts.h"
 
 #include <Status.h>
 
@@ -46,14 +50,16 @@ const static uint16_t L2capDefaultMtu = (1 * 1021) + 1011; // 2 x 3DH5
 /*
  * Set the L2CAP mtu to something better than the BT 1.0 default value.
  */
-void ConfigL2cap(SocketFd sockFd)
+void ConfigL2capMTU(SocketFd sockFd)
 {
     int ret;
     uint8_t secOpt = BT_SECURITY_LOW;
     socklen_t optLen = sizeof(secOpt);
     uint16_t outMtu = 672; // default BT 1.0 value
     ret = setsockopt(sockFd, SOL_BLUETOOTH, BT_SECURITY, &secOpt, optLen);
-    QCC_DbgPrintf(("Setting security low: %d - %d: %s", ret, errno, strerror(errno)));
+    if (ret < 0) {
+        QCC_DbgPrintf(("Setting security low: %d: %s", errno, strerror(errno)));
+    }
 
     struct l2cap_options opts;
     optLen = sizeof(opts);
@@ -61,15 +67,15 @@ void ConfigL2cap(SocketFd sockFd)
     if (ret != -1) {
         opts.imtu = L2capDefaultMtu;
         opts.omtu = L2capDefaultMtu;
-        setsockopt(sockFd, SOL_L2CAP, L2CAP_OPTIONS, &opts, optLen);
+        ret = setsockopt(sockFd, SOL_L2CAP, L2CAP_OPTIONS, &opts, optLen);
         if (ret == -1) {
-            QCC_LogError(ER_OS_ERROR, ("Failed to set in/out MTU for L2CAP socket"));
+            QCC_LogError(ER_OS_ERROR, ("Failed to set in/out MTU for L2CAP socket (%d - %s)", errno, strerror(errno)));
         } else {
             outMtu = opts.omtu;
             QCC_DbgPrintf(("Set L2CAP mtu to %d", opts.omtu));
         }
     } else {
-        QCC_LogError(ER_OS_ERROR, ("Failed to get in/out MTU for L2CAP socket"));
+        QCC_LogError(ER_OS_ERROR, ("Failed to get in/out MTU for L2CAP socket (%d - %s)", errno, strerror(errno)));
     }
 
     // Only let the kernel buffer up 2 packets at a time.
@@ -78,6 +84,23 @@ void ConfigL2cap(SocketFd sockFd)
     ret = setsockopt(sockFd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     if (ret == -1) {
         QCC_LogError(ER_OS_ERROR, ("Failed to set send buf to %d: %d - %s", sndbuf, errno, strerror(errno)));
+    }
+}
+
+void ConfigL2capMaster(SocketFd sockFd)
+{
+    int ret;
+    int lmOpt = 0;
+    socklen_t optLen = sizeof(lmOpt);
+    ret = getsockopt(sockFd, SOL_L2CAP, L2CAP_LM, &lmOpt, &optLen);
+    if (ret == -1) {
+        QCC_LogError(ER_OS_ERROR, ("Failed to get LM flags (%d - %s)", errno, strerror(errno)));
+    } else {
+        lmOpt |= L2CAP_LM_MASTER;
+        ret = setsockopt(sockFd, SOL_L2CAP, L2CAP_LM, &lmOpt, optLen);
+        if (ret == -1) {
+            QCC_LogError(ER_OS_ERROR, ("Failed to set LM flags (%d - %s)", errno, strerror(errno)));
+        }
     }
 }
 
@@ -318,6 +341,231 @@ Exit:
     close(hciFd);
     return status;
 }
+
+
+QStatus ConfigureClassOfDevice(uint16_t deviceId, uint32_t cod)
+{
+    static const uint8_t hciWriteCOD[] = {
+        0x01, 0x24, 0x0c, 0x03, 0x00, 0x00, 0x00
+    };
+    QStatus status = ER_OK;
+    uint8_t cmd[sizeof(hciWriteCOD)];
+    sockaddr_hci addr;
+    SocketFd hciFd;
+    size_t sent;
+
+    hciFd = (SocketFd)socket(AF_BLUETOOTH, QCC_SOCK_RAW, 1);
+    if (hciFd < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to create socket (errno %d)", errno));
+        return status;
+    }
+
+    addr.family = AF_BLUETOOTH;
+    addr.dev = deviceId;
+    if (bind(hciFd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to bind to BT device id %d socket (errno %d)", deviceId, errno));
+        goto Exit;
+    }
+
+    memcpy(cmd, hciWriteCOD, sizeof(hciWriteCOD));
+
+    cmd[4] = cod & 0xff;
+    cmd[5] = (cod >> 8) & 0xff;
+    cmd[6] = (cod >> 16) & 0xff;
+
+    status = Send(hciFd, cmd, sizeof(hciWriteCOD), sent);
+    if (status != ER_OK) {
+        QCC_LogError(status, ("Failed to send Write CoD HCI command (errno %d)", errno));
+        goto Exit;
+    }
+
+Exit:
+
+    close(hciFd);
+    return status;
+}
+
+
+QStatus IsMaster(uint16_t deviceId, const BDAddress& bdAddr, bool& master)
+{
+    int ret;
+    QStatus status = ER_OK;
+    struct hci_conn_info_req connInfoReq;
+    sockaddr_hci addr;
+    SocketFd hciFd;
+
+    hciFd = (SocketFd)socket(AF_BLUETOOTH, QCC_SOCK_RAW, 1);
+    if (hciFd < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to create socket (%d - %s)", errno, strerror(errno)));
+        return status;
+    }
+
+    addr.family = AF_BLUETOOTH;
+    addr.dev = deviceId;
+    if (bind(hciFd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to bind to BT device id %d socket (errno %d)", deviceId, errno));
+        goto exit;
+    }
+
+    bdAddr.CopyTo(connInfoReq.bdaddr.b, true);
+    connInfoReq.type = HCI_ACL_LINK;
+
+    ret = ioctl(hciFd, HCIGETCONNINFO, &connInfoReq);
+    if (ret < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Getting connection information (%d - %s)", errno, strerror(errno)));
+        goto exit;
+    }
+
+    master = static_cast<bool>(connInfoReq.conn_info.link_mode & HCI_LM_MASTER);
+
+exit:
+    close(hciFd);
+    return status;
+}
+
+QStatus RequestBTRole(uint16_t deviceId, const BDAddress& bdAddr, bt::BluetoothRole role)
+{
+    // Template for the role switch command.
+    static const uint8_t hciRoleSwitch[] = {
+        0x01, 0x0B, 0x08, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    QStatus status = ER_OK;
+    uint8_t cmd[sizeof(hciRoleSwitch)];
+    sockaddr_hci addr;
+    SocketFd hciFd;
+    size_t sent;
+    uint8_t rxBuf[260];
+    size_t pos;
+    size_t recvd;
+    bool gotCmdStatus = false;
+    bool gotRoleSwitchEvent = false;
+    int ret;
+    struct hci_filter evtFilter;
+    uint64_t timeout;
+    int flags;
+
+    // HCI command sent via raw sockets (must have privileges for this)
+    hciFd = (SocketFd)socket(AF_BLUETOOTH, QCC_SOCK_RAW, 1);
+    if (hciFd < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to create socket (errno %d)", errno));
+        return status;
+    }
+
+    Event hciRxEvent(hciFd);
+
+    // Need to select the adapter we are sending the HCI command to.
+    addr.family = AF_BLUETOOTH;
+    addr.dev = deviceId;
+    if (bind(hciFd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to bind to BT device id %d socket (errno %d)", deviceId, errno));
+        goto exit;
+    }
+
+    // Initialize the command with the template.
+    memcpy(cmd, hciRoleSwitch, sizeof(hciRoleSwitch));
+
+    // Embed the BD address into the command.
+    bdAddr.CopyTo(cmd + 4, true);
+
+    // Set which role we want.
+    cmd[10] = (role == bt::MASTER) ? 0x00 : 0x01;   // Select the role: master or slave
+
+    // Send the command.
+    status = Send(hciFd, cmd, sizeof(hciRoleSwitch), sent);
+    if (status != ER_OK) {
+        QCC_LogError(status, ("Failed to send HciRoleSwitch HCI command (errno %d)", errno));
+        goto exit;
+    }
+
+    // Setup HCI event types to receive.
+    evtFilter.type_mask = 1 << 0x04;
+    evtFilter.event_mask[0] = (1 << 0x0f) | (1 << 0x12);
+    evtFilter.event_mask[1] = 0;
+    evtFilter.opcode = htole16(0x0b | (0x2 << 10));
+
+    ret = setsockopt(hciFd, SOL_HCI, HCI_FILTER, &evtFilter, sizeof(evtFilter));
+    if (ret == -1) {
+        status = ER_OS_ERROR;
+        QCC_LogError(status, ("Failed to send HciRoleSwitch HCI command (errno %d)", errno));
+        goto exit;
+    }
+
+    flags = fcntl(hciFd, F_GETFL);
+    ret = fcntl(hciFd, F_SETFL, flags | O_NONBLOCK);
+
+    timeout = GetTimestamp64() + 10000;
+
+    pos = 0;
+    do {
+        status = Event::Wait(hciRxEvent, 5000);  // 5 second timeout
+        if (status != ER_OK) {
+            QCC_LogError(status, ("Waiting for HCI event"));
+            goto exit;
+        }
+
+        status = Recv(hciFd, rxBuf + pos, sizeof(rxBuf) - pos, recvd);
+        if (status == ER_WOULDBLOCK) {
+            continue;
+        }
+        if (status != ER_OK) {
+            QCC_LogError(status, ("Failed to receive HCI event (errno %d)", errno));
+            goto exit;
+        }
+
+        pos += recvd;
+
+        if ((pos > 2) && (pos > rxBuf[2])) {
+            if (!gotCmdStatus) {
+                if ((rxBuf[0] == 0x04) &&
+                    (rxBuf[1] == 0x0f) &&
+                    (rxBuf[2] == 0x04) &&
+                    memcmp(rxBuf + 4, hciRoleSwitch, 3) == 0) {
+                    if (rxBuf[3] != 0x00) {
+                        status = ER_FAIL;
+                        QCC_LogError(status, ("HCI role switch command failed with HCI status 0x%02x", rxBuf[3]));
+                        goto exit;
+                    }
+                    gotCmdStatus = true;
+                }
+
+            } else if (!gotRoleSwitchEvent) {
+                if ((rxBuf[0] == 0x04) &&
+                    (rxBuf[1] == 0x12) &&
+                    (rxBuf[2] == 0x08) &&
+                    memcmp(rxBuf + 4, cmd + 4, sizeof(hciRoleSwitch) - 5) == 0) {
+                    if (rxBuf[3] != 0x00) {
+                        status = ER_FAIL;
+                        QCC_LogError(status, ("HCI role switch event received with HCI fail code 0x%02x", rxBuf[3]));
+                        goto exit;
+                    }
+                    gotRoleSwitchEvent = true;
+                    QCC_DbgPrintf(("BT role switched to %s for connection to %s",
+                                   (rxBuf[9] == 0x00) ? "MASTER" : "SLAVE",
+                                   bdAddr.ToString().c_str()));
+                }
+            }
+            pos = 0;
+        }
+    } while (!gotRoleSwitchEvent && (timeout > GetTimestamp64()));
+
+    if (!gotRoleSwitchEvent) {
+        status = ER_TIMEOUT;
+        QCC_LogError(status, ("Timed out waiting for role switch confirmation"));
+    }
+
+exit:
+    close(hciFd);
+    return status;
+}
+
+
 
 } // namespace bluez
 } // namespace ajn

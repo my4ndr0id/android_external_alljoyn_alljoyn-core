@@ -45,7 +45,7 @@ namespace ajn {
  */
 #define NONCE_LEN  28
 
-AuthMechSRP::AuthMechSRP(KeyStore& keyStore, AuthListener* listener) : AuthMechanism(keyStore, listener), step(255)
+AuthMechSRP::AuthMechSRP(KeyStore& keyStore, ProtectedAuthListener& listener) : AuthMechanism(keyStore, listener), step(255)
 {
 }
 
@@ -53,9 +53,10 @@ QStatus AuthMechSRP::Init(AuthRole authRole, const qcc::String& authPeer)
 {
     AuthMechanism::Init(authRole, authPeer);
     step = 0;
-    if (!listener) {
-        return ER_BUS_NO_LISTENER;
-    }
+    /*
+     * Default for AuthMechSRP is to never expire the master key
+     */
+    expiration = 0xFFFFFFFF;
     /*
      * msgHash keeps a running hash of all challenges and responses sent and received.
      */
@@ -74,11 +75,14 @@ void AuthMechSRP::ComputeMS()
     uint8_t keymatter[48];
     KeyBlob pms;
     srp.GetPremasterSecret(pms);
+    QCC_DbgHLPrintf(("PMS:  %s", BytesToHexString(pms.GetData(), pms.GetSize()).c_str()));
     /*
      * Use the PRF function to compute the master secret.
      */
     Crypto_PseudorandomFunction(pms, label, clientRandom + serverRandom, keymatter, sizeof(keymatter));
     masterSecret.Set(keymatter, sizeof(keymatter), KeyBlob::GENERIC);
+    QCC_DbgHLPrintf(("MasterSecret:  %s", BytesToHexString(masterSecret.GetData(), masterSecret.GetSize()).c_str()));
+    masterSecret.SetExpiration(expiration);
 }
 
 /*
@@ -99,7 +103,7 @@ qcc::String AuthMechSRP::ComputeVerifier(const char* label)
      */
     qcc::String seed((const char*)digest, sizeof(digest));
     Crypto_PseudorandomFunction(masterSecret, label, seed, verifier, sizeof(verifier));
-    QCC_DbgHLPrintf(("Verifier:  %s", BytesToHexString(verifier, sizeof(verifier)).c_str()));
+    QCC_DbgHLPrintf(("Verifier(%s):  %s", label, BytesToHexString(verifier, sizeof(verifier)).c_str()));
     return BytesToHexString(verifier, sizeof(verifier));
 }
 
@@ -141,15 +145,22 @@ qcc::String AuthMechSRP::Response(const qcc::String& challenge,
 
     case 2:
         /*
-         * Server sends a random nonce concatenated wiht a verifier string.
+         * Server sends a random nonce concatenated with a verifier string.
          */
         pos = challenge.find_first_of(":");
         serverRandom = HexStringToByteString(challenge.substr(0, pos));
         if (pos == qcc::String::npos) {
-            result = ALLJOYN_AUTH_ERROR;
+            /*
+             * String is incorrectly formatted - fail the authentication
+             */
+            QCC_LogError(ER_FAIL, ("AuthMechSRP::Response has wrong format"));
+            result = ALLJOYN_AUTH_FAIL;
             break;
         }
-        if (listener->RequestCredentials(GetName(), authPeer.c_str(), authCount, "", AuthListener::CRED_PASSWORD, creds)) {
+        if (listener.RequestCredentials(GetName(), authPeer.c_str(), authCount, "", AuthListener::CRED_PASSWORD, creds)) {
+            if (creds.IsSet(AuthListener::CRED_EXPIRATION)) {
+                expiration = creds.GetExpiration();
+            }
             status = srp.ClientFinish("<anonymous>", creds.GetPassword());
             if (status == ER_OK) {
                 ComputeMS();
@@ -203,7 +214,10 @@ qcc::String AuthMechSRP::Challenge(const qcc::String& response,
          * Client sends a random string. Server returns an SRP string.
          */
         clientRandom = HexStringToByteString(response);
-        if (listener->RequestCredentials(GetName(), authPeer.c_str(), authCount, "", AuthListener::CRED_ONE_TIME_PWD, creds)) {
+        if (listener.RequestCredentials(GetName(), authPeer.c_str(), authCount, "", AuthListener::CRED_ONE_TIME_PWD, creds)) {
+            if (creds.IsSet(AuthListener::CRED_EXPIRATION)) {
+                expiration = creds.GetExpiration();
+            }
             status = srp.ServerInit("<anonymous>", creds.GetPassword(), challenge);
         } else {
             result = ALLJOYN_AUTH_FAIL;

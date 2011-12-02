@@ -47,8 +47,9 @@
 #include "MethodTable.h"
 #include "SignalTable.h"
 #include "Transport.h"
+#include "PermissionDB.h"
 
-#ifdef __GNUCC__
+#if defined(__GNUCC__) || defined (QCC_OS_DARWIN)
 #include <ext/hash_map>
 namespace std {
 using namespace __gnu_cxx;
@@ -148,6 +149,18 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
      * @param serial       The serial number expected in the reply
      */
     void UnregisterReplyHandler(uint32_t serial);
+
+    /**
+     * Extend the timeout on the handler for method call reply
+     *
+     * @param serial       The serial number expected in the reply
+     * @param extension    The number of milliseconds to add to the timeout.
+     *
+     * @return
+     *      - ER_OK if the timeout was succesfully extended.
+     *      - An error status otherwise
+     */
+    QStatus ExtendReplyHandlerTimeout(uint32_t serial, uint32_t extension);
 
     /**
      * Register a signal handler.
@@ -271,7 +284,7 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
      *
      * @return  The guid for the local endpoint
      */
-    const qcc::GUID& GetGuid() { return guid; }
+    const qcc::GUID128& GetGuid() { return guid; }
 
     /**
      * Return the user id of the endpoint.
@@ -359,6 +372,52 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
      */
     std::map<uint32_t, ReplyContext> replyMap;
 
+    /**
+     * Type definition for a message pending for permission check.
+     */
+    typedef struct ChkPendingMsg {
+        Message msg;                                /**< The message pending for permission check */
+        const MethodTable::Entry* methodEntry;      /**< Method handler */
+        list<SignalTable::Entry> signalCallList;    /**< List of signal handlers */
+        qcc::String perms;                          /**< The required permissions */
+        ChkPendingMsg(Message& msg, const MethodTable::Entry* methodEntry, const qcc::String& perms) : msg(msg), methodEntry(methodEntry), perms(perms) { }
+        ChkPendingMsg(Message& msg, list<SignalTable::Entry>& signalCallList, const qcc::String& perms) : msg(msg), signalCallList(signalCallList), perms(perms) { }
+    } ChkPendingMsg;
+
+    /**
+     * Type definition for a permission-checked method or signal call.
+     */
+    typedef struct PermCheckedEntry {
+      public:
+        const String sender;                        /**< The endpoint name that issues the call */
+        const String sourcePath;                    /**< The object path of the call */
+        const String iface;                         /**< The interface name of the call */
+        const String signalName;                    /**< The method or signal name of the call */
+        PermCheckedEntry(const String& sender, const String& sourcePath, const String& iface, const String& signalName) : sender(sender), sourcePath(sourcePath), iface(iface), signalName(signalName) { }
+        bool operator<(const PermCheckedEntry& other) const {
+            return (sender < other.sender) || ((sender == other.sender) && (sourcePath < other.sourcePath))
+                   || ((sourcePath == other.sourcePath) && (iface < other.iface))
+                   || ((iface == other.iface) && (signalName < other.signalName));
+        }
+    } PermCheckedEntry;
+
+    /**
+     * Type definition for a thread that does the permission verification on the message calls
+     */
+    class PermVerifyThread : public qcc::Thread {
+        qcc::ThreadReturn STDCALL Run(void* arg);
+
+      public:
+        PermVerifyThread() : Thread("PermVerifyThread") { }
+    };
+
+    std::list<ChkPendingMsg> chkPendingMsgList;    /**< List of messages pending for permission check */
+    std::map<PermCheckedEntry, bool> permCheckedCallMap;  /**< Map of a permission-checked method/signal call to the verification result */
+    qcc::Mutex chkMsgListLock;                     /**< Mutex protecting the pending message list and the verification result cache map */
+    qcc::Event wakeEvent;                          /**< Event to notify the permission verification thread of new pending messages */
+    PermVerifyThread permVerifyThread;             /**< The permission verification thread */
+    PermissionDB permDb;                           /**< Permission security information cache */
+
     bool running;                      /**< Is the local endpoint up and running */
     int32_t refCount;                  /**< Reference count for local transport */
     MethodTable methodTable;           /**< Hash table of BusObject methods */
@@ -366,7 +425,7 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
     BusAttachment& bus;                /**< Message bus */
     qcc::Mutex objectsLock;            /**< Mutex protecting Objects hash table */
     qcc::Mutex replyMapLock;           /**< Mutex protecting replyMap */
-    qcc::GUID guid;                    /**< GUID to uniquely identify a local endpoint */
+    qcc::GUID128 guid;                    /**< GUID to uniquely identify a local endpoint */
     qcc::String uniqueName;            /**< Unique name for endpoint */
 
     std::vector<BusObject*> defaultObjects;  /**< Auto-generated, heap allocated parent objects */
@@ -498,9 +557,11 @@ class LocalTransport : public Transport {
      * Connect a local endpoint. (Not used for local transports)
      *
      * @param connectSpec     Unused parameter.
+     * @param opts            Requested sessions opts.
+     * @param newep           [OUT] Endpoint created as a result of successful connect.
      * @return  ER_NOT_IMPLEMENTED.
      */
-    QStatus Connect(const char* connectSpec, RemoteEndpoint** newep) { return ER_NOT_IMPLEMENTED; }
+    QStatus Connect(const char* connectSpec, const SessionOpts& opts, RemoteEndpoint** newep) { return ER_NOT_IMPLEMENTED; }
 
     /**
      * Disconnect a local endpoint. (Not used for local transports)

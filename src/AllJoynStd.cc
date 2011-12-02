@@ -38,6 +38,7 @@ const char* org::alljoyn::Bus::ErrorName = "org.alljoyn.Bus.ErStatus";
 const char* org::alljoyn::Bus::ObjectPath = "/org/alljoyn/Bus";
 const char* org::alljoyn::Bus::InterfaceName = "org.alljoyn.Bus";
 const char* org::alljoyn::Bus::WellKnownName = "org.alljoyn.Bus";
+const char* org::alljoyn::Bus::Secure = "org.alljoyn.Bus.Secure";
 const char* org::alljoyn::Bus::Peer::ObjectPath = "/org/alljoyn/Bus/Peer";
 
 /** org.alljoyn.Daemon interface definitions */
@@ -78,10 +79,13 @@ QStatus org::alljoyn::CreateInterfaces(BusAttachment& bus)
         ifc->AddMethod("FindAdvertisedName",       "s",                 "u",                 "name,disposition",                           0);
         ifc->AddMethod("CancelFindAdvertisedName", "s",                 "u",                 "name,disposition",                           0);
         ifc->AddMethod("GetSessionFd",             "u",                 "h",                 "sessionId,handle",                           0);
+        ifc->AddMethod("SetLinkTimeout",           "uu",                "uu",                "sessionId,inLinkTO,disposition,outLinkTO",   0);
+        ifc->AddMethod("AliasUnixUser",            "u",                 "u",                 "aliasUID, disposition",                      0);
 
         ifc->AddSignal("FoundAdvertisedName",      "sqs",              "name,transport,prefix",                        0);
         ifc->AddSignal("LostAdvertisedName",       "sqs",              "name,transport,prefix",                        0);
         ifc->AddSignal("SessionLost",              "u",                "sessionId",                                    0);
+        ifc->AddSignal("MPSessionChanged",         "usb",              "sessionId,name,isAdded",                       0);
 
         ifc->Activate();
     }
@@ -100,6 +104,8 @@ QStatus org::alljoyn::CreateInterfaces(BusAttachment& bus)
         ifc->AddSignal("DetachSession",  "us",     "sessionId,joiner",       0);
         ifc->AddSignal("ExchangeNames",  "a(sas)", "uniqueName,aliases",     0);
         ifc->AddSignal("NameChanged",    "sss",    "name,oldOwner,newOwner", 0);
+        ifc->AddSignal("ProbeReq",       "",       "",                       0);
+        ifc->AddSignal("ProbeAck",       "",       "",                       0);
         ifc->Activate();
     }
     {
@@ -133,11 +139,12 @@ QStatus org::alljoyn::CreateInterfaces(BusAttachment& bus)
             QCC_LogError(status, ("Failed to create %s interface", org::alljoyn::Bus::Peer::Authentication::InterfaceName));
             return status;
         }
-        ifc->AddMethod("ExchangeGuids",     "s",   "s",  "localGuid,remoteGuid");
+        ifc->AddMethod("ExchangeGuids",     "su",  "su", "localGuid,localVersion,remoteGuid,remoteVersion");
         ifc->AddMethod("GenSessionKey",     "sss", "ss", "localGuid,remoteGuid,localNonce,remoteNonce,verifier");
         ifc->AddMethod("ExchangeGroupKeys", "ay",  "ay", "localKeyMatter,remoteKeyMatter");
         ifc->AddMethod("AuthChallenge",     "s",   "s",  "challenge,response");
         ifc->AddProperty("Mechanisms",  "s", PROP_ACCESS_READ);
+        ifc->AddProperty("Version",     "u", PROP_ACCESS_READ);
         ifc->Activate();
     }
     {
