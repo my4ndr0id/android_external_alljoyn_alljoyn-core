@@ -5,8 +5,6 @@
  */
 
 /******************************************************************************
- * $Revision: $
- *
  * Copyright 2010-2011, Qualcomm Innovation Center, Inc.
  * 
  *    Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,12 +24,12 @@
 
 static const char product[] = "Alljoyn Library";
 static const unsigned int architecture = 2;
-static const unsigned int apiLevel = 0;
-static const unsigned int release = 1;
+static const unsigned int apiLevel = 2;
+static const unsigned int release = 0;
 
 
-static const char version[] = "v2.0.1";
-static const char build[] = "Alljoyn Library v2.0.1 (Built Fri Jun 24 04:13:50 UTC 2011 on ubuntu by jprofit - Git branch: '(no branch)' tag: 'R02.00.01c2' (+0 changes) commit ref: b383a0ccb4ed661cd058431ef41ffad865679d3d)";
+static const char version[] = "v2.2.0";
+static const char build[] = "Alljoyn Library v2.2.0 (Built Tue Nov 22 02:31:27 UTC 2011 on sea-ajnu1010-a by seabuild - Git branch: '(no branch)' tag: 'R02.02.00c4' (+0 changes) commit ref: 7165ada378b3e618c938a2a9a4fc98b77c4d5d65)";
 
 const char * ajn::GetVersion()
 {

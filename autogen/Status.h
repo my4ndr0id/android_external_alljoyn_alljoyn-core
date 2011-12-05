@@ -58,6 +58,7 @@ typedef enum {
     ER_PARSE_ERROR = 0x19 /**< Generic parse failure */,
     ER_END_OF_DATA = 0x1A /**< Generic EOD/EOF error */,
     ER_CONN_REFUSED = 0x1B /**< Connection was refused because no one is listening */,
+    ER_BAD_ARG_COUNT = 0x1C /**< Incorrect number of arguments given to function call */,
     ER_COMMON_ERRORS = 0x1000 /**< Error code block for the Common subsystem. */,
     ER_STOPPING_THREAD = 0x1001 /**< Operation interrupted by ERThread stop signal. */,
     ER_ALERTED_THREAD = 0x1002 /**< Operation interrupted by ERThread alert signal. */,
@@ -233,7 +234,16 @@ typedef enum {
     ER_ALLJOYN_UNBINDSESSIONPORT_REPLY_FAILED = 0x9099 /**< UnbindSessionPort reply: Failed */,
     ER_ALLJOYN_BINDSESSIONPORT_REPLY_INVALID_OPTS = 0x909a /**< BindSessionPort reply: SessionOpts are invalid */,
     ER_ALLJOYN_JOINSESSION_REPLY_ALREADY_JOINED = 0x909b /**< JoinSession reply: Caller has already joined the session */,
-    ER_BUS_SELF_CONNECT = 0x909c /**< Received BusHello from self */
+    ER_BUS_SELF_CONNECT = 0x909c /**< Received BusHello from self */,
+    ER_BUS_SECURITY_NOT_ENABLED = 0x909d /**< Security is not enabled for this bus attachment */,
+    ER_BUS_LISTENER_ALREADY_SET = 0x909e /**< A listener has alread been set */,
+    ER_BUS_PEER_AUTH_VERSION_MISMATCH = 0x909f /**< Incompatible peer authentication version numbers */,
+    ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NOT_SUPPORTED = 0x90a0 /**< Local daemon does not support SetLinkTimeout */,
+    ER_ALLJOYN_SETLINKTIMEOUT_REPLY_NO_DEST_SUPPORT = 0x90a1 /**< SetLinkTimeout not supported by destination */,
+    ER_ALLJOYN_SETLINKTIMEOUT_REPLY_FAILED = 0x90a2 /**< SetLinkTimeout failed */,
+    ER_ALLJOYN_ACCESS_PERMISSION_WARNING = 0x90a3 /**< No permission to use Wifi/Bluetooth */,
+    ER_ALLJOYN_ACCESS_PERMISSION_ERROR = 0x90a4 /**< No permission to access peer service */,
+    ER_BUS_DESTINATION_NOT_AUTHENTICATED = 0x90a5 /**< Cannot send a signal to a destination that is not authenticated */
 } QStatus;
 
 /**

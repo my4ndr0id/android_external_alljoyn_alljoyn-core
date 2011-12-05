@@ -77,16 +77,6 @@ Known issues and limitations with this release
    SessionPortListener::SessionJoined callback.
 
 
-3) ALLJOYN-519: A ProxyBusObject may trigger a segmentation fault if it is
-   deleted while threads are blocked inside ProxyBusObjec::MethodCall().
-
-4) ALLJOYN-494: AllJoyn java binding calls that return QStatus can return
-   null instead of a valid QStatus in certain error situations.
-
-5) Java Chat sample program is not optimized for AllJoyn 2.x.
-   Please see source file AllJoynChat.java for details.
-
-
 Compatibility
 -------------
 Applications written for AllJoyn 1.X will need to be modified and rebuilt
