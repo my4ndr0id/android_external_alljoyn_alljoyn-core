@@ -106,6 +106,7 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
             SessionOpts::TrafficType traffic = SessionOpts::TRAFFIC_MESSAGES;
             SessionOpts opts(traffic, g_useMultipoint, SessionOpts::PROXIMITY_ANY, TRANSPORT_ANY);
 
+            QCC_SyncPrintf("Calling JoinSessionAsync(%s)\n", name);
             QStatus status = g_msgBus->JoinSessionAsync(name, 26, this, opts, this, ::strdup(name));
             if (ER_OK != status) {
                 QCC_LogError(status, ("JoinSessionAsync(%s) failed \n", name));
@@ -127,7 +128,7 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
             status = g_msgBus->JoinSessionAsync(name, 26, this, opts, this, retryContext);
             if (status != ER_OK) {
                 QCC_SyncPrintf("JoinSessionAsync retry failed\n");
-                delete retryContext;
+                free(retryContext);
             }
             return;
         } else {
@@ -153,7 +154,7 @@ class MyBusListener : public BusListener, public SessionPortListener, public Ses
                 status = g_msgBus->JoinSessionAsync(name, 26, this, opts, this, retryContext);
                 if (status != ER_OK) {
                     QCC_LogError(status, ("JoinSessionAsync failed"));
-                    delete retryContext;
+                    free(retryContext);
                 }
             } else {
                 QCC_LogError(status, ("LeaveSession failed"));

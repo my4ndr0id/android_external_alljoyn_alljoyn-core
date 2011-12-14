@@ -44,6 +44,7 @@ LOCAL_SRC_FILES := \
 	../common/src/BigNum.cc \
 	../common/src/SocketStream.cc \
 	../common/src/BufferedSink.cc \
+	../common/src/LockTrace.cc \
 	../common/os/posix/Mutex.cc \
 	../common/os/posix/Socket.cc \
 	../common/os/posix/Event.cc \
@@ -54,6 +55,7 @@ LOCAL_SRC_FILES := \
 	../common/os/posix/AdapterUtil.cc \
 	../common/os/posix/osUtil.cc \
 	../common/os/posix/Thread.cc \
+	../common/os/posix/IfConfigLinux.cc \
 	../common/crypto/openssl/CryptoRand.cc \
 	../common/crypto/openssl/CryptoRSA.cc \
 	../common/crypto/openssl/CryptoHash.cc \
@@ -89,7 +91,6 @@ LOCAL_SRC_FILES += \
 	src/ClientRouter.cc \
 	src/MsgArg.cc \
 	src/BusObject.cc \
-	src/NsProtocol.cc \
 	src/ProxyBusObject.cc \
 	src/XmlHelper.cc \
 	src/SASLEngine.cc \

@@ -35,7 +35,7 @@ QStatus WindowsBTStream::PushBytes(const void* buf, size_t numBytes, size_t& num
 {
     QStatus returnValue = ER_OK;
 
-    QCC_DbgPrintf(("PushBytes() %ld bytes to channel %p.", numBytes, GetChannelHandle()));
+    //QCC_DbgPrintf(("PushBytes() %ld bytes to channel %p.", numBytes, GetChannelHandle()));
 
     if (!btAccessor) {
         returnValue = ER_INIT_FAILED;
@@ -99,8 +99,7 @@ QStatus WindowsBTStream::PullBytes(void* buf,
     size_t bytesReturned = 0;
     QStatus returnValue = ER_OK;
 
-    QCC_DbgPrintf(("PullBytes() expects %ld bytes in %d mS from handle %p.",
-                   reqBytes, timeout, GetChannelHandle()));
+    //QCC_DbgPrintf(("PullBytes() expects %ld bytes in %d mS from handle %p.", reqBytes, timeout, GetChannelHandle()));
 
     message.version = DRIVER_VERSION;
     message.is64Bit = IS_64BIT;

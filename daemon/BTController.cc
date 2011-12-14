@@ -328,8 +328,8 @@ QStatus BTController::AddAdvertiseName(const qcc::String& name)
     if (isMaster && (status == ER_OK)) {
         if (lDevAvailable) {
             BTNodeDB newAdInfo;
-            BTNodeInfo node(addr, self->GetUniqueName(), self->GetGUID());  // make an actual copy of self
-            node->AddAdvertiseName(name);  // copy of self only gets the new names (not the existing names)
+            BTNodeInfo node = self->Clone();  // make an actual copy of self
+            node->AddAdvertiseName(name);     // clone of self only gets the new names (not all existing names)
             newAdInfo.AddNode(node);
             DistributeAdvertisedNameChanges(&newAdInfo, NULL);
         }
@@ -352,8 +352,8 @@ QStatus BTController::RemoveAdvertiseName(const qcc::String& name)
     if (isMaster && (status == ER_OK)) {
         if (lDevAvailable) {
             BTNodeDB oldAdInfo;
-            BTNodeInfo node(addr, self->GetUniqueName(), self->GetGUID());  // make an actual copy of self
-            node->AddAdvertiseName(name);  // Yes 'Add' the name being removed (it goes in the old ad info).
+            BTNodeInfo node = self->Clone();  // make an actual copy of self
+            node->AddAdvertiseName(name);     // clone of self only gets the new names (not all existing names)
             oldAdInfo.AddNode(node);
             DistributeAdvertisedNameChanges(NULL, &oldAdInfo);
         }
@@ -522,7 +522,7 @@ void BTController::ProcessDeviceChange(const BDAddress& adBdAddr,
                     return;
                 }
 
-                foundNodeDB.Lock();
+                foundNodeDB.Lock(MUTEX_CONTEXT);
 
                 if (knownAdNode) {
                     foundNodeDB.GetNodesFromConnectNode(adNode->GetConnectNode(), oldAdInfo);
@@ -570,6 +570,13 @@ void BTController::ProcessDeviceChange(const BDAddress& adBdAddr,
                 foundNodeDB.UpdateDB(NULL, &removed);
 
 
+                foundNodeDB.UpdateDB(&added, &removed, false);  // Remove names only.
+
+                BTNodeDB removedNodes;  // Don't re-use removed since it is still used later.
+                oldAdInfo.NodeDiff(newAdInfo, NULL, &removedNodes);  // Remove nodes that are actually gone.
+                foundNodeDB.UpdateDB(NULL, &removedNodes);
+
+
                 connNode->SetUUIDRev(newUUIDRev);
                 if (!foundNodeDB.FindNode(connNode->GetBusAddress())->IsValid()) {
                     // connNode somehow got removed from foundNodeDB.  Need to add it back in.
@@ -578,7 +585,7 @@ void BTController::ProcessDeviceChange(const BDAddress& adBdAddr,
                 foundNodeDB.RefreshExpiration(connNode, LOST_DEVICE_TIMEOUT);
                 foundNodeDB.DumpTable("foundNodeDB - Updated set of found devices due to remote device advertisement change");
 
-                foundNodeDB.Unlock();
+                foundNodeDB.Unlock(MUTEX_CONTEXT);
 
                 distributeChanges = true;
                 ResetExpireNameAlarm();
@@ -700,11 +707,11 @@ BTNodeInfo BTController::PrepConnect(const BTBusAddress& addr)
 
     QCC_DEBUG_ONLY(connectStartTimes[node->GetBusAddress().addr] = connectTimer.StartTime());
 
-    QCC_DbgPrintf(("Connect address %s for %s (add = %s) is %s as %s  (nodeDB size = %d  maxConnections = %d)",
+    QCC_DbgPrintf(("Connect address %s for %s (addr = %s) is %s as %s  (nodeDB size = %d  maxConnections = %d)",
                    node->GetConnectNode()->ToString().c_str(),
                    node->ToString().c_str(),
                    addr.ToString().c_str(),
-                   !node->IsValid() ? "<unkown>" :
+                   !node->IsValid() ? "<unknown>" :
                    (foundNodeDB.FindNode(addr) == node) ? "in foundNodeDB" :
                    ((nodeDB.FindNode(addr) == node) ? "in nodeDB" :
                     ((node == masterNode) ? "masterNode" : "<impossible>")),
@@ -757,7 +764,7 @@ void BTController::PostConnect(QStatus status, BTNodeInfo& node, const String& r
             JoinSessionNodeComplete();
         }
 
-        foundNodeDB.Lock();
+        foundNodeDB.Lock(MUTEX_CONTEXT);
         if (foundNodeDB.FindNode(node->GetBusAddress())->IsValid()) {
             // Failed to connect to the device.  Send out a lost advertised
             // name for all names in all nodes connectable via this node so
@@ -767,41 +774,45 @@ void BTController::PostConnect(QStatus status, BTNodeInfo& node, const String& r
             BTNodeDB reapDB;
             foundNodeDB.GetNodesFromConnectNode(node, reapDB);
             foundNodeDB.UpdateDB(NULL, &reapDB);
-            foundNodeDB.Unlock();
+            foundNodeDB.Unlock(MUTEX_CONTEXT);
 
             DistributeAdvertisedNameChanges(NULL, &reapDB);
         } else {
-            foundNodeDB.Unlock();
+            foundNodeDB.Unlock(MUTEX_CONTEXT);
         }
     }
 }
 
 
-void BTController::LostLastConnection(const BDAddress& addr)
+void BTController::LostLastConnection(const BTNodeInfo& node)
 {
-    QCC_DbgTrace(("BTController::LostLastConnection(addr = %s)",
-                  addr.ToString().c_str()));
+    QCC_DbgTrace(("BTController::LostLastConnection(node = %s)",
+                  node->ToString().c_str()));
 
-    BTNodeInfo node;
+    BTNodeInfo lostNode;
 
-    if (addr == masterNode->GetBusAddress().addr) {
-        node = masterNode;
-    } else {
-        BTNodeDB::const_iterator it;
-        BTNodeDB::const_iterator end;
-        nodeDB.Lock();
-        nodeDB.FindNodes(addr, it, end);
-        for (; it != end; ++it) {
-            if ((*it)->GetConnectionCount() == 1) {
-                node = *it;
-                break;
+    if (node->GetBusAddress().psm == bt::INCOMING_PSM) {
+        if (node->GetBusAddress().addr == masterNode->GetBusAddress().addr) {
+            lostNode = masterNode;
+        } else {
+            BTNodeDB::const_iterator it;
+            BTNodeDB::const_iterator end;
+            nodeDB.Lock(MUTEX_CONTEXT);
+            nodeDB.FindNodes(node->GetBusAddress().addr, it, end);
+            for (; it != end; ++it) {
+                if ((*it)->GetConnectionCount() == 1) {
+                    lostNode = *it;
+                    break;
+                }
             }
+            nodeDB.Unlock(MUTEX_CONTEXT);
         }
-        nodeDB.Unlock();
+    } else {
+        lostNode = node;
     }
 
-    if ((node->IsValid()) && (node->IsEIRCapable())) {
-        SessionId sessionID = node->GetSessionID();
+    if (lostNode->IsValid()) {
+        SessionId sessionID = lostNode->GetSessionID();
         nodeDB.NodeSessionLost(sessionID);
         bus.LeaveSession(sessionID);
     }
@@ -820,43 +831,45 @@ bool BTController::CheckIncomingAddress(const BDAddress& addr) const
     QCC_DbgTrace(("BTController::CheckIncomingAddress(addr = %s)", addr.ToString().c_str()));
     if (IsMaster()) {
         const BTNodeInfo& node = nodeDB.FindNode(addr);
-        if (incompleteConnections > 0) {
-            if (node->IsValid() && node->IsDirectMinion()) {
-                QCC_DbgPrintf(("Allowing incoming connection from a direct minion while creating a new outgoing connection as master."));
-                return true;
-            } else if (joinSessionNode->GetBusAddress().addr == addr) {
-                QCC_DbgPrintf(("Allowing incoming connection from a new remote device while we are creating a new outgoing connection to that same device (cross-connect) as master."));
-                return true;
-            } else {
-                QCC_DbgPrintf(("Rejecting incoming connection from a new remote device while we are creating a new outgoing connection to a different device as master."));
-                return false;
-            }
-        } else if (node->IsValid() && !node->IsDirectMinion()) {
-            QCC_DbgPrintf(("Rejecting incoming connections from indirect minions as master."));
+        if (node->IsValid()) {
+            bool allow  = node->IsDirectMinion();
+            QCC_DbgPrintf(("%s incoming connection from %s minion as master.",
+                           allow ? "Accept" : "Reject",
+                           allow ? "a direct" : "an indirect"));
+            return allow;
+        } else if (incompleteConnections > 0) {
+            bool allow = joinSessionNode->GetBusAddress().addr == addr;
+            QCC_DbgPrintf(("%s incoming connection from a new remote device while we are creating a new outgoing connection to %s device as master.",
+                           allow ? "Accept" : "Reject",
+                           allow ? "the same" : "a different"));
+            return allow;
+        } else if ((nodeDB.Size() - 1) >= maxConnections) {
+            QCC_DbgPrintf(("Reject incomming connection from new device since we've reached our max connections."));
             return false;
         } else if ((nodeDB.Size() - 1) >= maxConnections) {
             QCC_DbgPrintf(("Rejecting incomming connection from new device since we've reached our max connections."));
             return false;
         } else {
-            QCC_DbgPrintf(("Accepting incoming connection as Master."));
+            QCC_DbgPrintf(("Accept incoming connection as master."));
             return true;
         }
 
     } else if (addr == masterNode->GetBusAddress().addr) {
-        QCC_DbgPrintf(("Always accept incoming connection from Master."));
+        QCC_DbgPrintf(("Always accept incoming connection from our master."));
         return true;
 
     } else if (IsDrone()) {
         const BTNodeInfo& node = nodeDB.FindNode(addr);
+        bool allow = node->IsValid() && node->IsDirectMinion();
         QCC_DbgPrintf(("% incoming connection from %s %s.",
-                       (node->IsValid() && node->IsDirectMinion()) ? "Accepting" : "Not Accepting",
+                       allow ? "Accept" : "Reject",
                        node->IsValid() ?
                        (node->IsDirectMinion() ? "direct" : "indirect") : "unknown node:",
                        node->IsValid() ? "minion" : addr.ToString().c_str()));
-        return node->IsValid() && node->IsDirectMinion();
+        return allow;
     }
 
-    QCC_DbgPrintf(("Rejecting incoming connection from %s because we are a minion (our master is %s).",
+    QCC_DbgPrintf(("Reject incoming connection from %s because we are a minion (our master is %s).",
                    addr.ToString().c_str(),
                    masterNode->GetBusAddress().addr.ToString().c_str()));
     return false;
@@ -1027,7 +1040,7 @@ QStatus BTController::DoNameOp(const qcc::String& name,
             DispatchOperation(new UpdateDelegationsDispatchInfo());
 
         } else {
-            QCC_DbgPrintf(("Sending %s to our master: %s", signal.name.c_str(), master->GetServiceName().c_str()));
+            QCC_DbgPrintf(("Sending %s to our master: %s (%s)", signal.name.c_str(), master->GetServiceName().c_str(), masterNode->ToString().c_str()));
             MsgArg args[SIG_NAME_OP_SIZE];
             size_t argsSize = ArraySize(args);
             MsgArg::Set(args, argsSize, SIG_NAME_OP,
@@ -1110,7 +1123,7 @@ void BTController::HandleNameSignal(const InterfaceDescription::Member* member,
                 } else {
                     BTNodeDB newAdInfo;
                     BTNodeDB oldAdInfo;
-                    BTNodeInfo nodeChange(node->GetBusAddress(), node->GetUniqueName(), node->GetGUID());
+                    BTNodeInfo nodeChange = node->Clone();
                     nodeChange->AddAdvertiseName(name);
                     if (addName) {
                         newAdInfo.AddNode(nodeChange);
@@ -1210,18 +1223,24 @@ void BTController::HandleSetState(const InterfaceDescription::Member* member, Me
     vector<MsgArg> nodeStateArgsStorage;
     vector<MsgArg> foundNodeArgsStorage;
 
-
+    foundNodeDB.Lock(MUTEX_CONTEXT);
     // Get the known node if we know it in order to keep things consistent.
     BTNodeInfo connectingNode = foundNodeDB.FindNode(addr);
 
     if (connectingNode->IsValid()) {
         connectingNode->SetUniqueName(sender);
+        if (connectingNode != connectingNode->GetConnectNode()) {
+            foundNodeDB.RemoveNode(connectingNode);
+            connectingNode->SetConnectNode(connectingNode);
+            foundNodeDB.AddNode(connectingNode);
+        }
     } else {
         connectingNode = BTNodeInfo(addr, sender);
     }
     connectingNode->SetUUIDRev(otherUUIDRev);
     connectingNode->SetSessionID(msg->GetSessionId());
     connectingNode->SetEIRCapable(remoteEIRCapable);
+    foundNodeDB.Unlock(MUTEX_CONTEXT);
 
     if (addr == self->GetBusAddress()) {
         // We should never get a connection from a device with the same address as our own.
@@ -1293,7 +1312,7 @@ void BTController::HandleSetState(const InterfaceDescription::Member* member, Me
 
         FillNodeStateMsgArgs(nodeStateArgsStorage);
 
-        status = ImportState(masterNode, nodeStateArgs, numNodeStateArgs, foundNodeArgs, numFoundNodeArgs);
+        status = ImportState(connectingNode, nodeStateArgs, numNodeStateArgs, foundNodeArgs, numFoundNodeArgs);
         if (status != ER_OK) {
             lock.Unlock(MUTEX_CONTEXT);
             MethodReply(msg, "org.alljoyn.Bus.BTController.InternalError", QCC_StatusText(status));
@@ -1370,13 +1389,6 @@ void BTController::HandleSetState(const InterfaceDescription::Member* member, Me
         advertise.dirty = true;
     }
 
-    if (IsMaster()) {
-        ResetExpireNameAlarm();
-    } else {
-        RemoveExpireNameAlarm();
-        //dispatcher.RemoveAlarm(stopAd);
-    }
-
     status = MsgArg::Set(args, numArgs, SIG_SET_STATE_OUT,
                          bt.IsEIRCapable(),
                          masterUUIDRev,
@@ -1384,11 +1396,11 @@ void BTController::HandleSetState(const InterfaceDescription::Member* member, Me
                          self->GetBusAddress().psm,
                          nodeStateArgsStorage.size(), &nodeStateArgsStorage.front(),
                          foundNodeArgsStorage.size(), &foundNodeArgsStorage.front());
-    lock.Unlock(MUTEX_CONTEXT);
 
     if (status != ER_OK) {
         QCC_LogError(status, ("MsgArg::Set(%s)", SIG_SET_STATE_OUT));
         bt.Disconnect(sender);
+        lock.Unlock(MUTEX_CONTEXT);
         return;
     }
 
@@ -1396,14 +1408,20 @@ void BTController::HandleSetState(const InterfaceDescription::Member* member, Me
     if (status != ER_OK) {
         QCC_LogError(status, ("MethodReply"));
         bt.Disconnect(sender);
+        lock.Unlock(MUTEX_CONTEXT);
         return;
     }
 
     connectingNode->SetSessionState(_BTNodeInfo::SESSION_UP);  // Just in case it wasn't set before
 
-    if (updateDelegations) {
+
+    if (connectingNode == joinSessionNode) {
+        JoinSessionNodeComplete();  // Also triggers UpdateDelegations if we stay the master.
+    } else if (updateDelegations) {
         DispatchOperation(new UpdateDelegationsDispatchInfo());
     }
+
+    lock.Unlock(MUTEX_CONTEXT);
 }
 
 
@@ -1450,7 +1468,8 @@ void BTController::HandleFoundNamesChange(const InterfaceDescription::Member* me
     QCC_DbgTrace(("BTController::HandleFoundNamesChange(member = %s, sourcePath = \"%s\", msg = <>)",
                   member->name.c_str(), sourcePath));
 
-    if (IsMaster() || (strcmp(sourcePath, bluetoothObjPath) != 0) ||
+    if (IsMaster() ||
+        (strcmp(sourcePath, bluetoothObjPath) != 0) ||
         (master->GetServiceName() != msg->GetSender())) {
         // We only accept FoundNames signals from our direct master!
         QCC_LogError(ER_FAIL, ("Received %s from %s who is NOT our master",
@@ -1546,7 +1565,7 @@ void BTController::HandleConnectAddrChanged(const InterfaceDescription::Member* 
         BTBusAddress oldAddr(oldRawAddr, oldPSM);
         BTBusAddress newAddr(newRawAddr, newPSM);
         if (!IsMinion()) {
-            nodeDB.Lock();
+            nodeDB.Lock(MUTEX_CONTEXT);
             BTNodeInfo changedNode = nodeDB.FindNode(oldAddr);
             if (changedNode->IsValid()) {
                 nodeDB.RemoveNode(changedNode);
@@ -1554,7 +1573,7 @@ void BTController::HandleConnectAddrChanged(const InterfaceDescription::Member* 
                 changedNode->SetBusAddress(newAddr);
                 nodeDB.AddNode(changedNode);
             }
-            nodeDB.Unlock();
+            nodeDB.Unlock(MUTEX_CONTEXT);
         }
         if (!IsMaster()) {
             lock.Lock(MUTEX_CONTEXT);
@@ -1814,11 +1833,6 @@ void BTController::DeferredProcessSetStateReply(Message& reply,
                        (masterUUIDRev < upperBound)) {
                     masterUUIDRev = qcc::Rand32();
                 }
-
-                ResetExpireNameAlarm();
-            } else {
-                RemoveExpireNameAlarm();
-                //dispatcher.RemoveAlarm(stopAd);
             }
         }
     } else {
@@ -2004,6 +2018,9 @@ void BTController::DeferredNameLostHander(const String& name)
             find.active = false;
         }
 
+
+
+
         // the entire foundNodeDB will cause their advertised names to expire
         // as well.  No need to distribute lost names at this time.
         if (!find.Empty()) {
@@ -2043,16 +2060,23 @@ void BTController::DeferredNameLostHander(const String& name)
 
             QCC_DbgPrintf(("One of our minions left us: %s", minion->ToString().c_str()));
 
-            nodeDB.RemoveNode(minion);
-            assert(!devAvailable || (nodeDB.Size() > 0));
-
-            minion->SetSessionState(_BTNodeInfo::NO_SESSION);
-            minion->SetRelationship(_BTNodeInfo::UNAFFILIATED);
-
             bool wasAdvertiseMinion = minion == advertise.minion;
             bool wasFindMinion = minion == find.minion;
             bool wasDirect = minion->IsDirectMinion();
             bool wasRotateMinions = RotateMinions();
+
+            nodeDB.RemoveNode(minion);
+            assert(!devAvailable || (nodeDB.Size() > 0));
+
+            if (!wasDirect && nodeDB.FindNode(minion->GetConnectNode()->GetBusAddress())->IsValid()) {
+                // An indirect minion is leaving but its connect node is still
+                // connected (maybe).  Set its connect node to itself.  If
+                // we're wrong, we'll figure it out eventually.
+                minion->SetConnectNode(minion);
+            }
+
+            minion->SetSessionState(_BTNodeInfo::NO_SESSION);
+            minion->SetRelationship(_BTNodeInfo::UNAFFILIATED);
 
             find.dirty = true;  // Update ignore addrs
 
@@ -2139,7 +2163,7 @@ void BTController::DistributeAdvertisedNameChanges(const BTNodeDB* newAdInfo,
     if (!IsMinion() && devAvailable) {
         set<BTNodeInfo> destNodesOld;
         set<BTNodeInfo> destNodesNew;
-        nodeDB.Lock();
+        nodeDB.Lock(MUTEX_CONTEXT);
         for (BTNodeDB::const_iterator it = nodeDB.Begin(); it != nodeDB.End(); ++it) {
             const BTNodeInfo& node = *it;
             if (node->IsDirectMinion()) {
@@ -2153,7 +2177,7 @@ void BTController::DistributeAdvertisedNameChanges(const BTNodeDB* newAdInfo,
                 }
             }
         }
-        nodeDB.Unlock();
+        nodeDB.Unlock(MUTEX_CONTEXT);
 
         for (set<BTNodeInfo>::const_iterator it = destNodesOld.begin(); it != destNodesOld.end(); ++it) {
             SendFoundNamesChange(*it, *oldAdInfo, true);
@@ -2195,8 +2219,8 @@ void BTController::SendFoundNamesChange(const BTNodeInfo& destNode,
                                         const BTNodeDB& adInfo,
                                         bool lost)
 {
-    QCC_DbgTrace(("BTController::SendFoundNamesChange(destNode = \"%s\", adInfo = <>, <%s>)",
-                  destNode->ToString().c_str(),
+    QCC_DbgTrace(("BTController::SendFoundNamesChange(destNode = %s (\"%s\"), adInfo = <>, <%s>)",
+                  destNode->ToString().c_str(), destNode->GetUniqueName().c_str(),
                   lost ? "lost" : "found/changed"));
 
     vector<MsgArg> nodeList;
@@ -2229,8 +2253,10 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
                                   MsgArg* foundNodeArgs,
                                   size_t numFoundNodes)
 {
-    QCC_DbgTrace(("BTController::ImportState(addr = %s, nodeStateArgs = <>, numNodeStates = %u, foundNodeArgs = <>, numFoundNodes = %u)",
-                  connectingNode->ToString().c_str(), numNodeStates, numFoundNodes));
+    QCC_DbgTrace(("BTController::ImportState(addr = %s, nodeStateArgs = <>, numNodeStates = %u, foundNodeArgs = <>, numFoundNodes = %u)  [role = %s]",
+                  connectingNode->ToString().c_str(), numNodeStates, numFoundNodes,
+                  IsMaster() ? "master" : "drone/minion"));
+    assert(connectingNode->IsValid());
 
     /*
      * Here we need to bring in the state information from one or more nodes
@@ -2256,6 +2282,10 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
     BTNodeDB removedDB;
     BTNodeDB staleDB;
     BTNodeDB newFoundDB;
+    BTNodeDB::const_iterator nodeit;
+
+    lock.Lock(MUTEX_CONTEXT);  // Must be acquired before the foundNodeDB lock.
+    foundNodeDB.Lock(MUTEX_CONTEXT);
 
     for (i = 0; i < numNodeStates; ++i) {
         char* bn;
@@ -2266,7 +2296,6 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
         MsgArg* anList;
         MsgArg* fnList;
         size_t j;
-        BTNodeInfo node;
         bool eirCapable;
 
         status = nodeStateArgs[i].Get(SIG_NODE_STATE_ENTRY,
@@ -2277,36 +2306,29 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
                                       &fnSize, &fnList,
                                       &eirCapable);
         if (status != ER_OK) {
+            foundNodeDB.Unlock(MUTEX_CONTEXT);
+            lock.Unlock(MUTEX_CONTEXT);  // Must be acquired before the foundNodeDB lock.
+
             return status;
         }
 
         String busName(bn);
         BTBusAddress nodeAddr(BDAddress(rawBdAddr), psm);
         GUID128 guid(guidStr);
-
-        QCC_DbgPrintf(("Processing names for new minion %s (GUID: %s  uniqueName: %s):",
-                       nodeAddr.ToString().c_str(),
-                       guid.ToString().c_str(),
-                       busName.c_str()));
-
-        if (nodeAddr == connectingNode->GetBusAddress()) {
-            node = connectingNode;  // need to modify the existing instance since other nodes already refer to it.
-            node->SetGUID(guid);
-            node->SetUniqueName(busName);
-        } else {
-            node = BTNodeInfo(nodeAddr, busName, guid);
-            assert(connectingNode->IsValid());
-            node->SetConnectNode(connectingNode);
-            if (IsMaster()) {
-                node->SetRelationship(_BTNodeInfo::INDIRECT_MINION);
-            }
-        }
-        node->SetEIRCapable(eirCapable);
+        BTNodeInfo incomingNode(nodeAddr, busName, guid);
+        incomingNode->SetConnectNode(connectingNode);
+        incomingNode->SetEIRCapable(eirCapable);
         if (IsMaster()) {
+            incomingNode->SetRelationship((connectingNode->GetBusAddress() == nodeAddr) ? _BTNodeInfo::DIRECT_MINION : _BTNodeInfo::INDIRECT_MINION);
             if (eirCapable) {
                 ++eirMinions;
             }
         }
+
+        QCC_DbgPrintf(("Processing names for new minion %s (GUID: %s  uniqueName: %s):",
+                       incomingNode->ToString().c_str(),
+                       guid.ToString().c_str(),
+                       busName.c_str()));
 
         /*
          * NOTE: expiration time is explicitly NOT set for nodes that we are
@@ -2328,9 +2350,9 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
             QCC_DbgPrintf(("    Ad Name: %s", n));
             qcc::String name(n);
             if (IsMaster()) {
-                advertise.AddName(name, node);
+                advertise.AddName(name, incomingNode);
             } else {
-                node->AddAdvertiseName(name);
+                incomingNode->AddAdvertiseName(name);
             }
         }
 
@@ -2343,81 +2365,167 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
             QCC_DbgPrintf(("    Find Name: %s", n));
             qcc::String name(n);
             if (IsMaster()) {
-                find.AddName(name, node);
+                find.AddName(name, incomingNode);
             }
         }
 
-        incomingDB.AddNode(node);
-        if (IsMaster()) {
-            nodeDB.AddNode(node);
+        incomingDB.AddNode(incomingNode);
+
+        BTNodeInfo foundNode = foundNodeDB.FindNode(nodeAddr);
+        if (foundNode->IsValid()) {
+            foundNode->SetConnectNode(connectingNode);  // Just in case connectingNode is unknown to us.
+
+            // The incoming node is known to us so we need to find any
+            // differences in advertise/find name sets from what we think we
+            // know.
+            BTNodeInfo added, removed;
+
+            foundNode->Diff(incomingNode, &added, &removed);
+            if (added->IsValid()) {
+                // So that we can tell minions and client apps of the new names.
+                addedDB.AddNode(added);
+            }
+            if (removed->IsValid()) {
+                // So that we can tell minions and client apps of the lost names.
+                removedDB.AddNode(removed);
+            }
+
+            // Update the advertise/find name sets with what we learned from
+            // the incoming node.
+            foundNode->Update(&added, &removed);
+            if (IsMaster()) {
+                // Move the node from foundNodeDB to nodeDB since it is now a minion.
+                foundNodeDB.RemoveNode(foundNode);
+                nodeDB.AddNode(foundNode);
+            }
+        } else {
+            // The incoming node is completely new to us.
+            addedDB.AddNode(incomingNode);
+            if (IsMaster()) {
+                nodeDB.AddNode(incomingNode);
+            }
         }
     }
-
-    // At this point nodeDB now has all the nodes that have connected to us
-    // (if we are the master).
-
-    lock.Lock(MUTEX_CONTEXT);  // Must be acquired before the foundNodeDB lock.
-    foundNodeDB.Lock();
-    // Figure out set of devices/names that are part of the incoming
-    // device/piconet to be removed from the set of found nodes.
-    foundNodeDB.Diff(incomingDB, &addedDB, &removedDB);
-
-    // addedDB contains the devices being added to our network that was unknown in foundNodeDB.
-    // removedDB contains the devices not being added our network that are known to us via foundNodeDB.
-
-    // What we need to find out is which names in foundNodeDB were reachable
-    // from the connected address of the node that just connected to us but
-    // are not part of the incoming names.  Normally, this should be an empty
-    // set but it is not guaranteed to be so.
-
-    BTNodeDB::const_iterator nodeit;
-    for (nodeit = removedDB.Begin(); nodeit != removedDB.End(); ++nodeit) {
-        // If the connect address for the node from removedDB is in
-        // incomingDB, then that node is a stale advertisement.  (This should
-        // be rare.)
-        if (incomingDB.FindNode((*nodeit)->GetConnectNode()->GetBusAddress())->IsValid()) {
-            staleDB.AddNode(*nodeit);
-        }
-    }
-
-    // Now we have staleDB which contains those nodes in foundNodeDB that need
-    // to be removed (or at least some of the names for nodes in staleDB need
-    // to be removed from their respective nodes in foundNodeDB).
 
     status = ExtractNodeInfo(foundNodeArgs, numFoundNodes, newFoundDB);
+    if (status != ER_OK) {
+        foundNodeDB.Unlock(MUTEX_CONTEXT);
+        lock.Unlock(MUTEX_CONTEXT);
+        return status;
+    }
 
-    // Now we have newFoundDB which contains advertisement information that
-    // the newly connected node knows about.  It may contain information about
-    // nodes that we don't know about so we need to incorporate that
-    // information into foundNodeDB as well as addedDB for distribution to our
-    // minions.  First we'll trim down newFoundDB with what we already know.
+    // At this point, the state of the various BTNodeDBs in use are as follows:
+    // - nodeDB:      If we are the master, nodeDB now contains all the nodes
+    //                that were added to the bus and is our minion.  If we are
+    //                not the master then it has remained unchanged.
+    // - foundNodeDB: If we are the master, then all the nodes that were added
+    //                to the bus have been removed from foundNodeDB.  It could
+    //                still contain stale information about nodes that were
+    //                once connected to the incoming bus but are no longer part
+    //                of that bus.  If we are not the master then the advertise
+    //                names are now updated.  It could still have stale
+    //                information about other nodes.
+    // - incomingDB:  This contains all the information about all the nodes
+    //                that just joined the bus regardless of our role.
+    // - addedDB:     This contains any names we didn't know about for nodes we
+    //                already know about.
+    // - removedDB:   This contains names that are no longer valid for nodes we
+    //                know about.
+    // - newFoundDB:  This contains all the nodes the connecting node has found.
+    //                If we are not the master then it also contains all the
+    //                nodes connected added to the bus via the connecting node.
 
-    newFoundDB.UpdateDB(NULL, &nodeDB);
-    newFoundDB.UpdateDB(NULL, &foundNodeDB);
-
-    addedDB.UpdateDB(&newFoundDB, NULL);
+    // Trim all the devices in our nodeDB from newFoundDB since we are the
+    // authoritative source for the nodes found in nodeDB.
+    for (nodeit = nodeDB.Begin(); nodeit != nodeDB.End(); ++nodeit) {
+        newFoundDB.RemoveNode(*nodeit);
+    }
 
     if (IsMaster()) {
-        foundNodeDB.UpdateDB(&newFoundDB, &staleDB);
-        foundNodeDB.UpdateDB(NULL, &incomingDB);
+        // Since we are master, any nodes remaining in foundNodeDB that are
+        // connectable via connectingNode must be from a stale advertisement.
+        // Lets remove them.
+        foundNodeDB.GetNodesFromConnectNode(connectingNode, staleDB);
+
     } else {
-        foundNodeDB.UpdateDB(&addedDB, &staleDB);
+        // Extract the nodes connectable via connectingNode from newFoundDB
+        // for use as authoritative information for updating foundNodeDB.
+        BTNodeDB peerDB;
+        if (incomingDB.Size() > 0) {
+            incomingDB.GetNodesFromConnectNode(connectingNode, peerDB);
+        } else {
+            newFoundDB.GetNodesFromConnectNode(connectingNode, peerDB);
+        }
+
+        for (nodeit = peerDB.Begin(); nodeit != peerDB.End(); ++nodeit) {
+            BTNodeInfo foundNode = foundNodeDB.FindNode((*nodeit)->GetBusAddress());
+            if (foundNode->IsValid()) {
+                BTNodeInfo added, removed;
+                foundNode->Diff(*nodeit, &added, &removed);
+
+                if (incomingDB.Size() == 0) {
+                    if (added->IsValid()) {
+                        // So that we can tell minions and client apps of the new names.
+                        addedDB.AddNode(added);
+                    }
+                    if (removed->IsValid()) {
+                        // So that we can tell minions and client apps of the lost names.
+                        removedDB.AddNode(removed);
+                    }
+                }
+
+                foundNode->Update(&added, &removed);
+            } else {
+                addedDB.AddNode(*nodeit);
+                foundNodeDB.AddNode(*nodeit);
+            }
+        }
+
+        // Any nodes connectable via connectingNode that are in foundNodeDB
+        // but not in peerDB must be from a stale advertisement.  Lets
+        // remove them.
+        BTNodeDB tmpDB;
+        foundNodeDB.GetNodesFromConnectNode(connectingNode, tmpDB);
+        tmpDB.NodeDiff(peerDB, NULL, &staleDB);
+        tmpDB.Clear();
     }
+
+    for (nodeit = staleDB.Begin(); nodeit != staleDB.End(); ++nodeit) {
+        // We don't know what the connect address is for these nodes so we'll
+        // forget about them and if they are still around we'll get the update
+        // advertisements from them eventually anyway.
+        foundNodeDB.RemoveNode(*nodeit);
+        removedDB.AddNode(*nodeit);
+    }
+
+    // Now foundNodeDB is completely in sync with respect to the nodes that
+    // joined the bus.  We can now remove the names/nodes from newFoundDB
+    newFoundDB.UpdateDB(NULL, &foundNodeDB);
+
+    // Now newFoundDB only contains names/nodes the connecting node knows
+    // about that we do not know about.  Those names/nodes need to be added
+    // foundNode as well as addedDB so that we can notify our existing minions
+    // and local client apps.
+    foundNodeDB.UpdateDB(&newFoundDB, NULL);
+    addedDB.UpdateDB(&newFoundDB, NULL);
+
     foundNodeDB.DumpTable("foundNodeDB - Updated set of found devices from imported state information from new connection");
 
     if (IsMaster()) {
         ResetExpireNameAlarm();
+        ++directMinions;
+
+        QCC_DbgPrintf(("NodeDB after updating importing state information from connecting node"));
+        QCC_DEBUG_ONLY(DumpNodeStateTable());
+
     } else {
         RemoveExpireNameAlarm();
     }
-    foundNodeDB.Unlock();
+
+    foundNodeDB.Unlock(MUTEX_CONTEXT);
     lock.Unlock(MUTEX_CONTEXT);
 
-    DistributeAdvertisedNameChanges(&addedDB, &staleDB);
-
-    if (IsMaster()) {
-        ++directMinions;
-    }
+    DistributeAdvertisedNameChanges(&addedDB, &removedDB);
 
     return ER_OK;
 }
@@ -2546,12 +2654,11 @@ QStatus BTController::ExtractNodeInfo(const MsgArg* entries, size_t size, BTNode
 
         BTBusAddress connNodeAddr(BDAddress(connAddrRaw), connPSM);
         if ((self->GetBusAddress() == connNodeAddr) || nodeDB.FindNode(connNodeAddr)->IsValid()) {
-            // Don't add ourself or any node on our piconet/scatternet to foundNodeDB.
+            // Don't add ourself or any minions on our piconet/scatternet to foundNodeDB.
             QCC_DbgPrintf(("    Skipping nodes with connect address: %s", connNodeAddr.ToString().c_str()));
             continue;
         }
 
-        assert(!db.FindNode(connNodeAddr)->IsValid());
         BTNodeInfo connNode = BTNodeInfo(connNodeAddr);
 
         for (j = 0; j < adMapSize; ++j) {
@@ -2608,7 +2715,7 @@ void BTController::FillNodeStateMsgArgs(vector<MsgArg>& args) const
 {
     BTNodeDB::const_iterator it;
 
-    nodeDB.Lock();
+    nodeDB.Lock(MUTEX_CONTEXT);
     args.reserve(nodeDB.Size());
     for (it = nodeDB.Begin(); it != nodeDB.End(); ++it) {
         const BTNodeInfo& node = *it;
@@ -2640,7 +2747,7 @@ void BTController::FillNodeStateMsgArgs(vector<MsgArg>& args) const
 
         args.back().Stabilize();
     }
-    nodeDB.Unlock();
+    nodeDB.Unlock(MUTEX_CONTEXT);
 }
 
 
@@ -2648,11 +2755,11 @@ void BTController::FillFoundNodesMsgArgs(vector<MsgArg>& args, const BTNodeDB& a
 {
     BTNodeDB::const_iterator it;
     map<BTBusAddress, BTNodeDB> xformMap;
-    adInfo.Lock();
+    adInfo.Lock(MUTEX_CONTEXT);
     for (it = adInfo.Begin(); it != adInfo.End(); ++it) {
         xformMap[(&adInfo == &nodeDB) ? self->GetBusAddress() : (*it)->GetConnectNode()->GetBusAddress()].AddNode(*it);
     }
-    adInfo.Unlock();
+    adInfo.Unlock(MUTEX_CONTEXT);
 
     args.reserve(args.size() + xformMap.size());
     map<BTBusAddress, BTNodeDB>::const_iterator xmit;
@@ -2716,7 +2823,7 @@ uint8_t BTController::ComputeSlaveFactor() const
     BTNodeDB::const_iterator nit;
     uint8_t cnt = 0;
 
-    nodeDB.Lock();
+    nodeDB.Lock(MUTEX_CONTEXT);
     for (nit = nodeDB.Begin(); nit != nodeDB.End(); ++nit) {
         const BTNodeInfo& minion = *nit;
         if (minion->IsDirectMinion()) {
@@ -2730,7 +2837,7 @@ uint8_t BTController::ComputeSlaveFactor() const
             }
         }
     }
-    nodeDB.Unlock();
+    nodeDB.Unlock(MUTEX_CONTEXT);
 
     return cnt;
 }
@@ -2754,7 +2861,7 @@ void BTController::SetSelfAddress(const BTBusAddress& newAddr)
 
     dests.reserve(directMinions + (!IsMaster() ? 1 : 0));
 
-    nodeDB.Lock();
+    nodeDB.Lock(MUTEX_CONTEXT);
     nodeDB.RemoveNode(self);
     assert(newAddr.IsValid());
     self->SetBusAddress(newAddr);
@@ -2765,7 +2872,7 @@ void BTController::SetSelfAddress(const BTBusAddress& newAddr)
             dests.push_back(minion);
         }
     }
-    nodeDB.Unlock();
+    nodeDB.Unlock(MUTEX_CONTEXT);
 
     if (!IsMaster()) {
         dests.push_back(master->GetServiceName());
@@ -2821,13 +2928,15 @@ void BTController::AlarmTriggered(const Alarm& alarm, QStatus reason)
         QCC_DbgPrintf(("Handling deferred operation:"));
         switch (op->operation) {
         case DispatchInfo::UPDATE_DELEGATIONS:
-            QCC_DbgPrintf(("    Updating delegations"));
-            lock.Lock(MUTEX_CONTEXT);
-            UpdateDelegations(advertise);
-            UpdateDelegations(find);
-            QCC_DbgPrintf(("NodeDB after updating delegations"));
-            QCC_DEBUG_ONLY(DumpNodeStateTable());
-            lock.Unlock(MUTEX_CONTEXT);
+            if (incompleteConnections == 0) {
+                QCC_DbgPrintf(("    Updating delegations"));
+                lock.Lock(MUTEX_CONTEXT);
+                UpdateDelegations(advertise);
+                UpdateDelegations(find);
+                QCC_DbgPrintf(("NodeDB after updating delegations"));
+                QCC_DEBUG_ONLY(DumpNodeStateTable());
+                lock.Unlock(MUTEX_CONTEXT);
+            }
             break;
 
         case DispatchInfo::EXPIRE_CACHED_NODES: {
@@ -3053,7 +3162,7 @@ void BTController::AdvertiseNameArgInfo::SetArgs()
     NameArgs newArgs(argsSize);
     size_t localArgsSize = argsSize;
 
-    bto.nodeDB.Lock();
+    bto.nodeDB.Lock(MUTEX_CONTEXT);
     adInfoArgs.clear();
     adInfoArgs.reserve(bto.nodeDB.Size());
 
@@ -3074,7 +3183,7 @@ void BTController::AdvertiseNameArgInfo::SetArgs()
                                     names.size(), &names.front()));
     }
 
-    bto.nodeDB.Unlock();
+    bto.nodeDB.Unlock(MUTEX_CONTEXT);
 
     MsgArg::Set(newArgs->args, localArgsSize, SIG_DELEGATE_AD,
                 bto.masterUUIDRev,
@@ -3173,14 +3282,14 @@ void BTController::FindNameArgInfo::SetArgs()
     size_t localArgsSize = argsSize;
 
     bto.lock.Lock(MUTEX_CONTEXT);
-    bto.nodeDB.Lock();
+    bto.nodeDB.Lock(MUTEX_CONTEXT);
     ignoreAddrsCache.clear();
     ignoreAddrsCache.reserve(bto.nodeDB.Size() + bto.blacklist->size());
     BTNodeDB::const_iterator it;
     for (it = bto.nodeDB.Begin(); it != bto.nodeDB.End(); ++it) {
         ignoreAddrsCache.push_back((*it)->GetBusAddress().addr.GetRaw());
     }
-    bto.nodeDB.Unlock();
+    bto.nodeDB.Unlock(MUTEX_CONTEXT);
 
     set<BDAddress>::const_iterator bit;
     for (bit = bto.blacklist->begin(); bit != bto.blacklist->end(); ++bit) {
@@ -3218,13 +3327,13 @@ void BTController::FindNameArgInfo::ClearArgs()
 
 QStatus BTController::FindNameArgInfo::StartLocal()
 {
-    bto.nodeDB.Lock();
+    bto.nodeDB.Lock(MUTEX_CONTEXT);
     BDAddressSet ignoreAddrs(*bto.blacklist); // initialize ignore addresses with the blacklist
     BTNodeDB::const_iterator it;
     for (it = bto.nodeDB.Begin(); it != bto.nodeDB.End(); ++it) {
         ignoreAddrs->insert((*it)->GetBusAddress().addr);
     }
-    bto.nodeDB.Unlock();
+    bto.nodeDB.Unlock(MUTEX_CONTEXT);
 
     QCC_DbgPrintf(("Starting local find..."));
     return bto.bt.StartFind(ignoreAddrs);

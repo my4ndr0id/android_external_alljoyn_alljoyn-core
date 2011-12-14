@@ -662,9 +662,11 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
                     if ((it->second.sessionHost == vSessionEpName) && (it->second.sessionPort == sessionPort)) {
                         if (it->second.opts.IsCompatible(optsIn)) {
                             b2bEp = vSessionEp->GetBusToBusEndpoint(it->second.id);
-                            b2bEpName = b2bEp ? b2bEp->GetUniqueName() : "";
-                            replyCode = ALLJOYN_JOINSESSION_REPLY_SUCCESS;
-                            b2bEp->IncrementRef();
+                            if (b2bEp) {
+                                b2bEp->IncrementRef();
+                                b2bEpName = b2bEp->GetUniqueName();
+                                replyCode = ALLJOYN_JOINSESSION_REPLY_SUCCESS;
+                            }
                         } else {
                             /* Cannot support more than one connection to the same destination with the same sessionId */
                             replyCode = ALLJOYN_JOINSESSION_REPLY_BAD_SESSION_OPTS;
@@ -933,7 +935,12 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
 
                 /* Multipoint session member is local to this daemon. Send MPSessionChanged */
                 if (optsOut.isMultipoint) {
+                    ajObj.ReleaseLocks();
                     ajObj.SendMPSessionChanged(id, sender.c_str(), true, member.c_str());
+                    ajObj.AcquireLocks();
+                    joinerEp = ajObj.router.FindEndpoint(sender);
+                    memberEp = ajObj.router.FindEndpoint(member);
+                    memberB2BEp = static_cast<RemoteEndpoint*>(ajObj.router.FindEndpoint(b2bEpName));
                 }
             }
             /* Add session routing */
@@ -960,22 +967,26 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
         QCC_LogError(status, ("Failed to respond to org.alljoyn.Bus.JoinSession"));
     }
 
-    /* Send a series of MPSessionChanged to "catch up" the newly joiner */
+    /* Send a series of MPSessionChanged to "catch up" the new joiner */
     if ((replyCode == ALLJOYN_JOINSESSION_REPLY_SUCCESS) && optsOut.isMultipoint) {
         ajObj.AcquireLocks();
         pair<String, SessionId> key(sender, id);
         multimap<pair<String, SessionId>, SessionMapEntry>::iterator it = ajObj.sessionMap.find(key);
         if (it != ajObj.sessionMap.end()) {
-            ajObj.SendMPSessionChanged(id, it->second.sessionHost.c_str(), true, sender.c_str());
-            vector<String>::const_iterator mit = it->second.memberNames.begin();
-            while (mit != it->second.memberNames.end()) {
+            String sessionHost = it->second.sessionHost;
+            vector<String> memberVector = it->second.memberNames;
+            ajObj.ReleaseLocks();
+            ajObj.SendMPSessionChanged(id, sessionHost.c_str(), true, sender.c_str());
+            vector<String>::const_iterator mit = memberVector.begin();
+            while (mit != memberVector.end()) {
                 if (sender != *mit) {
                     ajObj.SendMPSessionChanged(id, mit->c_str(), true, sender.c_str());
                 }
                 mit++;
             }
+        } else {
+            ajObj.ReleaseLocks();
         }
-        ajObj.ReleaseLocks();
     }
 
     return 0;
@@ -1305,6 +1316,9 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
                 VirtualEndpoint*vep = static_cast<VirtualEndpoint*>(destEp);
                 b2bEp = vep->GetBusToBusEndpoint(msg->GetSessionId());
                 b2bEpName = b2bEp ? b2bEp->GetUniqueName() : "";
+                if (b2bEp) {
+                    b2bEp->IncrementRef();
+                }
             } else if (busAddr[0] != '\0') {
                 /* Ask the transport for an endpoint */
                 TransportList& transList = ajObj.bus.GetInternal().GetTransportList();
@@ -1316,6 +1330,7 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
                     status = trans->Connect(busAddr, optsIn, &b2bEp);
                     ajObj.AcquireLocks();
                     if (status == ER_OK) {
+                        b2bEp->IncrementRef();
                         b2bEpName = b2bEp->GetUniqueName();
                     } else {
                         QCC_LogError(status, ("trans->Connect(%s) failed", busAddr));
@@ -1392,6 +1407,9 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
                     QCC_LogError(status, ("AttachSession failed"));
                 }
             }
+            if (b2bEp) {
+                b2bEp->DecrementRef();
+            }
         }
     }
 
@@ -1405,6 +1423,10 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
      */
     srcB2BEp = srcB2B ? static_cast<RemoteEndpoint*>(ajObj.router.FindEndpoint(srcB2B)) : NULL;
     if (srcB2BEp) {
+        srcB2BEp->IncrementWaiters();
+    }
+    ajObj.ReleaseLocks();
+    if (srcB2BEp) {
         status = msg->ReplyMsg(msg, replyArgs, ArraySize(replyArgs));
         if (status == ER_OK) {
             status = srcB2BEp->PushMessage(msg);
@@ -1412,6 +1434,11 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
     } else {
         status = ajObj.MethodReply(msg, replyArgs, ArraySize(replyArgs));
     }
+    if (srcB2BEp) {
+        srcB2BEp->DecrementWaiters();
+    }
+    ajObj.AcquireLocks();
+    srcB2BEp  = srcB2B ? static_cast<RemoteEndpoint*>(ajObj.router.FindEndpoint(srcB2B)) : NULL;
 
     /* Log error if reply could not be sent */
     if (ER_OK != status) {
@@ -1598,6 +1625,8 @@ void AllJoynObj::RemoveSessionRefs(const VirtualEndpoint& vep, const RemoteEndpo
                     SendSessionLost(it->second);
                     if (!it->second.isInitializing) {
                         sessionMap.erase(it++);
+                    } else {
+                        ++it;
                     }
                 } else {
                     ++it;

@@ -32,34 +32,13 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 
-#elif defined(QCC_OS_GROUP_POSIX)
-
-#include <errno.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <net/if.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-
-#if defined(QCC_OS_ANDROID) || defined(QCC_OS_LINUX)
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
 #endif
 
-#if defined(QCC_OS_DARWIN)
-#include <ifaddrs.h>
-#define IPV6_DROP_MEMBERSHIP IPV6_LEAVE_GROUP
-#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP
-#endif
-
-#endif // defined(QCC_OS_GROUP_POSIX)
-
-#include <qcc/platform.h>
 #include <qcc/Debug.h>
 #include <qcc/Event.h>
 #include <qcc/Socket.h>
 #include <qcc/SocketTypes.h>
+#include <qcc/IfConfig.h>
 #include <qcc/time.h>
 
 #include "NsProtocol.h"
@@ -71,8 +50,219 @@ using namespace std;
 
 namespace ajn {
 
+// ============================================================================
+// Long sidebar on why this looks so complicated:
 //
-// There are configurable attributes of the name servcie which are determined
+// In order to understand all of the trouble we are going to go through below,
+// it is helpful to thoroughly understand what is done on our platforms in the
+// presence of multicast.  This is long reading, but worthwhile reading if you
+// are trying to understand what is going on.  I don't know of anywhere you
+// can find all of this written in one place.
+//
+// The first thing to grok is that all platforms are implemented differently.
+// Windows and Linux use IGMP to enable and disable multicast, and use other
+// multicast-related socket calls to do the fine-grained control.  Android
+// doesn't bother to compile its kernel with CONFIG_IP_MULTICAST set.  This
+// doesn't mean that there is no multicast code in the Android kernel, it means
+// there is no IGMP code in the kernel.  Since IGMP isn't implemented, Android
+// can't use it to enable and disable multicast at the driver level, so it uses
+// wpa_supplicant driver-private commands instead.  This means that you will
+// probably get three different answers if you ask how some piece of the
+// multicast puzzle works.
+//
+// On the send side, multicast is controlled by the IP_MULTICAST_IF (or for
+// IPv6 IPV6_MULTICAST_IF) socket.  In IPv4 you provide an IP address and in
+// IPv6 you provide an interface index.  These differences are abstracted in
+// the qcc code and there you are asked to provide an interface name, which the
+// abstraction function uses to figure out the appropriate address or index
+// depending on the address family.  Unfortunately, you can't abstract away
+// the operating system differences in how they interpret the calls; so you
+// really need to understand what is happening at a low level in order to get
+// the high level multicast operations to do what you really want.
+//
+// If you do nothing (leave the sockets as you find them), or set the interface
+// address to 0.0.0.0 for IPv4 or the interface index to 0 for IPv6 the
+// multicast output interface is essentially selected by the system routing
+// code.
+//
+// In Linux (and Android), multicast packets are sent out the interface that is
+// used for the default route (the default interface).  You can see this if you
+// type "ip ro sh".  In Windows, however, the system chooses its default
+// interface by looking for the lowest value for the routing metric for a
+// destination IP address of 224.0.0.0 in its routing table.  You can see this
+// in the output of "route print".
+//
+// We want all of our multicast code to work in the presence of IP addresses
+// changing when phones move from one Wifi access point to another, or when our
+// desktop access point changes when someone with a mobile access point walks
+// by; so it is also important to know what will happen when these addresses
+// change (or come up or go down).
+//
+// On Linux, if you set the IP_MULTICAST_IF to 0.0.0.0 (or index 0 in IPv6) and
+// bring down the default interface or change the IP address on the default
+// interface, you will begin to fail the multicast sends with "network
+// unreachable" errors since the default route goes away when you change the IP
+// address (e.g, just do somthing like "sudo ifconfig eth1 10.4.108.237 netmask
+// 255.255.255.0 up to change the address).  Until you provide a new default
+// route (e.g., "route add default gw 10.4.108.1") the multicast packets will be
+// dropped, but as soon as a new default route is set, they will begin flowing
+// again.
+//
+// In Windows, if you set the IP_MULTICAST_IF address to 0.0.0.0 and release the
+// ip address (e.g., "ipconfig /release") the sends may still appear to work at
+// the level of the program but nothing goes out the original interface.  The
+// sends fail silently.  This is because Windows will dynamically change the
+// default multicast route according to its internal multicast routing table.
+// It selects another interface based on a routing metric, and it could, for
+// example, just switch to a VMware virtual interface silently.  The name
+// service would never know it just "broke" and is no longer sending packets out
+// the interface it thinks it is.
+//
+// When we set up multicast advertisements in our system, we most likely do not
+// want to route our advertisements only to the default adapter.  For example,
+// on a desktop system, the default interface is probably one of the wired
+// Ethernets.  We may or many not want to advertise on that interface, but we
+// may also want to advertise on other wired interfaces and other wireless
+// interfaces as well.
+//
+// We do not want the system to start changing multicast destinations out from
+// under us, EVER.  Because of this, the only time using INADDR_ANY would be
+// appropriate in the IP_MULTICAST_IF socket option is in the simplest, static
+// network situations.  For the general case, we really need to keep multiple
+// sockets that are each talking to an INTERFACE of interest (not an IP address
+// of interest, since they can change at any time because of normal access point
+// dis-associations, for example).
+//
+// Since we determined that we needed to use IP_MULTICAST_IF to control which
+// interfaces are used for discovery, we needed to understand exactly what
+// changing an IP address out from under a corresponding interface would do.
+//
+// The first thing we observed is that IP_MULTICAST_IF takes an IP address in
+// the case of IPv4, but we wanted to specify an interface index as in IPv6 or
+// for mere mortal human beings, a name (e.g., "wlan0").  It may be the case
+// that the interface does not have an IP address assigned (is not up or
+// connected to an access point) at the time we want to start our name service,
+// so a call to set the IP_MULTICAST_IF (via the appropriate abstract qcc call)
+// would not be possible until an address is available, perhaps an arbitrary
+// unknowable time later.  If sendto() operations are attempted and the IP
+// address is not valid one will see "network unreachable" errors.  As we will
+// discuss shortly, joining a multicast group also requires an IP address in the
+// case of IPv4 (need to send IGMP Join messages), so it is not possible to
+// express interest in receiving multicast packets until an IP address is
+// available.
+//
+// So we needed to provide an API that allows a user to specify a network
+// interface over which she is interested in advertising.  This explains the
+// method OpenInterface(qcc::String interface) defined below.  The client is
+// expected to figure out which interfaces it wants to do discovery over (e.g.,
+// "wlan0", "eth0") and explicitly tell the name service which interfaces it is
+// interested in.  We clearly need a lazy evaluation mechanism in the name
+// service to look at the interfaces which the client expresses interest in, and
+// when IP addresses are available, or change, we begin using those interfaces.
+// If the interfaces go down, or change out from under the name service, we need
+// to deal with that fact and make things right.
+//
+// We can either hook system "IP address changed" or "interface state changed"
+// events to drive the re-evaluation process as described above, or we can poll
+// for those changes.  Since the event systems in our various target platforms
+// are wildly different, creating an abstract event system is non-trivial (for
+// example, a DBus-based network manager exists on Linux, but even though
+// Android is basically Linux and has DBus, it doesn't use it.  You'd need to
+// use Netlink sockets on most Posix systems, but Darwin doesn't have Netlink.
+// Windows is from another planet.
+//
+// Because of all of these complications, we just choose the better part of
+// valor and poll for changes using a maintenance thread that fires off every
+// second and looks for changes in the networking environment and adjusts
+// accordingly.
+//
+// We could check for IP address changes on the interfaces and re-evaluate and
+// open new sockets bound to the correct interfaces whenever an address change
+// happens.  It is possible, however, that we could miss the fact that we have
+// switched access points if DHCP gives us the same IP address.  Windows, for
+// example, could happily begin rerouting packets to other interfaces if one
+// goes down.  If the interface comes back up on a different access point, which
+// gives out the same IP address, Windows could bring us back up but leave the
+// multicast route pointing somewhere else and we would never notice.  Because
+// of these byzantine kinds of errors, we chose the better part of valor and
+// decided to close all of our multicast sockets down and restart them in a
+// known state periodically.
+//
+// The receive side has similar kinds of issues.
+//
+// In order to receive multicast datagrams sent to a particular port, it is
+// necessary to bind that local port leaving the local address unspecified
+// (i.e., INADDR_ANY or in6addr_any).  What you might think of as binding is
+// then actually handled by the Internet Group Management Protocol (IGMP) or its
+// ICMPv6 equivalent.  Recall that Android does not implement IGMP, so we have
+// yet another complication.
+//
+// Using IGMP, we join the socket to the multicast group instead of binding the
+// socket to a specific interface (address) and port.  Binding the socket to
+// INADDR_ANY or in6addr_any may look strange, but it is actually the right
+// thing to do.  Since joining a multicast group requires sending packets over
+// the IGMP protocol, we need a valid IP address in order to do the join.  As
+// mentioned above, an interface must be IFF_UP with an assigned IP address in
+// order to join a multicast group.
+//
+// The socket option for joining a multicast group, of course, works differently
+// for IPv4 and IPv6.  IP_ADD_MEMBERSHIP (for IPv4) has a provided IP address
+// that can be either INADDR_ANY or a specific address.  If INADDR_ANY is
+// provided, the interface of the default route is added to the group, and the
+// IGMP join is sent out that interface.  IPV6_ADD_MEMBERSHIP (for IPv6) has a
+// provided interface index that can be either 0 or a specific interface.  If 0
+// is provided, the interface of the default route is added to the group, and
+// the IGMP Join (actually an ICMPv6 equivalent) is sent out that interface.  If
+// a specific interface index is that interface is added to the group and the
+// IGMP join is sent out that interface.  Note that since an ICMP packet is sent,
+// the interface must be IFF_UP with an assigned IP address even though the
+// interface is specified by an index.
+//
+// A side effect of the IGMP join deep down in the kernel is to enable reception
+// of multicast MAC addresses in the device driver.  Since there is no IGMP in
+// Android, we must rely on a multicast (Java) lock being taken by some external
+// code on phones that do not leave multicast always enabled (HTC Desire, for
+// example).  When the Java multicast lock is taken, a private driver command is
+// sent to the wpa_supplicant which, in turn, calls into the appropriate network
+// device driver(s) to enable reception of multicast MAC packets.  This is
+// completely out of our control here.
+//
+// Similar to the situation on the send side, we most likely do not want to rely
+// on the system routing tables to configure which network interfaces our name
+// service receives over; so we really need to provide a specific address.
+//
+// If a specific IP address is provided, then that address must be an address
+// assigned to a currently-UP interface.  This is the same catch-22 as we have
+// on the send side.  We need to lazily evaluate the interface in order to find
+// if an IP address has appeared on that interface and then join the multicast
+// group to enable multicast on the underlying network device.
+//
+// It turns out that in Linux, the IP address passed to the join multicast group
+// socket option call is actually not significant after the initial call.  It is
+// used to look up an interface and its associated net device and to then set
+// the PACKET_MULTICAST filter on the net device to receive packets destined for
+// the specified multicast address.  If the IP address associated with the
+// interface changes, multicast messages will continue to be received.
+//
+// Of course, Windows does it differently.  They look at the IP address passed
+// to the socket option as being significant, and so if the underlying IP
+// address changes on a Windows system, multicast packets will no longer be
+// delivered.  Because of this, the receive side of the multicast name service
+// has also got to look for changes to IP address configuration and re-set
+// itself whenever it finds a change.
+//
+// So the code you find below may look overly complicated, but (hopefully most
+// of it, anyway) needs to be that way.
+//
+// As an aside, the daemon that owns us can be happy as a clam by simply binding
+// to INADDR_ANY since the semantics of this action, as interpreted by both
+// Windows and Linux, are to listen for connections on all current and future
+// interfaces and their IP addresses.  The complexity is fairly well contained
+// here.
+// ============================================================================
+
+//
+// There are configurable attributes of the name service which are determined
 // by the configuration database.  A module name is required and is defined
 // here.  An example of how to use this is in setting the interfaces the name
 // service will use for discovery.
@@ -109,36 +299,43 @@ const char* NameService::INTERFACES_WILDCARD = "*";
 const char* NameService::BROADCAST_PROPERTY = "disable_directed_broadcast";
 
 //
-// This is just a random multicast group chosen out of an unreserved block of
-// addresses and a port next to the AllJoyn daemon port.  In the future we
-// will contact IANA an reserve a multicast group and port; but for now we
-// appropriate an IPv4 Local Scope group as defined in RFC 2365.
+// This is just a random IPv4 multicast group chosen out of the defined site
+// administered block of addresses.  This was a temporary choice while an IANA
+// reservation was in process, and remains for backward compatibility.
 //
 const char* NameService::IPV4_MULTICAST_GROUP = "239.255.37.41";
-const uint16_t NameService::MULTICAST_PORT = 9956;
 
 //
-// Define a broadcast address to allow Access Points in SEA to fall back onto
-// broadcast in case multicast is turned of.  If we are going to control which
-// interfaces ensuing broadcasts should be sent out on, we will need to do a
-// subnet directed broadcast, e.g. 192.168.1.255, but since most OSes will
-// convert the global broadcast address to a subnet directed broadcast using
-// default routes, we define the global broadcast address in case we need it.
+// This is the IANA assigned IPv4 multicast group for AllJoyn.
 //
-// Note that there is no corresponding IPv6 broadcast address.
+const char* NameService::IPV4_ALLJOYN_MULTICAST_GROUP = "224.0.0.113";
+
 //
-const char* NameService::IPV4_GLOBAL_BROADCAST_ADDR = "255.255.255.255";
+// This is just a port next to the default daemon TCP listen port.  These are
+// both from an unassigned area in the IANA port range and was a temporary
+// choice while the IANA port reservation was in process, and remains for
+// backward compatibility.
+//
+const uint16_t NameService::MULTICAST_PORT = 9956;
 const uint16_t NameService::BROADCAST_PORT = NameService::MULTICAST_PORT;
 
 //
-// IPv6 multicast groups are composed of a prefix containing 0xff and then
-// flags (4 bits) followed by the IPv6 Scope (4 bits) and finally the IPv4
+// This is an IPv6 version of the temporary IPv4 multicast address described
+// above.  IPv6 multicast groups are composed of a prefix containing 0xff and
+// then flags (4 bits) followed by the IPv6 Scope (4 bits) and finally the IPv4
 // group, as in "ff03::239.255.37.41".  The Scope corresponding to the IPv4
 // Local Scope group is defined to be "3" by RFC 2365.  Unfortunately, the
 // qcc::IPAddress code can't deal with "ff03::239.255.37.41" so we have to
 // translate it.
 //
 const char* NameService::IPV6_MULTICAST_GROUP = "ff03::efff:2529";
+
+//
+// This is the IANA assigned IPv6 multicast group for AllJoyn.  The assigned
+// address is a variable scope address (ff0x) but we always use the link local
+// scope (ff02).
+//
+const char* NameService::IPV6_ALLJOYN_MULTICAST_GROUP = "ff02::13a";
 
 //
 // Simple pattern matching function that supports '*' and '?' only.  Returns a
@@ -254,782 +451,8 @@ NameService::NameService()
     m_loopback(false), m_enableIPv4(false), m_enableIPv6(false),
     m_any(false), m_wakeEvent(), m_forceLazyUpdate(false)
 {
-    QCC_DbgPrintf(("NameService::NameService()\n"));
-
-#if defined(QCC_OS_WINDOWS)
-    //
-    // Without commenting on the wisdom of this hidden jewel, it turns
-    // out that there is a reference counted call to WSAStartup in our
-    // sockets abstraction.  If you don't have a socket initialized in
-    // the Windows version, you don't have an initialized winsock.
-    // This is a problem for NameService::IfConfig() because it
-    // doesn't use a socket and it makes calls to getnameinfo() which
-    // requires that winsock be initialized.
-    //
-    // Rather than trying to undo all of that reference counting, we
-    // just hold onto a socket while we are alive.
-    //
-    qcc::Socket(qcc::QCC_AF_INET, qcc::QCC_SOCK_DGRAM, m_refSockFd);
-#endif
+    QCC_DbgPrintf(("NameService::NameService()"));
 }
-
-//
-// We need to get a list of interfaces and IP addresses on the system.  This is
-// useful internally for our lazy update interfaces code and to the user who
-// might want to determine what interfaces are up and have IP addresses assigned.
-//
-// Implicit in the last statement is that we need to be able to find interfaces
-// that are not up.  We also need to be able to deal with multiple IP addresses
-// assigned to interfaces, and also with IPv4 and IPv6 at the same time.
-//
-// There are a bewildering number of ways to get information about network
-// devices in Linux.  Unfortunately, most of them only give us access to pieces
-// of the information we need.  For example, the ioctl SIOCGIFCONF belongs to
-// the IP layer and only returns information about IFF_UP interfaces that have
-// assigned IP address.  Furthermore, it only returns information about IPv4
-// addresses.  Since we need IPv6 addresses, and also interfaces that may not
-// have a currently assigned IP address, this won't work.  The function
-// getifaddrs() works on Linux, but isn't available on Android since the header
-// is private and excludes information we need.  User-space tools are even
-// different on different platforms, with ifconfig returning both IPv4 and IPv6
-// addresses on Linux but only IPv4 addresses on Android.  Windows is from
-// planet.
-//
-// One command that pretty much works the same on Android and generic Linux
-// is "ip ad sh" which gives us exactly what we want.  This is from the iproute2
-// package which uses netlink sockets, which is the new super-whoopty-wow
-// control plane for networks in Linux-based systems.  We use netlink sockets
-// to get what we want in Linux and Android.  Of course, as you may expect,
-// libnetlink is not available on Android so we get to use low-level netlink
-// sockets.  This is a bit of a pain, but is manageable since we really need
-// so little information.
-//
-// Since we are really ultimately interested in opening separate sockets and
-// doing separate IGMP joins on each interface/address combination as they
-// become available, we organize the output that way instead of the more OS-like
-// way of an interface with an associated list of addresses.
-//
-
-#if defined (QCC_OS_GROUP_POSIX)
-
-static uint32_t TranslateFlags(uint32_t flags)
-{
-    uint32_t ourFlags = 0;
-    if (flags & IFF_UP) ourFlags |= NameService::IfConfigEntry::UP;
-    if (flags & IFF_BROADCAST) ourFlags |= NameService::IfConfigEntry::BROADCAST;
-    if (flags & IFF_DEBUG) ourFlags |= NameService::IfConfigEntry::DEBUG;
-    if (flags & IFF_LOOPBACK) ourFlags |= NameService::IfConfigEntry::LOOPBACK;
-    if (flags & IFF_POINTOPOINT) ourFlags |= NameService::IfConfigEntry::POINTOPOINT;
-    if (flags & IFF_RUNNING) ourFlags |= NameService::IfConfigEntry::RUNNING;
-    if (flags & IFF_NOARP) ourFlags |= NameService::IfConfigEntry::NOARP;
-    if (flags & IFF_PROMISC) ourFlags |= NameService::IfConfigEntry::PROMISC;
-    if (flags & IFF_NOTRAILERS) ourFlags |= NameService::IfConfigEntry::NOTRAILERS;
-    if (flags & IFF_ALLMULTI) ourFlags |= NameService::IfConfigEntry::ALLMULTI;
-#if defined(IFF_MASTER)
-    if (flags & IFF_MASTER) ourFlags |= NameService::IfConfigEntry::MASTER;
-#endif
-#if defined(IFF_SLAVE)
-    if (flags & IFF_SLAVE) ourFlags |= NameService::IfConfigEntry::SLAVE;
-#endif
-    if (flags & IFF_MULTICAST) ourFlags |= NameService::IfConfigEntry::MULTICAST;
-#if defined(IFF_PORTSEL)
-    if (flags & IFF_PORTSEL) ourFlags |= NameService::IfConfigEntry::PORTSEL;
-#endif
-#if defined(IFF_AUTOMEDIA)
-    if (flags & IFF_AUTOMEDIA) ourFlags |= NameService::IfConfigEntry::AUTOMEDIA;
-#endif
-#if defined(IFF_DYNAMIC)
-    if (flags & IFF_DYNAMIC) ourFlags |= NameService::IfConfigEntry::DYNAMIC;
-#endif
-    return ourFlags;
-}
-
-#endif
-
-#if defined(QCC_OS_LINUX) || defined(QCC_OS_ANDROID)
-
-static int NetlinkRouteSocket(uint32_t bufsize)
-{
-    int sockFd;
-
-    if ((sockFd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)) < 0) {
-        QCC_LogError(ER_FAIL, ("NetlinkRouteSocket: Error obtaining socket: %s", strerror(errno)));
-        return -1;
-    }
-
-    if (setsockopt(sockFd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0) {
-        QCC_LogError(ER_FAIL, ("NetlinkRouteSocket: Can't setsockopt SO_SNDBUF: %s", strerror(errno)));
-        return -1;
-    }
-
-    if (setsockopt(sockFd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0) {
-        QCC_LogError(ER_FAIL, ("NetlinkRouteSocket: Can't setsockopt SO_RCVBUF: %s", strerror(errno)));
-        return -1;
-    }
-
-    struct sockaddr_nl addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.nl_family = AF_NETLINK;
-    addr.nl_pid = getpid();
-
-    if (bind(sockFd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        QCC_LogError(ER_FAIL, ("NetlinkRouteSocket: Can't bind to NETLINK_ROUTE socket: %s", strerror(errno)));
-        return -1;
-    }
-
-    return sockFd;
-}
-
-static void NetlinkSend(int sockFd, int seq, int type, int family)
-{
-    //
-    // Header with general form of address family-dependent message
-    //
-    struct {
-        struct nlmsghdr nlh;
-        struct rtgenmsg g;
-    } request;
-
-    memset(&request, 0, sizeof(request));
-    request.nlh.nlmsg_len = sizeof(request);
-    request.nlh.nlmsg_type = type;
-
-    //
-    // NLM_F_REQUEST ... Indicates a request
-    // NLM_F_ROOT ...... Return the entire table, not just a single entry.
-    // NLM_F_MATCH ..... Return all entries matching criteria.
-    //
-    request.nlh.nlmsg_flags = NLM_F_ROOT | NLM_F_MATCH | NLM_F_REQUEST;
-    request.nlh.nlmsg_pid = getpid();
-    request.nlh.nlmsg_seq = seq;
-
-    request.g.rtgen_family = family;
-
-    send(sockFd, (void*)&request, sizeof(request), 0);
-}
-
-static uint32_t NetlinkRecv(int sockFd, char* buffer, int buflen)
-{
-    uint32_t nBytes = 0;
-
-    while (1) {
-        int tmp = recv(sockFd, &buffer[nBytes], buflen - nBytes, 0);
-
-        if (tmp < 0) {
-            return nBytes;
-        }
-
-        if (tmp == 0) {
-            return nBytes;
-        }
-
-        struct nlmsghdr* p = (struct nlmsghdr*)&buffer[nBytes];
-
-        if (p->nlmsg_type == NLMSG_DONE) {
-            break;
-        }
-
-        nBytes += tmp;
-    }
-
-    return nBytes;
-}
-
-class IfEntry {
-  public:
-    uint32_t m_index;
-    qcc::String m_name;
-    uint32_t m_mtu;
-    uint32_t m_flags;
-};
-
-//
-// Get a list of all interfaces (links) on the system irrespective of whether
-// or not they are up or down or what kind of address they may have assigned.
-// We can use the m_index field to do a "join" on the address list from below.
-//
-static std::list<IfEntry> NetlinkGetInterfaces(void)
-{
-    std::list<IfEntry> entries;
-
-    //
-    // Like many interfaces that do similar things, there's no clean way to
-    // figure out beforehand how big of a buffer we are going to eventually
-    // need.  Typically user code just picks buffers that are "big enough."
-    // for example, iproute2 just picks a 16K buffer and fails if its not
-    // "big enough."  Experimentally, we see that an 8K buffer holds 19
-    // interfaces (because we have overflowed that for some devices).  Instead
-    // of trying to dynamically resize the buffer as we go along, we do what
-    // everyone else does and just allocate a  "big enough' buffer.  We choose
-    // 64K which should handle about 150 interfaces.
-    //
-    const uint32_t BUFSIZE = 65536;
-    char* buffer = new char[BUFSIZE];
-    uint32_t len;
-
-    //
-    // If we can't get a NETLINK_ROUTE socket, treat it as a transient error
-    // since we'll periodically retry looking for interfaces that come up and
-    // go down.  The worst thing that will happen is we may not send
-    // advertisements during the transient time; but this is guaranteed by
-    // construction to be less than the advertisement timeout.
-    //
-    int sockFd = NetlinkRouteSocket(BUFSIZE);
-    if (sockFd < 0) {
-        return entries;
-    }
-
-    NetlinkSend(sockFd, 0, RTM_GETLINK, 0);
-    len = NetlinkRecv(sockFd, buffer, BUFSIZE);
-
-    for (struct nlmsghdr* nh = (struct nlmsghdr*)buffer; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
-        switch (nh->nlmsg_type) {
-        case NLMSG_DONE:
-        case NLMSG_ERROR:
-            break;
-
-        case RTM_NEWLINK:
-        {
-            IfEntry entry;
-
-            struct ifinfomsg* ifi = (struct ifinfomsg*)NLMSG_DATA(nh);
-            entry.m_index = ifi->ifi_index;
-            entry.m_flags = ifi->ifi_flags;
-
-            struct rtattr* rta = IFLA_RTA(ifi);
-            uint32_t rtalen = IFLA_PAYLOAD(nh);
-
-            for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
-                switch (rta->rta_type) {
-                case IFLA_IFNAME:
-                    entry.m_name = qcc::String((char*)RTA_DATA(rta));
-                    break;
-
-                case IFLA_MTU:
-                    entry.m_mtu = *(int*)RTA_DATA(rta);
-                    break;
-                }
-            }
-            entries.push_back(entry);
-            break;
-        }
-        }
-    }
-
-    delete [] buffer;
-    close(sockFd);
-
-    return entries;
-}
-
-class AddrEntry {
-  public:
-    uint32_t m_family;
-    uint32_t m_prefixlen;
-    uint32_t m_flags;
-    uint32_t m_scope;
-    uint32_t m_index;
-    qcc::String m_addr;
-};
-
-//
-// Get a list of all IP addresses of a given family.  We can use the m_index
-// field to do a "join" on the interface list from above.
-//
-static std::list<AddrEntry> NetlinkGetAddresses(uint32_t family)
-{
-    std::list<AddrEntry> entries;
-
-    //
-    // Like many interfaces that do similar things, there's no clean way to
-    // figure out beforehand how big of a buffer we are going to eventually
-    // need.  Typically user code just picks buffers that are "big enough."
-    // for example, iproute2 just picks a 16K buffer and fails if its not
-    // "big enough."  Experimentally, we see that an 8K buffer holds 19
-    // interfaces (because we have overflowed that for some devices).  Instead
-    // of trying to dynamically resize the buffer as we go along, we do what
-    // everyone else does and just allocate a  "big enough' buffer.  We choose
-    // 64K which should handle about 150 interfaces.
-    //
-    const uint32_t BUFSIZE = 65536;
-    char* buffer = new char[BUFSIZE];
-    uint32_t len;
-
-    int sockFd = NetlinkRouteSocket(BUFSIZE);
-
-    NetlinkSend(sockFd, 0, RTM_GETADDR, family);
-    len = NetlinkRecv(sockFd, buffer, BUFSIZE);
-
-    for (struct nlmsghdr* nh = (struct nlmsghdr*)buffer; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
-        switch (nh->nlmsg_type) {
-        case NLMSG_DONE:
-        case NLMSG_ERROR:
-            break;
-
-        case RTM_NEWADDR:
-        {
-            AddrEntry entry;
-
-            struct ifaddrmsg* ifa = (struct ifaddrmsg*)NLMSG_DATA(nh);
-
-            entry.m_family = ifa->ifa_family;
-            entry.m_prefixlen = ifa->ifa_prefixlen;
-            entry.m_flags = ifa->ifa_flags;
-            entry.m_scope = ifa->ifa_scope;
-            entry.m_index = ifa->ifa_index;
-
-            struct rtattr* rta = IFA_RTA(ifa);
-            uint32_t rtalen = IFA_PAYLOAD(nh);
-
-            for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
-                switch (rta->rta_type) {
-                case IFA_ADDRESS:
-                    if (ifa->ifa_family == AF_INET) {
-                        struct in_addr* p = (struct in_addr*)RTA_DATA(rta);
-                        //
-                        // Android seems to stash INADDR_ANY in as an
-                        // IFA_ADDRESS in the case of an AF_INET address
-                        // for some reason, so we ignore those.
-                        //
-                        if (p->s_addr != 0) {
-                            char buffer[17];
-                            inet_ntop(AF_INET, p, buffer, sizeof(buffer));
-                            entry.m_addr = qcc::String(buffer);
-                        }
-                    }
-                    if (ifa->ifa_family == AF_INET6) {
-                        struct in6_addr* p = (struct in6_addr*)RTA_DATA(rta);
-                        char buffer[41];
-                        inet_ntop(AF_INET6, p, buffer, sizeof(buffer));
-                        entry.m_addr = qcc::String(buffer);
-                    }
-                    break;
-
-                default:
-                    break;
-                }
-            }
-            entries.push_back(entry);
-        }
-        break;
-        }
-    }
-
-    delete [] buffer;
-    close(sockFd);
-
-    return entries;
-}
-
-QStatus NameService::IfConfig(std::vector<IfConfigEntry>& entries)
-{
-    QCC_DbgPrintf(("NameService::IfConfig(): The Linux way\n"));
-
-    std::list<IfEntry> ifEntries = NetlinkGetInterfaces();
-    std::list<AddrEntry> entriesIpv4 = NetlinkGetAddresses(AF_INET);
-    std::list<AddrEntry> entriesIpv6 = NetlinkGetAddresses(AF_INET6);
-
-    for (std::list<IfEntry>::const_iterator i = ifEntries.begin(); i != ifEntries.end(); ++i) {
-        uint32_t nAddresses = 0;
-
-        //
-        // Are there any IPV4 addresses assigned to the currently described interface
-        //
-        for (std::list<AddrEntry>::const_iterator j = entriesIpv4.begin(); j != entriesIpv4.end(); ++j) {
-            if ((*j).m_index == (*i).m_index) {
-                IfConfigEntry entry;
-                entry.m_name = (*i).m_name.c_str();
-                entry.m_flags = TranslateFlags((*i).m_flags);
-                entry.m_mtu = (*i).m_mtu;
-                entry.m_index = (*i).m_index;
-                entry.m_addr = (*j).m_addr.c_str();
-                entry.m_prefixlen = (*j).m_prefixlen;
-                entry.m_family = (*j).m_family;
-
-                entries.push_back(entry);
-                ++nAddresses;
-            }
-        }
-
-        //
-        // Are there any IPV6 addresses assigned to the currently described interface
-        //
-        for (std::list<AddrEntry>::const_iterator j = entriesIpv6.begin(); j != entriesIpv6.end(); ++j) {
-            if ((*j).m_index == (*i).m_index) {
-                IfConfigEntry entry;
-                entry.m_name = (*i).m_name.c_str();
-                entry.m_flags = TranslateFlags((*i).m_flags);
-                entry.m_mtu = (*i).m_mtu;
-                entry.m_index = (*i).m_index;
-                entry.m_addr = (*j).m_addr.c_str();
-                entry.m_prefixlen = (*j).m_prefixlen;
-                entry.m_family = (*j).m_family;
-
-                entries.push_back(entry);
-                ++nAddresses;
-            }
-        }
-
-        //
-        // Even if there are no addresses on the interface instantaneously, we
-        // need to return it since there may be an address on it in the future.
-        // The flags should reflect the fact that there are no addresses
-        // assigned.
-        //
-        if (nAddresses == 0) {
-            IfConfigEntry entry;
-            entry.m_name = (*i).m_name.c_str();
-            entry.m_flags = (*i).m_flags;
-            entry.m_mtu = (*i).m_mtu;
-            entry.m_index = (*i).m_index;
-
-            entry.m_addr = qcc::String();
-            entry.m_family = AF_UNSPEC;
-
-            entries.push_back(entry);
-        }
-    }
-
-    return ER_OK;
-}
-
-#elif QCC_OS_WINDOWS
-
-std::vector<qcc::String> GetInterfaces(void)
-{
-    vector<qcc::String> ifs;
-
-    //
-    // Multiple calls are a legacy of sockets stupidity since BSD 4.2
-    //
-    IP_ADAPTER_INFO info, * parray = 0, * pinfo = 0;
-    ULONG infoLen = sizeof(info);
-
-    //
-    // Call into Windows and it will tell us how much memory it needs, if
-    // more than we provide.
-    //
-    GetAdaptersInfo(&info, &infoLen);
-
-    //
-    // Allocate enough memory to hold the adapter information array.
-    //
-    parray = pinfo = reinterpret_cast<IP_ADAPTER_INFO*>(new uint8_t[infoLen]);
-
-    //
-    // Now, get the interesting information about the net devices
-    //
-    if (GetAdaptersInfo(pinfo, &infoLen) == NO_ERROR) {
-        while (pinfo) {
-            ifs.push_back(qcc::String(pinfo->AdapterName));
-            pinfo = pinfo->Next;
-        }
-    }
-
-    delete [] parray;
-
-    return ifs;
-}
-
-void IfConfigByFamily(uint32_t family, std::vector<NameService::IfConfigEntry>& entries)
-{
-    QCC_DbgPrintf(("IfConfigIpv4()\n"));
-
-    //
-    // Windows is from another planet, but we can't blame multiple calls to get
-    // interface info on them.  It's a legacy of *nix sockets since BSD 4.2
-    //
-    IP_ADAPTER_ADDRESSES info, * parray = 0, * pinfo = 0;
-    ULONG infoLen = sizeof(info);
-
-    //
-    // Call into Windows and it will tell us how much memory it needs, if
-    // more than we provide.
-    //
-    GetAdaptersAddresses(family,
-                         GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER,
-                         0, &info, &infoLen);
-
-    //
-    // Allocate enough memory to hold the adapter information array.
-    //
-    parray = pinfo = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(new uint8_t[infoLen]);
-
-    //
-    // Now, get the interesting information about the net devices with IPv4 addresses
-    //
-    if (GetAdaptersAddresses(family,
-                             GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER,
-                             0, pinfo, &infoLen) == NO_ERROR) {
-
-        //
-        // pinfo is a linked list of adapter information records
-        //
-        for (; pinfo; pinfo = pinfo->Next) {
-
-            //
-            // Since there can be multiple IP addresses associated with an
-            // adapter, we have to loop through them as well.  Each IP address
-            // corresponds to a name service IfConfigEntry.
-            //
-            for (IP_ADAPTER_UNICAST_ADDRESS* paddr = pinfo->FirstUnicastAddress; paddr; paddr = paddr->Next) {
-
-                NameService::IfConfigEntry entry;
-
-                //
-                // Get the adapter name.  This will be a GUID, but the
-                // friendly name which would look something like
-                // "Wireless Network Connection 3" in an English
-                // localization can also be Unicode Chinese characters
-                // which AllJoyn may not deal with well.  We choose
-                // the better part of valor and just go with the GUID.
-                //
-                entry.m_name = qcc::String(pinfo->AdapterName);
-
-                //
-                // Fill in the rest of the entry, translating the Windows constants into our
-                // more platform-independent constants.
-                //
-                entry.m_flags = pinfo->OperStatus == IfOperStatusUp ? NameService::IfConfigEntry::UP : 0;
-                entry.m_flags |= pinfo->Flags & IP_ADAPTER_NO_MULTICAST ? 0 : NameService::IfConfigEntry::MULTICAST;
-                entry.m_flags |= pinfo->IfType == IF_TYPE_SOFTWARE_LOOPBACK ? NameService::IfConfigEntry::LOOPBACK : 0;
-                entry.m_family = family;
-                entry.m_mtu = pinfo->Mtu;
-
-                if (family == AF_INET) {
-                    entry.m_index = pinfo->IfIndex;
-                } else {
-                    entry.m_index = pinfo->Ipv6IfIndex;
-                }
-
-                //
-                // Get the IP address in presentation form.
-                //
-                char buffer[NI_MAXHOST];
-                memset(buffer, 0, NI_MAXHOST);
-
-                int result = getnameinfo(paddr->Address.lpSockaddr, paddr->Address.iSockaddrLength,
-                                         buffer, sizeof(buffer), NULL, 0, NI_NUMERICHOST);
-                if (result != 0) {
-                    QCC_LogError(ER_FAIL, ("IfConfigByFamily(): getnameinfo error %d", result));
-                }
-
-                //
-                // Windows appends the IPv6 link scope (after a
-                // percent character) to the end of the IPv6 address
-                // which we can't deal with.  We chop it off if it
-                // is there.
-                //
-                char* p = strchr(buffer, '%');
-                if (p) {
-                    *p = '\0';
-                }
-
-                entry.m_addr = buffer;
-
-#if !defined (NTDDI_VERSION) || !defined (NTDDI_WIN7) || (NTDDI_VERSION < NTDDI_WIN7)
-                //
-                // WINDOWS XP doesn't provide the OnLInkPrefixLength we need to
-                // construct a subnet directed broadcast in the
-                // IP_ADAPTER_UNICAST_ADDRESS structure.  This information is,
-                // however, available in the INTERFACE_INFO structure.  The
-                // problem is that some of the information that is actually
-                // avialable in the IP_ADAPTER_UNICAST_ADDRESS structure is not
-                // available in the INTERFACE_INFO structure.  We don't
-                // absolutely need the mtu, but we do need the interface index.
-                //
-                // So, to get the same amount of information about interfaces, we
-                // have to make an extra call and wander through a different data
-                // structure on XP.  This is only required for AF_INET since
-                // there is no such thing as a subnet directed broadcast in IPv6
-                // (and IPv6 multicast works fine).
-                //
-                if (family == AF_INET) {
-                    //
-                    // Get a socket through qcc::Socket to keep its reference
-                    // counting squared away.
-                    //
-                    qcc::SocketFd sockFd;
-
-                    QStatus status = qcc::Socket(qcc::QCC_AF_INET, qcc::QCC_SOCK_DGRAM, sockFd);
-
-                    if (status == ER_OK) {
-                        //
-                        // Like many interfaces that do similar things, there's no
-                        // clean way to figure out beforehand how big of a buffer we
-                        // are going to eventually need.  Typically user code just
-                        // picks buffers that are "big enough."  On the Linux side
-                        // of things, we run into a similar situation.  There we
-                        // chose a buffer that could handle about 150 interfaces, so
-                        // we just do the same thing here.  Hopefully 150 will be
-                        // "big enough" and an INTERFACE_INFO is not that big since
-                        // it holds a long flags and three sockaddr_gen structures
-                        // (two shorts, two longs and sixteen btyes).  We're then
-                        // looking at allocating 13,200 bytes on the stack which
-                        // doesn't see too terribly outrageous.
-                        //
-                        INTERFACE_INFO interfaces[150];
-                        uint32_t nBytes;
-
-                        //
-                        // Make the WinSuck call to get the address information about
-                        // the various interfaces in the system.
-                        //
-                        if (WSAIoctl(sockFd, SIO_GET_INTERFACE_LIST, 0, 0, &interfaces,
-                                     sizeof(interfaces), (LPDWORD)&nBytes, 0, 0) == SOCKET_ERROR) {
-                            QCC_LogError(status, ("IfConfigByFamily: WSAIoctl(SIO_GET_INTERFACE_LIST) failed: affects %s",
-                                                  entry.m_name.c_str()));
-                            entry.m_prefixlen = static_cast<uint32_t>(-1);
-                        } else {
-                            //
-                            // Walk the array of interface address information
-                            // looking for one with the same address as the adapter
-                            // we are currently inspecting.  It is conceivable that
-                            // we might see a system presenting us with multiple
-                            // adapters with the same IP address but different
-                            // netmasks, but that will confuse more modules than us.
-                            // For example, someone might have multiple wireless
-                            // interfaces connected to multiple access points which
-                            // dole out the same DHCP address with different network
-                            // parts.  This is expected to be extraordinarily rare,
-                            // but if it happens, we'll just form an incorrect
-                            // broadcast address.  This is minor in the grand scheme
-                            // of things.
-                            //
-                            uint32_t nInterfaces = nBytes / sizeof(INTERFACE_INFO);
-                            for (uint32_t i = 0; i < nInterfaces; ++i) {
-                                struct in_addr* addr = &interfaces[i].iiAddress.AddressIn.sin_addr;
-                                //
-                                // XP doesn't have inet_ntop, so we fall back to inet_ntoa
-                                //
-                                char* buffer = inet_ntoa(*addr);
-
-                                if (entry.m_addr == qcc::String(buffer)) {
-                                    //
-                                    // This is the address we want modulo the corner
-                                    // case discussed above.  Grown-up systems
-                                    // recognize that CIDR is the way to go and give
-                                    // us a prefix length, but XP is going to give
-                                    // us a netmask.  We have to convert the mask to
-                                    // a prefix since we consider ourselves all
-                                    // grown-up.
-                                    //
-                                    // So get the 32-bits of netmask returned by
-                                    // Windows (remembering endianness issues) and
-                                    // convert it to a prefix length.
-                                    //
-                                    uint32_t mask = ntohl(interfaces[i].iiNetmask.AddressIn.sin_addr.s_addr);
-
-                                    uint32_t prefixlen = 0;
-                                    while (mask & 0x80000000) {
-                                        ++prefixlen;
-                                        mask <<= 1;
-                                    }
-                                    entry.m_prefixlen = prefixlen;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        QCC_LogError(status, ("IfConfigByFamily: Socket(QCC_AF_INET) failed: affects %s", entry.m_name.c_str()));
-                        entry.m_prefixlen = static_cast<uint32_t>(-1);
-                    }
-                } else {
-                    //
-                    // Don't even attempt to find the prefix length for AF_INET6
-                    // since it will never be used.  Set it to some insane value
-                    // so if someone does try to use it, it will be obviously
-                    // bogus.
-                    //
-                    entry.m_prefixlen = static_cast<uint32_t>(-1);
-                }
-#else // Windows 7 or greater
-                entry.m_prefixlen = paddr->OnLinkPrefixLength;
-#endif // Windows 7 or greater
-                entries.push_back(entry);
-            }
-        }
-    }
-
-    delete [] parray;
-}
-
-QStatus NameService::IfConfig(std::vector<IfConfigEntry>& entries)
-{
-    QCC_DbgPrintf(("NameService::IfConfig(): The Windows way\n"));
-    IfConfigByFamily(AF_INET, entries);
-    IfConfigByFamily(AF_INET6, entries);
-    return ER_OK;
-}
-
-#elif defined(QCC_OS_DARWIN)
-
-QStatus NameService::IfConfig(std::vector<IfConfigEntry>& entries)
-{
-    QCC_DbgPrintf(("NameService::IfConfig(): The Darwin way\n"));
-
-    int sck;
-    struct ifaddrs* iflist = NULL;
-    QStatus status = ER_OK;
-
-    sck = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sck < 0) {
-        status = ER_OS_ERROR;
-        QCC_LogError(status, ("Opening socket: %s", strerror(errno)));
-        goto exit;
-    }
-
-    if (getifaddrs(&iflist) < 0) {
-        status = ER_OS_ERROR;
-        goto exit;
-    }
-
-    for (struct ifaddrs* if_addr = iflist; if_addr != NULL; if_addr = if_addr->ifa_next) {
-        IfConfigEntry entry;
-        struct ifreq if_item;
-        char buf[INET6_ADDRSTRLEN];
-
-        *buf = 0;
-        if (if_addr->ifa_addr->sa_family == AF_INET) {
-            struct in_addr*p =  &((struct sockaddr_in*)if_addr->ifa_addr)->sin_addr;
-            inet_ntop(AF_INET, p, buf, sizeof(buf));
-        } else if (if_addr->ifa_addr->sa_family == AF_INET6) {
-            struct in6_addr*p =  &((struct sockaddr_in6*)if_addr->ifa_addr)->sin6_addr;
-            inet_ntop(AF_INET6, p, buf, sizeof(buf));
-            entry.m_addr = qcc::String(buf);
-        }
-
-        strncpy(if_item.ifr_name, if_addr->ifa_name, IFNAMSIZ);
-        if (ioctl(sck, SIOCGIFMTU, &if_item) < 0) {
-            status = ER_OS_ERROR;
-            QCC_LogError(status, ("Calling IOCtl: %s", strerror(errno)));
-            goto exit;
-        }
-
-        entry.m_name = qcc::String(if_addr->ifa_name);
-        entry.m_family = if_addr->ifa_addr->sa_family;
-        entry.m_flags = TranslateFlags(if_addr->ifa_flags);
-        entry.m_index = if_nametoindex(if_addr->ifa_name);
-        entry.m_mtu = if_item.ifr_mtu;
-        if (*buf != 0) {
-            entry.m_addr = qcc::String(buf);
-        }
-
-        entries.push_back(entry);
-    }
-exit:
-    if (sck >= 0) {
-        close(sck);
-    }
-    if (iflist) {
-        freeifaddrs(iflist);
-    }
-    return status;
-}
-
-#else
-#error No known OS specified
-#endif
 
 QStatus NameService::Init(
     const qcc::String& guid,
@@ -1038,7 +461,7 @@ QStatus NameService::Init(
     bool disableBroadcast,
     bool loopback)
 {
-    QCC_DbgHLPrintf(("NameService::Init()\n"));
+    QCC_DbgPrintf(("NameService::Init()"));
 
     //
     // Can only call Init() if the object is not running or in the process
@@ -1065,7 +488,7 @@ QStatus NameService::Init(
 
 NameService::~NameService()
 {
-    QCC_DbgPrintf(("NameService::~NameService()\n"));
+    QCC_DbgPrintf(("NameService::~NameService()"));
 
     //
     // Stop the worker thread to get things calmed down.
@@ -1089,7 +512,6 @@ NameService::~NameService()
     //
     // Delete any callbacks that a user of this class may have set.
     //
-
     delete m_callback;
     m_callback = 0;
 
@@ -1097,196 +519,17 @@ NameService::~NameService()
     // All shut down and ready for bed.
     //
     m_state = IMPL_SHUTDOWN;
-
-#if defined(QCC_OS_WINDOWS)
-    //
-    // Release our hold on the winsock reference count.  See the constructor
-    // for the gory details.
-    //
-    qcc::Close(m_refSockFd);
-#endif
 }
-
-//
-// Long Sidebar:
-//
-// In order to understand all of the trouble we are going to go through below,
-// it is helpful to thoroughly understand what is done on our platforms in the
-// presence of multicast.  This is long reading, but worthwhile reading if you
-// are trying to understand what is going on.  I don't know of anywhere you
-// can find all of this written in one place.
-//
-// The first thing to grok is that all platforms are implemented differently.
-// Windows and Linux use IGMP to enable and disable multicast, and other
-// multicast-related socket calls to do the fine-grained control.  Android
-// doesn't bother to compile its kernel with CONFIG_IP_MULTICAST set.  This
-// doesn't mean that there is no multicast code in the Android kernel, it means
-// there is no IGMP code in the kernel.  Since IGMP isn't implemented, Android
-// can't use it to enable and disable multicast, so it uses wpa_supplicant
-// driver-private commands instead.  This means that you will probably get
-// three different answers if you ask how some piece of the multicast puzzle
-// works.
-//
-// On the send side, multicast is controlled by the IP_MULTICAST_IF (or for
-// IPv6 IPV6_MULTICAST_IF) socket.  In IPv4 you provide an IP address and in
-// IPv6 you provide an interface index.  If you do nothing, or set the
-// interface address to 0.0.0.0 for IPv4 or the interface index to 0 for IPv6
-// the multicast output interface is essentially selected by the system routing
-// code.  In Linux (and Android), multicast packets are sent out the interface
-// that is used for the default route (the default interface).  You can see this
-// if you type "ip ro sh".  In Windows, the system chooses its default interface
-// by looking for the lowest value for the routing metric for a destination IP
-// address of 224.0.0.0 in its routing table.  You can see this in the output
-// of "route print".
-//
-// We want all of our multicast code to work in the presence of IP addresses
-// changing when phones move from one Wifi access point to another, or when
-// our desktop access point changes when someone with a mobile access point
-// walks by; so it is important to know what will happen when these addresses
-// change.
-//
-// On Linux, if you set the IP_MULTICAST_IF to 0.0.0.0 (or index 0 in IPv6)
-// and bring down the default interface or change the IP address on the
-// default interface, you will begin to fail the multicast sends with "network
-// unreachable" errors since the default route goes away when you change the
-// IP address (e.g, "sudo ifconfig eth1 10.4.108.237 netmask 255.255.255.0 upâ€?).
-// As soon as you provide a new default route (e.g., "route add default gw
-// 10.4.108.1") the multicast packets will start flowing again.
-//
-// In Windows, if you set the IP_MULTICAST_IF address to 0.0.0.0 and release
-// the ip address (e.g., "ipconfig /release") the sends may still appear to
-// work but nothing goes out the original interface.  This is because Windows
-// will dynamically change the default multicast route according to its internal
-// multicast routing table.  It selects another interface based on a routing
-// metric, and it could, for example, just switch to a VMware virtual interface
-// silently.  The name service would never know it just "broke."
-//
-// When we set up multicast advertisements in our system, we most likely do not
-// want to route our advertisements only to the default adapter.  For example,
-// on a desktop system, the default interface is probably one of the wired
-// Ethernets.  We most likely want to advertise on that interface, but we may
-// also want to advertise on other wired interfaces and any wireless interfaces
-// as well.  We do not want the system to start changing multicast destinations
-// out from under us ever.  Because of this, the only time using INADDR_ANY
-// would be appropriate in the IP_MULTICAST_IF socket option is in the simplest,
-// static network situations.  For the general case, we really need to keep
-// multiple sockets that are each talking to an interface of interest (not IP
-// address, since they can change).
-//
-// So we need to provide API that allows a user to specify a network interface
-// over which she is interested in advertising.  This explains the method
-// OpenInterface(qcc::String interface) defined below.
-//
-// Once we have determined that we need to use IP_MULTICAST_IF, we needed to
-// understand exactly what changing the IP address out from under that call
-// would do.  The first thing to observe is that IP_MULTICAST_IF takes an IP
-// address in the case of IPv4, but we want to specify an interface index as
-// in IPv6 or for human beings, a name (e.g., "wlan0").  It may be the case that
-// the interface does not have an IP address assigned (is not up or connected to
-// an access point) at the time the call to OpenInterface is made, so a call to
-// setsockopt is not possible until an address is available.  If the IP address
-// is not valid you will see a "network unreachable" error.  So, we need to defer
-// this action until we need to do it; and we use lazy evaluation on the IP
-// address and only store the interface name in OpenInterface.
-//
-// If we try to rely on sockets to notify us whenever an error happens and then
-// try to re-open the socket using the correct interface name, as we metioned
-// above, we could miss the fact that our routing has changed.  The safest thing
-// to do would be to check for IP address changes and re-evaluate and open new
-// sockets bound to the correct interfaces whenever we want to send a multicast
-// packet.  It is conceivable that we could miss the fact that we have switched
-// access points if DHCP gives us the same IP (using either the error return or
-// address check methods), but that shouldn't actually matter.
-//
-// The receive side has similar issues.
-//
-// In order to receive multicast datagrams sent to a particular port, it is
-// necessary to bind that local port leaving the local address unspecified
-// (i.e., INADDR_ANY or in6addr_any).  What you might think of as binding is
-// then actually handled by the Internet Group Management Protocol (IGMP).
-// Recall that Android does not implement IGMP, so we have yet another small
-// complication.
-//
-// Using IGMP, we join the socket to the multicast group instead of binding
-// the socket to a specific interface (address) and port.  Binding the socket
-// to INADDR_ANY or in6addr_any may look strange, but it is actually the right
-// thing to do.
-//
-// The socket option for joining a multicast group, of course, works differently
-// for IPv4 and IPv6.  IP_ADD_MEMBERSHIP (for IPv4) has a provided IP address
-// that can be either INADDR_ANY or a specific address.  If INADDR_ANY is
-// provided, the interface of the default route is added to the group, and the
-// IGMP join is sent out that interface.  IPV6_ADD_MEMBERSHIP (for IPv6) has a
-// provided interface index that can be either 0 or a specific interface.  If 0
-// is provided, the interface of the default route is added to the group, and the
-// IGMP join is sent out that interface.  If a specific interface index is
-// that interface is added to the group and the IGMP join is sent out that
-// interface.
-//
-// A side effect of the IGMP join deep down in the kernel is to enable reception
-// of multicast MAC addresses in the device driver.  Since there is no IGMP in
-// Android, we must rely on a multicast (Java) lock being taken by some external
-// code on phones that do not leave multicast always enabled (HTC Desire, for
-// example).  When the multicast lock is taken, a private driver command is sent
-// to the wpa_supplicant which, in turn, calls into the driver to enable reception
-// of multicast MAC packets.
-//
-// Similar to the situation on the send side, we most likely do not want to rely
-// on the system routing tables to configure our name service.  So we really need
-// to provide a specific address.
-//
-// If a specific IP address is provided, then that address must be an
-// address assigned to a currently-UP interface.  This is the same catch-22
-// as we have on the send side.  We need to lazily evaluate the interface
-// when we "need" to, in order to find if an IP address has appeared on
-// that interface and then join the multicast group to enable multicast on
-// the underlying device.
-//
-// We can either hook "IP address changed" events to drive the re-evaluation
-// process or we can poll for those changes.  We have a maintenance thread
-// that fires off every second, so it can look for these changes.  It seems
-// that "IP address changed" events are communicated by the DBus-based network
-// manager in Linux, other Windows-specific events, or an unknown mechanism in
-// Android.  The better part of valor seems to be to poll in the maintenance
-// thread.
-//
-// It turns out that in Linux, the IP address passed to the join socket option
-// call is actually not significant after the initial call.  It is used to look
-// up an interface and its associated net device and to then set the
-// PACKET_MULTICAST filter on the net device to receive packets destined for
-// the specified multicast address.  If the IP address associated with the
-// interface changes, multicast messages will continue to be received.
-//
-// Of course, Windows does it differently.  They look at the IP address passed
-// to the socket option as being significant, and so if the underlying IP address
-// changes on a Windows system, multicast packets will no longer be delivered.
-// Because of this, the receive side of the multicast name service has also
-// got to look for changes to IP address configuration and set itself up
-// whenever it finds a change.
-//
-// So it may look overly complicated, but we provide an OpenInterface call that
-// takes an interface name.  This just remembers that name.  The maintenance
-// thread wakes up every second and checks to make sure we are ready to listen
-// to and talk over the correct interfaces (as specified by the calls to
-// OpenInterface) by closing and opening sockets.  When an advertise or cancel
-// is called, we also check to make sure we are ready to talk over the correct
-// interfaces before sending packets.
-//
-// As an aside, the daemon that owns us can be happy as a clam by simply binding
-// to INADDR_ANY since the semantics of this, as interpreted by both Windows and
-// Linux, are to listen for connections on all current and future interfaces and
-// their IP addresses.
-//
 
 QStatus NameService::OpenInterface(const qcc::String& name)
 {
-    QCC_DbgPrintf(("NameService::OpenInterface(%s)\n", name.c_str()));
+    QCC_DbgPrintf(("NameService::OpenInterface(%s)", name.c_str()));
 
     //
     // Can only call OpenInterface() if the object is running.
     //
     if (m_state != IMPL_RUNNING) {
-        QCC_DbgPrintf(("NameService::OpenInterface(): Not running\n"));
+        QCC_DbgPrintf(("NameService::OpenInterface(): Not running"));
         return ER_FAIL;
     }
 
@@ -1307,7 +550,7 @@ QStatus NameService::OpenInterface(const qcc::String& name)
 
     for (uint32_t i = 0; i < m_requestedInterfaces.size(); ++i) {
         if (m_requestedInterfaces[i].m_interfaceName == name) {
-            QCC_DbgPrintf(("NameService::OpenInterface(): Already opened.\n"));
+            QCC_DbgPrintf(("NameService::OpenInterface(): Already opened."));
             m_mutex.Unlock();
             return ER_OK;
         }
@@ -1326,13 +569,13 @@ QStatus NameService::OpenInterface(const qcc::String& name)
 
 QStatus NameService::OpenInterface(const qcc::IPAddress& addr)
 {
-    QCC_DbgPrintf(("NameService::OpenInterface(%s)\n", addr.ToString().c_str()));
+    QCC_DbgPrintf(("NameService::OpenInterface(%s)", addr.ToString().c_str()));
 
     //
     // Can only call OpenInterface() if the object is running.
     //
     if (m_state != IMPL_RUNNING) {
-        QCC_DbgPrintf(("NameService::OpenInterface(): Not running\n"));
+        QCC_DbgPrintf(("NameService::OpenInterface(): Not running"));
         return ER_FAIL;
     }
 
@@ -1355,7 +598,7 @@ QStatus NameService::OpenInterface(const qcc::IPAddress& addr)
     if (addr == qcc::IPAddress("0.0.0.0") ||
         addr == qcc::IPAddress("0::0") ||
         addr == qcc::IPAddress("::")) {
-        QCC_DbgPrintf(("NameService::OpenInterface(): Wildcard address\n"));
+        QCC_DbgPrintf(("NameService::OpenInterface(): Wildcard address"));
         m_any = true;
         m_mutex.Unlock();
         return ER_OK;
@@ -1363,7 +606,7 @@ QStatus NameService::OpenInterface(const qcc::IPAddress& addr)
 
     for (uint32_t i = 0; i < m_requestedInterfaces.size(); ++i) {
         if (m_requestedInterfaces[i].m_interfaceAddr == addr) {
-            QCC_DbgPrintf(("NameService::OpenInterface(): Already opened.\n"));
+            QCC_DbgPrintf(("NameService::OpenInterface(): Already opened."));
             m_mutex.Unlock();
             return ER_OK;
         }
@@ -1382,13 +625,13 @@ QStatus NameService::OpenInterface(const qcc::IPAddress& addr)
 
 QStatus NameService::CloseInterface(const qcc::String& name)
 {
-    QCC_DbgPrintf(("NameService::CloseInterface(%s)\n", name.c_str()));
+    QCC_DbgPrintf(("NameService::CloseInterface(%s)", name.c_str()));
 
     //
     // Can only call CloseInterface() if the object is running.
     //
     if (m_state != IMPL_RUNNING) {
-        QCC_DbgPrintf(("NameService::CloseInterface(): Not running\n"));
+        QCC_DbgPrintf(("NameService::CloseInterface(): Not running"));
         return ER_FAIL;
     }
 
@@ -1419,13 +662,13 @@ QStatus NameService::CloseInterface(const qcc::String& name)
 
 QStatus NameService::CloseInterface(const qcc::IPAddress& addr)
 {
-    QCC_DbgPrintf(("NameService::CloseInterface(%s)\n", addr.ToString().c_str()));
+    QCC_DbgPrintf(("NameService::CloseInterface(%s)", addr.ToString().c_str()));
 
     //
     // Can only call CloseInterface() if the object is running.
     //
     if (m_state != IMPL_RUNNING) {
-        QCC_DbgPrintf(("NameService::CloseInterface(): Not running\n"));
+        QCC_DbgPrintf(("NameService::CloseInterface(): Not running"));
         return ER_FAIL;
     }
 
@@ -1445,7 +688,7 @@ QStatus NameService::CloseInterface(const qcc::IPAddress& addr)
     if (addr == qcc::IPAddress("0.0.0.0") ||
         addr == qcc::IPAddress("0::0") ||
         addr == qcc::IPAddress("::")) {
-        QCC_DbgPrintf(("NameService::CloseInterface(): Wildcard address\n"));
+        QCC_DbgPrintf(("NameService::CloseInterface(): Wildcard address"));
         m_any = false;
         m_mutex.Unlock();
         return ER_OK;
@@ -1472,7 +715,7 @@ QStatus NameService::CloseInterface(const qcc::IPAddress& addr)
 
 void NameService::ClearLiveInterfaces(void)
 {
-    QCC_DbgPrintf(("NameService::ClearLiveInterfaces()\n"));
+    QCC_DbgPrintf(("NameService::ClearLiveInterfaces()"));
 
     for (uint32_t i = 0; i < m_liveInterfaces.size(); ++i) {
         if (m_liveInterfaces[i].m_sockFd == -1) {
@@ -1480,77 +723,28 @@ void NameService::ClearLiveInterfaces(void)
         }
 
         //
-        // Arrange an IGMP drop via the appropriate setsockopt. Android
-        // doesn't bother to compile its kernel with CONFIG_IP_MULTICAST set.
-        // This doesn't mean that there is no multicast code in the Android
-        // kernel, it means there is no IGMP code in the kernel.  What this
-        // means to us is that even through we are doing an IP_DROP_MEMBERSHIP
-        // request, which is ultimately an IGMP operation, the request will
-        // filter through the IP code before being ignored and will do useful
-        // things in the kernel even though CONFIG_IP_MULTICAST was not set
-        // for the Android build -- i.e., we have to do it anyway.
+        // Arrange an IGMP drop via the appropriate socket option (via the qcc
+        // absraction layer). Android doesn't bother to compile its kernel with
+        // CONFIG_IP_MULTICAST set.  This doesn't mean that there is no
+        // multicast code in the Android kernel, it means there is no IGMP code
+        // in the kernel.  What this means to us is that even through we are
+        // doing an IP_DROP_MEMBERSHIP request, which is ultimately an IGMP
+        // operation, the request will filter through the IP code before being
+        // ignored and will do useful things in the kernel even though
+        // CONFIG_IP_MULTICAST was not set for the Android build -- i.e., we
+        // have to do it anyway.
         //
         if (m_liveInterfaces[i].m_address.IsIPv4()) {
-            struct ip_mreq mreq;
-            mreq.imr_multiaddr.s_addr = inet_addr(IPV4_MULTICAST_GROUP);
-            mreq.imr_interface.s_addr = m_liveInterfaces[i].m_address.GetIPv4AddressNetOrder();
-
-            if (setsockopt(m_liveInterfaces[i].m_sockFd, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-                           reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
-                QCC_DbgPrintf(("NameService::ClearLiveInterfaces(void): setsockopt(IP_DROP_MEMBERSHIP) failed\n"));
-            }
+            qcc::LeaveMulticastGroup(m_liveInterfaces[i].m_sockFd, qcc::QCC_AF_INET, IPV4_MULTICAST_GROUP, m_liveInterfaces[i].m_interfaceName);
         } else if (m_liveInterfaces[i].m_address.IsIPv6()) {
-            struct ipv6_mreq mreq;
-
-            //
-            // If we can't convert the multicast group to an IP address, there's
-            // nothing we can do about letting routers on the net know that we
-            // are closing down.
-            //
-            qcc::String mcGroup = qcc::String(IPV6_MULTICAST_GROUP);
-            if (INET_PTON(AF_INET6, mcGroup.c_str(), &mreq.ipv6mr_multiaddr) == 0) {
-                QCC_DbgPrintf(("NameService::ClearLiveInterfaces(void): INET_PTON failed\n"));
-                continue;
-            }
-
-            //
-            // The IPv6 version of selecting the multicast interface works on
-            // an interface index instead of an IP address.  This index may
-            // be changed on a per-socket basis so We have to figure out what
-            // this index is using a getsockopt.
-            //
-            uint32_t index = 0;
-            socklen_t indexLen = sizeof(index);
-
-            if (getsockopt(m_liveInterfaces[i].m_sockFd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
-                           reinterpret_cast<char*>(&index), &indexLen) < 0) {
-                QCC_DbgPrintf(("NameService::ClearLiveInterfaces(void): getsockopt(IPV6_MULTICAST_IF) failed\n"));
-                continue;
-            }
-
-            mreq.ipv6mr_interface = index;
-
-            //
-            // This call tells the OS to issue an IGMP leave event.  This is
-            // primarily going to send an IGMP packet to routers on the local
-            // subnet telling them that we are no longer interested in hearing
-            // packets destined for our multicast group.  Various operating
-            // systems take this with various degrees of seriousness.  Android
-            // ignores it completely, Linux generates the packet but leaves the
-            // net device enabled for multicast reception, and Windows does
-            // everything.
-            //
-            if (setsockopt(m_liveInterfaces[i].m_sockFd, IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP,
-                           reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
-                QCC_DbgPrintf(("NameService::ClearLiveInterfaces(void): setsockopt(IPV6_DROP_MEMBERSHIP) failed\n"));
-                continue;
-            }
-        } else {
-            QCC_LogError(ER_FAIL, ("NameService:ClearLiveInterfaces: Address not IPv4 or IPv6"));
+            qcc::LeaveMulticastGroup(m_liveInterfaces[i].m_sockFd, qcc::QCC_AF_INET6, IPV6_MULTICAST_GROUP, m_liveInterfaces[i].m_interfaceName);
         }
 
         qcc::Close(m_liveInterfaces[i].m_sockFd);
         m_liveInterfaces[i].m_sockFd = -1;
+
+        delete m_liveInterfaces[i].m_event;
+        m_liveInterfaces[i].m_event = NULL;
     }
 
     m_liveInterfaces.clear();
@@ -1563,7 +757,7 @@ void NameService::ClearLiveInterfaces(void)
 //
 void NameService::LazyUpdateInterfaces(void)
 {
-    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces()\n"));
+    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces()"));
 
     //
     // However desirable it may be, the decision to simply use an existing
@@ -1599,9 +793,9 @@ void NameService::LazyUpdateInterfaces(void)
     // can't get the system interfaces, we give up for now and hope the error
     // is transient.
     //
-    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): IfConfig()\n"));
-    std::vector<IfConfigEntry> entries;
-    QStatus status = IfConfig(entries);
+    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): IfConfig()"));
+    std::vector<qcc::IfConfigEntry> entries;
+    QStatus status = qcc::IfConfig(entries);
     if (status != ER_OK) {
         QCC_LogError(status, ("LazyUpdateInterfaces: IfConfig() failed"));
         return;
@@ -1623,7 +817,7 @@ void NameService::LazyUpdateInterfaces(void)
         // a name.
         //
         assert(entries[i].m_name.size());
-        QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Checking out interface %s\n", entries[i].m_name.c_str()));
+        QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Checking out interface %s", entries[i].m_name.c_str()));
 
         //
         // We are never interested in interfaces that are not UP or are LOOPBACK
@@ -1631,9 +825,9 @@ void NameService::LazyUpdateInterfaces(void)
         // local host is handled by the MULTICAST_LOOP socket option which is
         // enabled by default.
         //
-        if ((entries[i].m_flags & IfConfigEntry::UP) == 0 ||
-            (entries[i].m_flags & IfConfigEntry::LOOPBACK) != 0) {
-            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): not UP or LOOPBACK\n"));
+        if ((entries[i].m_flags & qcc::IfConfigEntry::UP) == 0 ||
+            (entries[i].m_flags & qcc::IfConfigEntry::LOOPBACK) != 0) {
+            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): not UP or LOOPBACK"));
             continue;
         }
 
@@ -1644,9 +838,9 @@ void NameService::LazyUpdateInterfaces(void)
         // just works with the live interfaces irrespective of address family,
         // this is the only place we need to do this check.
         //
-        if ((m_enableIPv4 == false && entries[i].m_family == AF_INET) ||
-            (m_enableIPv6 == false && entries[i].m_family == AF_INET6)) {
-            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): family %d not enabled\n", entries[i].m_family));
+        if ((m_enableIPv4 == false && entries[i].m_family == qcc::QCC_AF_INET) ||
+            (m_enableIPv6 == false && entries[i].m_family == qcc::QCC_AF_INET6)) {
+            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): family %d not enabled", entries[i].m_family));
             continue;
         }
 
@@ -1659,7 +853,7 @@ void NameService::LazyUpdateInterfaces(void)
         bool useEntry = false;
 
         if (m_any) {
-            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Use because wildcard mode\n"));
+            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Use because wildcard mode"));
             useEntry = true;
         } else {
             for (uint32_t j = 0; j < m_requestedInterfaces.size(); ++j) {
@@ -1669,7 +863,7 @@ void NameService::LazyUpdateInterfaces(void)
                 //
                 if (m_requestedInterfaces[j].m_interfaceName.size() != 0 &&
                     m_requestedInterfaces[j].m_interfaceName == entries[i].m_name) {
-                    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Found matching requestedInterface name\n"));
+                    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Found matching requestedInterface name"));
                     useEntry = true;
                     break;
                 }
@@ -1680,7 +874,7 @@ void NameService::LazyUpdateInterfaces(void)
                 //
                 if (m_requestedInterfaces[j].m_interfaceName.size() == 0 &&
                     m_requestedInterfaces[j].m_interfaceAddr == qcc::IPAddress(entries[i].m_addr)) {
-                    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Found matching requestedInterface address\n"));
+                    QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Found matching requestedInterface address"));
                     useEntry = true;
                     break;
                 }
@@ -1691,8 +885,8 @@ void NameService::LazyUpdateInterfaces(void)
         // If we aren't configured to use this entry, or have no idea how to use
         // this entry (not AF_INET or AF_INET6), try the next one.
         //
-        if (useEntry == false || (entries[i].m_family != AF_INET && entries[i].m_family != AF_INET6)) {
-            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Won't use this IfConfig entry\n"));
+        if (useEntry == false || (entries[i].m_family != qcc::QCC_AF_INET && entries[i].m_family != qcc::QCC_AF_INET6)) {
+            QCC_DbgPrintf(("NameService::LazyUpdateInterfaces(): Won't use this IfConfig entry"));
             continue;
         }
 
@@ -1711,16 +905,24 @@ void NameService::LazyUpdateInterfaces(void)
         // If multicast is not suported, then to be useful we need to be able to
         // do an IPv4 subnet directed broadcast on this interface.
         //
-        if ((entries[i].m_flags & IfConfigEntry::MULTICAST) == 0) {
-            if ((entries[i].m_family != AF_INET) || (m_broadcast == false)) {
-                QCC_DbgPrintf(("LazyUpdateInterfaces:  Not MULTICAST, or broadcast not enabled and AF_INET.  Ignoring\n"));
+        if ((entries[i].m_flags & qcc::IfConfigEntry::MULTICAST) == 0) {
+            if ((entries[i].m_family != qcc::QCC_AF_INET) || (m_broadcast == false)) {
+                QCC_DbgPrintf(("LazyUpdateInterfaces:  Not MULTICAST, or BROADCAST not enabled and AF_INET.  Ignoring"));
                 continue;
             }
         }
 
+        //
+        // We've decided the interface in question is interesting and we want to
+        // use it to send and receive name service messages.  Now we need to
+        // start the long process of convincing the network to do what we want.
+        // This is going to mostly be done by setting a series of socket
+        // options.  The small number of the ones we need are absracted in the
+        // qcc package.
+        //
         qcc::SocketFd sockFd;
 
-        if (entries[i].m_family == AF_INET) {
+        if (entries[i].m_family == qcc::QCC_AF_INET) {
             QStatus status = qcc::Socket(qcc::QCC_AF_INET, qcc::QCC_SOCK_DGRAM, sockFd);
             if (status != ER_OK) {
                 QCC_LogError(status, ("LazyUpdateInterfaces: qcc::Socket(AF_INET) failed: %d - %s",
@@ -1728,19 +930,18 @@ void NameService::LazyUpdateInterfaces(void)
                 continue;
             }
 
+            //
+            // If we're going to send broadcasts, we have to ask for
+            // permission.
+            //
             if (m_broadcast) {
-                //
-                // If we're going to send broadcasts, we have to ask for
-                // permission.
-                //
-                int broadcast = 1;
-                if (setsockopt(sockFd, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof broadcast) == -1) {
-                    QCC_LogError(status, ("LazyUpdateInterfaces: setsockopt(SO_BROADCAST) failed: %d - %s",
-                                          qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
+                status = qcc::SetBroadcast(sockFd, true);
+                if (status != ER_OK) {
+                    QCC_LogError(status, ("LazyUpdateInterfaces: enable broadcast failed"));
                     continue;
                 }
             }
-        } else if (entries[i].m_family == AF_INET6) {
+        } else if (entries[i].m_family == qcc::QCC_AF_INET6) {
             QStatus status = qcc::Socket(qcc::QCC_AF_INET6, qcc::QCC_SOCK_DGRAM, sockFd);
             if (status != ER_OK) {
                 QCC_LogError(status, ("LazyUpdateInterfaces: qcc::Socket(AF_INET6) failed: %d - %s",
@@ -1753,82 +954,68 @@ void NameService::LazyUpdateInterfaces(void)
         }
 
         //
-        // We must be able to reuse the address (well, port, but not all systems
-        // support SO_REUSEPORT) so other AllJoyn daemon instances on this host can
-        // listen in if desired.
+        // We must be able to reuse the address/port combination so other
+        // AllJoyn daemon instances on the same host can listen in if desired.
+        // This will set the SO_REUSEPORT socket option if available or fall
+        // back onto SO_REUSEADDR if not.
         //
-#ifndef SO_REUSEPORT
-#define SO_REUSEPORT SO_REUSEADDR
-#endif
-        uint32_t yes = 1;
-        if (setsockopt(sockFd, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
-            QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): setsockopt(SO_REUSEPORT) failed: %d - %s",
-                                  qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
+        status = qcc::SetReusePort(sockFd, true);
+        if (status != ER_OK) {
+            QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): SetReusePort() failed"));
             qcc::Close(sockFd);
             continue;
         }
 
         //
-        // If the MULTICAST flag is set, we are going to try and multicast out over
-        // the interface in question, so we are going to have to play the usual
-        // multicast games.  If the MULTICAST flag is not set, then we want to fall
-        // back to IPv4 subnet directed broadcast.
+        // If the MULTICAST flag is set, we are going to try and multicast out
+        // over the interface in question.  If the MULTICAST flag is not set,
+        // then we want to fall back to IPv4 subnet directed broadcast, so we
+        // optionally do all of the multicast games and take the interface live
+        // even if it doesn't support multicast.
         //
-        if (entries[i].m_flags & IfConfigEntry::MULTICAST) {
+        if (entries[i].m_flags & qcc::IfConfigEntry::MULTICAST) {
             //
             // Restrict the scope of the sent muticast packets to the local subnet.
-            // Of course, IPv4 and IPv6 have to do it differently.
             //
-            uint32_t ttl = 1;
-            if (entries[i].m_family == AF_INET) {
-                if (setsockopt(sockFd, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<const char*>(&ttl), sizeof(ttl)) < 0) {
-                    QCC_LogError(status, (
-                                     "NameService::LazyUpdateInterfaces(): setsockopt(IP_MULTICAST_TTL) failed: %d - %s",
-                                     qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
-                    qcc::Close(sockFd);
-                    continue;
-                }
-            }
-
-            if (entries[i].m_family == AF_INET6) {
-                if (setsockopt(sockFd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, reinterpret_cast<const char*>(&ttl), sizeof(ttl)) < 0) {
-                    QCC_LogError(status, (
-                                     "NameService::LazyUpdateInterfaces(): setsockopt(IP_MULTICAST_HOPS) failed: %d - %s",
-                                     qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
-                    qcc::Close(sockFd);
-                    continue;
-                }
-            }
-        }
-
-        qcc::IPAddress address(entries[i].m_addr);
-
-        //
-        // In order to control which interfaces get our multicast datagrams, it
-        // is necessary to do so via a socket option.  See the Long Sidebar above.
-        // Yes, you have to do it differently depending on whether or not you're
-        // using IPv4 or IPv6.
-        //
-        if (entries[i].m_family == AF_INET) {
-            struct in_addr addr;
-            addr.s_addr = address.GetIPv4AddressNetOrder();
-            if (setsockopt(sockFd, IPPROTO_IP, IP_MULTICAST_IF,
-                           reinterpret_cast<const char*>(&addr), sizeof(addr)) < 0) {
-                QCC_LogError(status, (
-                                 "NameService::LazyUpdateInterfaces(): setsockopt(IP_MULTICAST_IF) failed: %d - %s",
-                                 qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
+            status = qcc::SetMulticastHops(sockFd, entries[i].m_family, 1);
+            if (status != ER_OK) {
+                QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): SetMulticastHops() failed"));
                 qcc::Close(sockFd);
                 continue;
             }
-        }
 
-        if (entries[i].m_family == AF_INET6) {
-            uint32_t index = entries[i].m_index;
-            if (setsockopt(sockFd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
-                           reinterpret_cast<const char*>(&index), sizeof(index)) < 0) {
-                QCC_LogError(status, (
-                                 "NameService::LazyUpdateInterfaces(): setsockopt(IPV6_MULTICAST_IF) failed: %d - %s",
-                                 qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
+            //
+            // In order to control which interfaces get our multicast datagrams, it
+            // is necessary to do so via a socket option.  See the Long Sidebar above.
+            // Yes, you have to do it differently depending on whether or not you're
+            // using IPv4 or IPv6.
+            //
+            status = qcc::SetMulticastInterface(sockFd, entries[i].m_family, entries[i].m_name);
+            if (status != ER_OK) {
+                QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): SetMulticastInterface() failed"));
+                qcc::Close(sockFd);
+                continue;
+            }
+
+            //
+            // Arrange an IGMP join via the appropriate socket option (via the
+            // qcc abstraction layer). Android doesn't bother to compile its
+            // kernel with CONFIG_IP_MULTICAST set.  This doesn't mean that
+            // there is no multicast code in the Android kernel, it means there
+            // is no IGMP code in the kernel.  What this means to us is that
+            // even through we are doing an IP_ADD_MEMBERSHIP request, which is
+            // ultimately an IGMP operation, the request will filter through the
+            // IP code before being ignored and will do useful things in the
+            // kernel even though CONFIG_IP_MULTICAST was not set for the
+            // Android build -- i.e., we have to do it anyway.
+            //
+            if (entries[i].m_family == qcc::QCC_AF_INET) {
+                status = qcc::JoinMulticastGroup(sockFd, qcc::QCC_AF_INET, IPV4_MULTICAST_GROUP, entries[i].m_name);
+            } else if (entries[i].m_family == qcc::QCC_AF_INET6) {
+                status = qcc::JoinMulticastGroup(sockFd, qcc::QCC_AF_INET6, IPV6_MULTICAST_GROUP, entries[i].m_name);
+            }
+            if (status != ER_OK) {
+                QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): unable to join multicast group"));
                 qcc::Close(sockFd);
                 continue;
             }
@@ -1840,70 +1027,19 @@ void NameService::LazyUpdateInterfaces(void)
         // are a little different.  Binding to INADDR_ANY is the correct thing
         // to do.  The See the Long Sidebar above.
         //
-        if (entries[i].m_family == AF_INET) {
+        if (entries[i].m_family == qcc::QCC_AF_INET) {
             status = qcc::Bind(sockFd, qcc::IPAddress("0.0.0.0"), MULTICAST_PORT);
             if (status != ER_OK) {
                 QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): bind(0.0.0.0) failed"));
                 qcc::Close(sockFd);
                 continue;
             }
-        }
-
-        if (entries[i].m_family == AF_INET6) {
+        } else if (entries[i].m_family == qcc::QCC_AF_INET6) {
             status = qcc::Bind(sockFd, qcc::IPAddress("::"), MULTICAST_PORT);
             if (status != ER_OK) {
                 QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): bind(::) failed"));
                 qcc::Close(sockFd);
                 continue;
-            }
-        }
-
-        //
-        // Arrange an IGMP join via the appropriate setsockopt. Android
-        // doesn't bother to compile its kernel with CONFIG_IP_MULTICAST set.
-        // This doesn't mean that there is no multicast code in the Android
-        // kernel, it means there is no IGMP code in the kernel.  What this
-        // means to us is that even through we are doing an IP_ADD_MEMBERSHIP
-        // request, which is ultimately an IGMP operation, the request will
-        // filter through the IP code before being ignored and will do useful
-        // things in the kernel even though CONFIG_IP_MULTICAST was not set
-        // for the Android build -- i.e., we have to do it anyway.
-        //
-        if (entries[i].m_flags & IfConfigEntry::MULTICAST) {
-            if (entries[i].m_family == AF_INET) {
-                struct ip_mreq mreq;
-                mreq.imr_multiaddr.s_addr = inet_addr(IPV4_MULTICAST_GROUP);
-                mreq.imr_interface.s_addr = address.GetIPv4AddressNetOrder();
-
-                if (setsockopt(sockFd, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
-                    QCC_LogError(status, (
-                                     "NameService::LazyUpdateInterfaces(): setsockopt(IP_ADD_MEMBERSHIP) failed: %d - %s",
-                                     qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
-                    qcc::Close(sockFd);
-                    continue;
-                }
-            }
-
-            if (entries[i].m_family == AF_INET6) {
-                struct ipv6_mreq mreq;
-                qcc::String mcGroup(IPV6_MULTICAST_GROUP);
-                if (INET_PTON(AF_INET6, mcGroup.c_str(), &mreq.ipv6mr_multiaddr) == 0) {
-                    QCC_LogError(status, ("NameService::LazyUpdateInterfaces(): INET_PTON failed"));
-                    qcc::Close(sockFd);
-                    continue;
-                }
-
-                mreq.ipv6mr_interface = entries[i].m_index;
-
-                if (setsockopt(sockFd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
-                               reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
-                    QCC_LogError(status, (
-                                     "NameService::LazyUpdateInterfaces(): setsockopt(IPV6_ADD_MEMBERSHIP) failed: %d-%s",
-                                     qcc::GetLastError(), qcc::GetLastErrorString().c_str()));
-                    qcc::Close(sockFd);
-                    continue;
-                }
-
             }
         }
 
@@ -1914,18 +1050,19 @@ void NameService::LazyUpdateInterfaces(void)
         live.m_interfaceName = entries[i].m_name;
         live.m_interfaceAddr = entries[i].m_addr;
         live.m_prefixlen = entries[i].m_prefixlen;
-        live.m_address = address;
+        live.m_address = qcc::IPAddress(entries[i].m_addr);
         live.m_flags = entries[i].m_flags;
         live.m_mtu = entries[i].m_mtu;
         live.m_index = entries[i].m_index;
         live.m_sockFd = sockFd;
+        live.m_event = new qcc::Event(sockFd, qcc::Event::IO_READ, false);
         m_liveInterfaces.push_back(live);
     }
 }
 
 QStatus NameService::Locate(const qcc::String& wkn, LocatePolicy policy)
 {
-    QCC_DbgHLPrintf(("NameService::Locate(): %s with policy %d\n", wkn.c_str(), policy));
+    QCC_DbgHLPrintf(("NameService::Locate(): %s with policy %d", wkn.c_str(), policy));
 
     //
     // Send a request to the network over our multicast channel,
@@ -1972,7 +1109,7 @@ void NameService::SetCriticalParameters(
 
 void NameService::SetCallback(Callback<void, const qcc::String&, const qcc::String&, vector<qcc::String>&, uint8_t>* cb)
 {
-    QCC_DbgPrintf(("NameService::SetCallback()\n"));
+    QCC_DbgPrintf(("NameService::SetCallback()"));
 
     delete m_callback;
     m_callback = cb;
@@ -1983,7 +1120,7 @@ QStatus NameService::SetEndpoints(
     const qcc::String& ipv6address,
     uint16_t port)
 {
-    QCC_DbgHLPrintf(("NameService::SetEndpoints(%s, %s, %d)\n", ipv4address.c_str(), ipv6address.c_str(), port));
+    QCC_DbgHLPrintf(("NameService::SetEndpoints(%s, %s, %d)", ipv4address.c_str(), ipv6address.c_str(), port));
 
     m_mutex.Lock();
 
@@ -1992,17 +1129,17 @@ QStatus NameService::SetEndpoints(
     //
     if (ipv4address.size()) {
         if (ipv4address == "0.0.0.0") {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv4 address looks like INADDR_ANY\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv4 address looks like INADDR_ANY"));
             return ER_FAIL;
         }
 
         if (WildcardMatch(ipv4address, "*255") == 0) {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv4 address looks like a broadcast address\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv4 address looks like a broadcast address"));
             return ER_FAIL;
         }
 
         if (WildcardMatch(ipv4address, "127*") == 0) {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv4 address looks like a loopback address\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv4 address looks like a loopback address"));
             return ER_FAIL;
         }
     }
@@ -2012,27 +1149,27 @@ QStatus NameService::SetEndpoints(
     //
     if (ipv6address.size()) {
         if (ipv6address == "0:0:0:0:0:0:0:1") {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like a loopback address\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like a loopback address"));
             return ER_FAIL;
         }
 
         if (ipv6address == "::1") {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like a loopback address\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like a loopback address"));
             return ER_FAIL;
         }
 
         if (ipv6address == "::") {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like in6addr_any\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like in6addr_any"));
             return ER_FAIL;
         }
 
         if (ipv6address == "0::0") {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like in6addr_any\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like in6addr_any"));
             return ER_FAIL;
         }
 
         if (ipv6address == "ff*") {
-            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like a multicast address\n"));
+            QCC_DbgPrintf(("NameService::SetEndpoints(): IPv6 address looks like a multicast address"));
             return ER_FAIL;
         }
     }
@@ -2041,7 +1178,7 @@ QStatus NameService::SetEndpoints(
     // You must provide a reasonable port.
     //
     if (port == 0) {
-        QCC_DbgPrintf(("NameService::SetEndpoints(): Must provide non-zero port\n"));
+        QCC_DbgPrintf(("NameService::SetEndpoints(): Must provide non-zero port"));
         return ER_FAIL;
     }
 
@@ -2061,7 +1198,7 @@ QStatus NameService::GetEndpoints(
     qcc::String& ipv6address,
     uint16_t& port)
 {
-    QCC_DbgHLPrintf(("NameService::GetEndpoints(%s, %s, %d)\n", ipv4address.c_str(), ipv6address.c_str(), port));
+    QCC_DbgHLPrintf(("NameService::GetEndpoints(%s, %s, %d)", ipv4address.c_str(), ipv6address.c_str(), port));
 
     m_mutex.Lock();
     ipv4address = m_ipv4address;
@@ -2074,7 +1211,7 @@ QStatus NameService::GetEndpoints(
 
 QStatus NameService::Advertise(const qcc::String& wkn)
 {
-    QCC_DbgHLPrintf(("NameService::Advertise(): %s\n", wkn.c_str()));
+    QCC_DbgHLPrintf(("NameService::Advertise(): %s", wkn.c_str()));
 
     vector<qcc::String> wknVector;
     wknVector.push_back(wkn);
@@ -2084,10 +1221,10 @@ QStatus NameService::Advertise(const qcc::String& wkn)
 
 QStatus NameService::Advertise(vector<qcc::String>& wkn)
 {
-    QCC_DbgHLPrintf(("NameService::Advertise()\n"));
+    QCC_DbgHLPrintf(("NameService::Advertise()"));
 
     if (m_state != IMPL_RUNNING) {
-        QCC_DbgPrintf(("NameService::Advertise(): Not IMPL_RUNNING\n"));
+        QCC_DbgPrintf(("NameService::Advertise(): Not IMPL_RUNNING"));
         return ER_FAIL;
     }
 
@@ -2096,7 +1233,7 @@ QStatus NameService::Advertise(vector<qcc::String>& wkn)
     // be if they are not set, but we absolutely need a port.
     //
     if (m_port == 0) {
-        QCC_DbgPrintf(("NameService::Advertise(): Port not set\n"));
+        QCC_DbgPrintf(("NameService::Advertise(): Port not set"));
         return ER_FAIL;
     }
 
@@ -2120,7 +1257,7 @@ QStatus NameService::Advertise(vector<qcc::String>& wkn)
             //
             // Nothing has changed, so don't bother.
             //
-            QCC_DbgPrintf(("NameService::Advertise(): Duplicate advertisement\n"));
+            QCC_DbgPrintf(("NameService::Advertise(): Duplicate advertisement"));
             m_mutex.Unlock();
             return ER_OK;
         }
@@ -2197,7 +1334,7 @@ QStatus NameService::Advertise(vector<qcc::String>& wkn)
 
 QStatus NameService::Cancel(const qcc::String& wkn)
 {
-    QCC_DbgPrintf(("NameService::Cancel(): %s\n", wkn.c_str()));
+    QCC_DbgPrintf(("NameService::Cancel(): %s", wkn.c_str()));
 
     vector<qcc::String> wknVector;
     wknVector.push_back(wkn);
@@ -2207,10 +1344,10 @@ QStatus NameService::Cancel(const qcc::String& wkn)
 
 QStatus NameService::Cancel(vector<qcc::String>& wkn)
 {
-    QCC_DbgPrintf(("NameService::Cancel()\n"));
+    QCC_DbgPrintf(("NameService::Cancel()"));
 
     if (m_state != IMPL_RUNNING) {
-        QCC_DbgPrintf(("NameService::Advertise(): Not IMPL_RUNNING\n"));
+        QCC_DbgPrintf(("NameService::Advertise(): Not IMPL_RUNNING"));
         return ER_FAIL;
     }
 
@@ -2219,7 +1356,7 @@ QStatus NameService::Cancel(vector<qcc::String>& wkn)
     // be if they are not set, but we absolutely need a port.
     //
     if (m_port == 0) {
-        QCC_DbgPrintf(("NameService::Advertise(): Port not set\n"));
+        QCC_DbgPrintf(("NameService::Advertise(): Port not set"));
         return ER_FAIL;
     }
 
@@ -2322,7 +1459,7 @@ QStatus NameService::Cancel(vector<qcc::String>& wkn)
 
 void NameService::QueueProtocolMessage(Header& header)
 {
-    QCC_DbgPrintf(("NameService::QueueProtocolMessage()\n"));
+    QCC_DbgPrintf(("NameService::QueueProtocolMessage()"));
     m_mutex.Lock();
     m_outbound.push_back(header);
     m_wakeEvent.SetEvent();
@@ -2424,7 +1561,7 @@ void NameService::SendProtocolMessage(
     bool sockFdIsIPv4,
     Header& header)
 {
-    QCC_DbgHLPrintf(("NameService::SendProtocolMessage()\n"));
+    QCC_DbgHLPrintf(("NameService::SendProtocolMessage()"));
 
     //
     // Legacy 802.11 MACs do not do backoff and retransmission of packets
@@ -2467,12 +1604,12 @@ void NameService::SendProtocolMessage(
         // If the underlying interface told us that it suported multicast, send
         // the packet out on our IPv4 multicast group.
         //
-        if (flags & IfConfigEntry::MULTICAST) {
-            QCC_DbgPrintf(("NameService::SendProtocolMessage():  Sending to IPv4 multicast group\n"));
+        if (flags & qcc::IfConfigEntry::MULTICAST) {
+            QCC_DbgPrintf(("NameService::SendProtocolMessage():  Sending to IPv4 multicast group"));
             qcc::IPAddress ipv4Multicast(IPV4_MULTICAST_GROUP);
             QStatus status = qcc::SendTo(sockFd, ipv4Multicast, MULTICAST_PORT, buffer, size, sent);
             if (status != ER_OK) {
-                QCC_LogError(ER_FAIL, ("NameService::SendProtocolMessage():  Error sending to IPv4 (multicast)\n"));
+                QCC_LogError(ER_FAIL, ("NameService::SendProtocolMessage():  Error sending to IPv4 (multicast)"));
             }
         }
 
@@ -2493,7 +1630,7 @@ void NameService::SendProtocolMessage(
             // have to form a subnet directed broadcast.  To do this we need
             // the IP address and netmask.
             //
-            QCC_DbgPrintf(("NameService::SendProtocolMessage():  InterfaceAddress %s, prefix %d\n",
+            QCC_DbgPrintf(("NameService::SendProtocolMessage():  InterfaceAddress %s, prefix %d",
                            interfaceAddress.ToString().c_str(), interfaceAddressPrefixLen));
 
             //
@@ -2513,23 +1650,23 @@ void NameService::SendProtocolMessage(
             //
             uint32_t addr = (interfaceAddress.GetIPv4AddressCPUOrder() & mask) | ~mask;
             qcc::IPAddress ipv4Broadcast(addr);
-            QCC_DbgPrintf(("NameService::SendProtocolMessage():  Sending to subnet directed broadcast address %s\n",
+            QCC_DbgPrintf(("NameService::SendProtocolMessage():  Sending to subnet directed broadcast address %s",
                            ipv4Broadcast.ToString().c_str()));
 
             QStatus status = qcc::SendTo(sockFd, ipv4Broadcast, BROADCAST_PORT, buffer, size, sent);
             if (status != ER_OK) {
-                QCC_LogError(ER_FAIL, ("NameService::SendProtocolMessage():  Error sending to IPv4 (broadcast)\n"));
+                QCC_LogError(ER_FAIL, ("NameService::SendProtocolMessage():  Error sending to IPv4 (broadcast)"));
             }
         } else {
-            QCC_DbgPrintf(("NameService::SendProtocolMessage():  subnet directed broadcasts are disabled\n"));
+            QCC_DbgPrintf(("NameService::SendProtocolMessage():  subnet directed broadcasts are disabled"));
         }
     } else {
-        if (flags & IfConfigEntry::MULTICAST) {
-            QCC_DbgPrintf(("NameService::SendProtocolMessage():  Sending to IPv6 multicast\n"));
+        if (flags & qcc::IfConfigEntry::MULTICAST) {
+            QCC_DbgPrintf(("NameService::SendProtocolMessage():  Sending to IPv6 multicast"));
             qcc::IPAddress ipv6(IPV6_MULTICAST_GROUP);
             QStatus status = qcc::SendTo(sockFd, ipv6, MULTICAST_PORT, buffer, size, sent);
             if (status != ER_OK) {
-                QCC_LogError(ER_FAIL, ("NameService::SendProtocolMessage():  Error sending to IPv6\n"));
+                QCC_LogError(ER_FAIL, ("NameService::SendProtocolMessage():  Error sending to IPv6"));
             }
         }
     }
@@ -2539,7 +1676,7 @@ void NameService::SendProtocolMessage(
 
 void* NameService::Run(void* arg)
 {
-    QCC_DbgPrintf(("NameService::Run()\n"));
+    QCC_DbgPrintf(("NameService::Run()"));
 
     //
     // This method is executed by the name service main thread and becomes the
@@ -2761,13 +1898,13 @@ void* NameService::Run(void* arg)
         checkEvents.push_back(&m_wakeEvent);
 
         //
-        // We also need to wait on all of the sockets that correspond to the
-        // "live" interfaces we need to listen for inbound multicast messages
-        // on.
+        // We also need to wait on events from all of the sockets that
+        // correspond to the "live" interfaces we need to listen for inbound
+        // multicast messages on.
         //
         for (uint32_t i = 0; i < m_liveInterfaces.size(); ++i) {
             if (m_liveInterfaces[i].m_sockFd != -1) {
-                checkEvents.push_back(new qcc::Event(m_liveInterfaces[i].m_sockFd, qcc::Event::IO_READ, false));
+                checkEvents.push_back(m_liveInterfaces[i].m_event);
             }
         }
 
@@ -2793,14 +1930,14 @@ void* NameService::Run(void* arg)
         //
         for (vector<qcc::Event*>::iterator i = signaledEvents.begin(); i != signaledEvents.end(); ++i) {
             if (*i == &stopEvent) {
-                QCC_DbgPrintf(("NameService::Run(): Stop event fired\n"));
+                QCC_DbgPrintf(("NameService::Run(): Stop event fired"));
                 //
                 // We heard the stop event, so reset it.  We'll pop out of the
                 // server loop when we run through it again (above).
                 //
                 stopEvent.ResetEvent();
             } else if (*i == &timerEvent) {
-                // QCC_DbgPrintf(("NameService::Run(): Timer event fired\n"));
+                // QCC_DbgPrintf(("NameService::Run(): Timer event fired"));
                 //
                 // This is an event that fires every second to give us a chance
                 // to do any protocol maintenance, like retransmitting queued
@@ -2808,7 +1945,7 @@ void* NameService::Run(void* arg)
                 //
                 DoPeriodicMaintenance();
             } else if (*i == &m_wakeEvent) {
-                QCC_DbgPrintf(("NameService::Run(): Wake event fired\n"));
+                QCC_DbgPrintf(("NameService::Run(): Wake event fired"));
                 //
                 // This is an event that fires whenever a message has been
                 // queued on the outbound name service message queue.  We
@@ -2818,13 +1955,13 @@ void* NameService::Run(void* arg)
                 //
                 m_wakeEvent.ResetEvent();
             } else {
-                QCC_DbgPrintf(("NameService::Run(): Socket event fired\n"));
+                QCC_DbgPrintf(("NameService::Run(): Socket event fired"));
                 //
                 // This must be activity on one of our multicast listener sockets.
                 //
                 qcc::SocketFd sockFd = (*i)->GetFD();
 
-                QCC_DbgPrintf(("NameService::Run(): Call qcc::RecvFrom()\n"));
+                QCC_DbgPrintf(("NameService::Run(): Call qcc::RecvFrom()"));
 
                 qcc::IPAddress address;
                 uint16_t port;
@@ -2836,8 +1973,8 @@ void* NameService::Run(void* arg)
                     // We have a RecvFrom error.  We want to avoid states where
                     // we get repeated read errors and just end up in an
                     // infinite loop getting errors sucking up all available
-                    // CPU, so we make sure we sleep for a short time after
-                    // detecting the error.
+                    // CPU, so we make sure we sleep for at least a short time
+                    // after detecting the error.
                     //
                     // Our basic strategy is to hope that this is a transient
                     // error, or one that will be recovered at the next lazy
@@ -2846,8 +1983,18 @@ void* NameService::Run(void* arg)
                     // the worst that can happen is that we introduce a short
                     // delay here in our handler whenever we detect an error.
                     //
+                    // Although this could happen for any number of reasons, it
+                    // typically happens due to a confusion in the Windows event
+                    // code between the read and write side events in a socket.
+                    // The result is that we get an event from the write side
+                    // that wakes us up here on the read side.  When we call
+                    // RecvFrom, we then get back an ER_WOULDBLOCK since there's
+                    // really no data waiting to be read.  There is nothing we
+                    // can do about it here, so we just deal with the
+                    // possibility.
+                    //
                     QCC_LogError(status, ("NameService::Run(): qcc::RecvFrom(): Failed"));
-                    qcc::Sleep(50);
+                    qcc::Sleep(1);
                     continue;
                 }
 
@@ -2855,15 +2002,6 @@ void* NameService::Run(void* arg)
                 // We got a message over the multicast channel.  Deal with it.
                 //
                 HandleProtocolMessage(buffer, nbytes, address);
-            }
-        }
-
-        //
-        // Delete the checkEvents we created above
-        //
-        for (uint32_t i = 0; i < checkEvents.size(); ++i) {
-            if (checkEvents[i] != &stopEvent && checkEvents[i] != &timerEvent && checkEvents[i] != &m_wakeEvent) {
-                delete checkEvents[i];
             }
         }
     }
@@ -2922,13 +2060,13 @@ void NameService::Retry(void)
 
 void NameService::Retransmit(void)
 {
-    QCC_DbgPrintf(("NameService::Retransmit()\n"));
+    QCC_DbgPrintf(("NameService::Retransmit()"));
 
     //
     // We need a valid port before we send something out to the local subnet.
     //
     if (m_port == 0) {
-        QCC_DbgPrintf(("NameService::Retransmit(): Port not set\n"));
+        QCC_DbgPrintf(("NameService::Retransmit(): Port not set"));
         return;
     }
 
@@ -3004,7 +2142,7 @@ void NameService::DoPeriodicMaintenance(void)
     if (m_timer) {
         --m_timer;
         if (m_timer == m_tRetransmit) {
-            QCC_DbgPrintf(("NameService::DoPeriodicMaintenance(): Retransmit()\n"));
+            QCC_DbgPrintf(("NameService::DoPeriodicMaintenance(): Retransmit()"));
             Retransmit();
             m_timer = m_tDuration;
         }
@@ -3015,7 +2153,7 @@ void NameService::DoPeriodicMaintenance(void)
 
 void NameService::HandleProtocolQuestion(WhoHas whoHas, qcc::IPAddress address)
 {
-    QCC_DbgHLPrintf(("NameService::HandleProtocolQuestion()\n"));
+    QCC_DbgHLPrintf(("NameService::HandleProtocolQuestion()"));
 
     //
     // There are at least two threads wandering through the advertised list.
@@ -3051,7 +2189,7 @@ void NameService::HandleProtocolQuestion(WhoHas whoHas, qcc::IPAddress address)
             // allow wildcards there.
             //
             if (WildcardMatch((*j), wkn)) {
-                QCC_DbgHLPrintf(("NameService::HandleProtocolQuestion(): request for %s does not match my %s\n",
+                QCC_DbgHLPrintf(("NameService::HandleProtocolQuestion(): request for %s does not match my %s",
                                  wkn.c_str(), (*j).c_str()));
                 continue;
             } else {
@@ -3082,7 +2220,7 @@ void NameService::HandleProtocolQuestion(WhoHas whoHas, qcc::IPAddress address)
 
 void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress address)
 {
-    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer()\n"));
+    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer()"));
 
     //
     // If there are no callbacks we can't tell the user anything about what is
@@ -3090,14 +2228,14 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
     //
 
     if (m_callback == 0) {
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): No callback, so nothing to do\n"));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): No callback, so nothing to do"));
         return;
     }
 
     vector<qcc::String> wkn;
 
     for (uint8_t i = 0; i < isAt.GetNumberNames(); ++i) {
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got well-known name %s\n", isAt.GetName(i).c_str()));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got well-known name %s", isAt.GetName(i).c_str()));
         wkn.push_back(isAt.GetName(i));
     }
 
@@ -3108,7 +2246,7 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
     sort(wkn.begin(), wkn.end());
 
     qcc::String guid = isAt.GetGuid();
-    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got GUID %s\n", guid.c_str()));
+    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got GUID %s", guid.c_str()));
 
     //
     // We always get an address since we got the message over a call to
@@ -3127,20 +2265,20 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
     qcc::String recvfromAddress, ipv4address, ipv6address;
 
     recvfromAddress = address.ToString();
-    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got IP %s from protocol\n", recvfromAddress.c_str()));
+    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got IP %s from protocol", recvfromAddress.c_str()));
 
     if (isAt.GetIPv4Flag()) {
         ipv4address = isAt.GetIPv4();
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got IPv4 %s from message\n", ipv4address.c_str()));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got IPv4 %s from message", ipv4address.c_str()));
     }
 
     if (isAt.GetIPv6Flag()) {
         ipv6address = isAt.GetIPv6();
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got IPv6 %s from message\n", ipv6address.c_str()));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got IPv6 %s from message", ipv6address.c_str()));
     }
 
     uint16_t port = isAt.GetPort();
-    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got port %d from message\n", port));
+    QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Got port %d from message", port));
 
     //
     // The longest bus address we can generate is going to be the larger
@@ -3160,7 +2298,7 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
     //
     if ((address.IsIPv4() && !ipv4address.size()) || (address.IsIPv6() && !ipv6address.size())) {
         snprintf(addrbuf, sizeof(addrbuf), "tcp:addr=%s,port=%d", recvfromAddress.c_str(), port);
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Calling back with %s\n", addrbuf));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Calling back with %s", addrbuf));
         qcc::String busAddress(addrbuf);
 
         if (m_callback) {
@@ -3173,7 +2311,7 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
     //
     if (ipv4address.size()) {
         snprintf(addrbuf, sizeof(addrbuf), "tcp:addr=%s,port=%d", ipv4address.c_str(), port);
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Calling back with %s\n", addrbuf));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Calling back with %s", addrbuf));
         qcc::String busAddress(addrbuf);
 
         if (m_callback) {
@@ -3186,7 +2324,7 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
     //
     if (ipv6address.size()) {
         snprintf(addrbuf, sizeof(addrbuf), "tcp:addr=%s,port=%d", ipv6address.c_str(), port);
-        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Calling back with %s\n", addrbuf));
+        QCC_DbgHLPrintf(("NameService::HandleProtocolAnswer(): Calling back with %s", addrbuf));
         qcc::String busAddress(addrbuf);
 
         if (m_callback) {
@@ -3197,7 +2335,7 @@ void NameService::HandleProtocolAnswer(IsAt isAt, uint32_t timer, qcc::IPAddress
 
 void NameService::HandleProtocolMessage(uint8_t const* buffer, uint32_t nbytes, qcc::IPAddress address)
 {
-    QCC_DbgHLPrintf(("NameService::HandleProtocolMessage(0x%x, %d, %s)\n", buffer, nbytes, address.ToString().c_str()));
+    QCC_DbgHLPrintf(("NameService::HandleProtocolMessage(0x%x, %d, %s)", buffer, nbytes, address.ToString().c_str()));
 
 #if HAPPY_WANDERER
     if (Wander() == false) {
@@ -3211,7 +2349,7 @@ void NameService::HandleProtocolMessage(uint8_t const* buffer, uint32_t nbytes, 
     Header header;
     size_t bytesRead = header.Deserialize(buffer, nbytes);
     if (bytesRead != nbytes) {
-        QCC_DbgPrintf(("NameService::HandleProtocolMessage(): Deserialize(): Error\n"));
+        QCC_DbgPrintf(("NameService::HandleProtocolMessage(): Deserialize(): Error"));
         return;
     }
 
@@ -3219,7 +2357,7 @@ void NameService::HandleProtocolMessage(uint8_t const* buffer, uint32_t nbytes, 
     // We only understand version zero packets for now.
     //
     if (header.GetVersion() != 0) {
-        QCC_DbgPrintf(("NameService::HandleProtocolMessage(): Unknown version: Error\n"));
+        QCC_DbgPrintf(("NameService::HandleProtocolMessage(): Unknown version: Error"));
         return;
     }
 

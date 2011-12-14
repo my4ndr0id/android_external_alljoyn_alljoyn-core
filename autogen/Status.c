@@ -36,6 +36,7 @@ const char* QCC_StatusText(QStatus status)
         CASE(ER_END_OF_DATA);
         CASE(ER_CONN_REFUSED);
         CASE(ER_BAD_ARG_COUNT);
+        CASE(ER_WARNING);
         CASE(ER_COMMON_ERRORS);
         CASE(ER_STOPPING_THREAD);
         CASE(ER_ALERTED_THREAD);
@@ -221,6 +222,7 @@ const char* QCC_StatusText(QStatus status)
         CASE(ER_ALLJOYN_ACCESS_PERMISSION_WARNING);
         CASE(ER_ALLJOYN_ACCESS_PERMISSION_ERROR);
         CASE(ER_BUS_DESTINATION_NOT_AUTHENTICATED);
+        CASE(ER_BUS_ENDPOINT_REDIRECTED);
     default:
         return "<unknown>";
     }

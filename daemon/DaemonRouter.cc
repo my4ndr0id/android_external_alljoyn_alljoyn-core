@@ -108,6 +108,7 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
     NormalizedMsgHdr nmh(msg, policydb);
     BusEndpoint* sender = &origSender;
     bool replyExpected = (msg->GetType() == MESSAGE_METHOD_CALL) && ((msg->GetFlags() & ALLJOYN_FLAG_NO_REPLY_EXPECTED) == 0);
+    std::set<BusEndpoint*> sentdestinations;  /**< Collection of bus endpoints to whom we have already sent a message */
 
     const char* destination = msg->GetDestination();
     SessionId sessionId = msg->GetSessionId();
@@ -185,13 +186,9 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                         msg->ErrorMsg(msg, "org.alljoyn.Bus.Blocked", "Method reply would be blocked because caller does not allow remote messages");
                         PushMessage(msg, *localEndpoint);
                     } else {
-                        if (destEndpoint == localEndpoint) {
-                            nameTable.Unlock();
-                            status = SendThroughEndpoint(msg, *destEndpoint, sessionId);
-                            nameTable.Lock();
-                        } else {
-                            status = SendThroughEndpoint(msg, *destEndpoint, sessionId);
-                        }
+                        nameTable.Unlock();
+                        status = SendThroughEndpoint(msg, *destEndpoint, sessionId);
+                        nameTable.Lock();
                     }
                 } else {
                     QCC_DbgPrintf(("Blocking message from %s to %s (serial=%d) because receiver does not allow remote messages",
@@ -208,6 +205,8 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                 }
                 if ((ER_OK != status) && (ER_BUS_ENDPOINT_CLOSING != status)) {
                     QCC_LogError(status, ("BusEndpoint::PushMessage failed"));
+                } else {
+                    sentdestinations.insert(destEndpoint);
                 }
             }
             nameTable.Unlock();
@@ -272,15 +271,28 @@ QStatus DaemonRouter::PushMessage(Message& msg, BusEndpoint& origSender)
                                                (msg->GetType() == MESSAGE_METHOD_RET ? "method reply" : "error reply"))),
                                              msg->GetSender()));
                 }
+                BusEndpoint* ep = it->first;
                 if (allow) {
+                    /* Check to see if we have already sent signal/message to this endpoint.
+                       This prevents sending the signal to endpoint twice if eavesdropping is enabled
+                     */
+                    bool alreadysent = false;
+                    set<BusEndpoint*>::const_iterator sdit = sentdestinations.find(dest);
+                    if (sdit != sentdestinations.end()) {
+                        alreadysent = true;
+                    }
                     // Broadcast status must not trump directed message
                     // status, especially for eavesdropped messages.
-                    if (policydb->EavesdropEnabled() || !((sender->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_BUS2BUS) && !dest->AllowRemoteMessages())) {
+                    if (!alreadysent && (policydb->EavesdropEnabled() || !((sender->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_BUS2BUS) && !dest->AllowRemoteMessages()))) {
+                        ruleTable.Unlock();
+                        nameTable.Unlock();
                         QStatus tStatus = SendThroughEndpoint(msg, *dest, sessionId);
                         status = (status == ER_OK) ? tStatus : status;
+                        nameTable.Lock();
+                        ruleTable.Lock();
                     }
                 }
-                ruleTable.AdvanceToNextEndpoint(it);
+                it = ruleTable.AdvanceToNextEndpoint(ep);
             } else {
                 ++it;
             }

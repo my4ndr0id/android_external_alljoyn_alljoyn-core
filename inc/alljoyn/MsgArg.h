@@ -181,12 +181,13 @@ typedef struct {
  * Type for a handle. An handle is an abstraction of a platform-specific socket or file descriptor.
  *
  * @note Handles associated with in a message received by the application will be closed when the
- * message destructor is called. If the application code needs to continue using the handle the
- * handle must be duplicated by calling qcc:SocketDup() or the appropriate platform-specific APIs.
- * Handles that are passed in when creating a message to be sent are duplicated internally and can
- * be closed by the caller after the message has been created. Handles that have been duplicated
- * using qcc::SocketDup() must be closed by calling qcc::Close(). Handles duplicated by calling a
- * native platform "dup" API must be closed using the native "close" API.
+ * message destructor is called or when a method call is converted into a method reply. If the
+ * application code needs to continue using the handle the handle must be duplicated by calling
+ * qcc:SocketDup() or the appropriate platform-specific APIs.  Handles that are passed in when
+ * creating a message to be sent are duplicated internally and can be closed by the caller after the
+ * message has been created. Handles that have been duplicated using qcc::SocketDup() must be closed
+ * by calling qcc::Close(). Handles duplicated by calling a native platform "dup" API must be closed
+ * using the native "close" API.
  */
 typedef struct {
     qcc::SocketFd fd;          /**< A platform-specific socket file descriptor */
@@ -440,9 +441,9 @@ class MsgArg {
      *
      * @param args     An array of MsgArgs to set.
      * @param numArgs  [in,out] On input the size of the args array. On output the number of MsgArgs
-     *                 that were set. There must be at least enought MsgArgs to completely
+     *                 that were set. There must be at least enough MsgArgs to completely
      *                 initialize the signature.
-     *                 there should at least enough.
+     *
      * @param signature   The signature for MsgArg values
      * @param ...         One or more values to initialize the MsgArg list.
      *
@@ -461,7 +462,7 @@ class MsgArg {
      *
      *  - @c 'a'  A pointer to a length of type size_t that returns the number of elements in the array followed by:
      *            - If the element type is a scalar type a pointer to a pointer of the correct type for the values.
-     *            - Othewise a pointer to a pointer to a MsgArg.
+     *            - Otherwise a pointer to a pointer to a MsgArg.
      *
      *  - @c 'b'  A pointer to a bool
      *  - @c 'd'  A pointer to a double (64 bits)
@@ -475,7 +476,7 @@ class MsgArg {
      *  - @c 't'  A pointer to a uint64_t
      *  - @c 'u'  A pointer to a uint32_t
      *  - @c 'v'  A pointer to a pointer to a MsgArg, matches to a variant but returns a pointer to
-     *            the MsgArg of the undlerying real type.
+     *            the MsgArg of the underlying real type.
      *  - @c 'x'  A pointer to an int64_t
      *  - @c 'y'  A pointer to a uint8_t
      *
@@ -554,7 +555,7 @@ class MsgArg {
      *
      * @param args       An array of MsgArgs to unpack.
      * @param numArgs    The size of the MsgArgs array.
-     * @param signature  The signature to match agains the MsgArg values
+     * @param signature  The signature to match against the MsgArg values
      * @param ...         Pointers to return references to the unpacked values.
      *
      * @return

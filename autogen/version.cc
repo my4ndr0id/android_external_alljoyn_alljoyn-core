@@ -24,12 +24,12 @@
 
 static const char product[] = "Alljoyn Library";
 static const unsigned int architecture = 2;
-static const unsigned int apiLevel = 2;
+static const unsigned int apiLevel = 3;
 static const unsigned int release = 0;
 
 
-static const char version[] = "v2.2.0";
-static const char build[] = "Alljoyn Library v2.2.0 (Built Tue Nov 22 02:31:27 UTC 2011 on sea-ajnu1010-a by seabuild - Git branch: '(no branch)' tag: 'R02.02.00c4' (+0 changes) commit ref: 7165ada378b3e618c938a2a9a4fc98b77c4d5d65)";
+static const char version[] = "v2.3.0";
+static const char build[] = "Alljoyn Library v2.3.0 (Built Fri Dec 09 23:03:25 UTC 2011 on sea-ajnu1010-a by seabuild - Git branch: '(no branch)' tag: 'R02.03.00c3' (+0 changes) commit ref: 312b10b0f10b1f3bd65ae0ff2f527c304a95a2f9)";
 
 const char * ajn::GetVersion()
 {
