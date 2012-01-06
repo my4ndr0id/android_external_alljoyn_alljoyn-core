@@ -148,6 +148,7 @@ LOCAL_SRC_FILES := \
 	daemon/RuleTable.cc \
 	daemon/DaemonUnixTransport.cc \
 	daemon/NameService.cc \
+	daemon/bt_bluez/AdapterObject.cc \
 	daemon/bt_bluez/BlueZUtils.cc \
 	daemon/bt_bluez/BlueZIfc.cc \
 	daemon/bt_bluez/BTAccessor.cc \

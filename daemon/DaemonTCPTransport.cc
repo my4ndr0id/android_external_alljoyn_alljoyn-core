@@ -297,7 +297,11 @@ void DaemonTCPTransport::Authenticated(DaemonTCPEndpoint* conn)
 
 QStatus DaemonTCPTransport::Start()
 {
-    QCC_DbgTrace(("DaemonTCPTransport::Start()"));
+    /* TODO - need to read these values from the configuration file */
+    const bool enableIPv4 = true;
+    const bool enableIPv6 = true;
+
+    QCC_DbgTrace(("DaemonTCPTransport::Start() ipv4=%s ipv6=%s", enableIPv4 ? "true" : "false", enableIPv6 ? "true" : "false"));
 
     /*
      * We rely on the status of the server accept thead as the primary
@@ -364,7 +368,8 @@ QStatus DaemonTCPTransport::Start()
      * ID of the daemon.
      */
     qcc::String guidStr = m_bus.GetInternal().GetGlobalGUID().ToString();
-    QStatus status = m_ns->Init(guidStr, true, true, disable);
+
+    QStatus status = m_ns->Init(guidStr, enableIPv4, enableIPv6, disable);
     if (status != ER_OK) {
         QCC_LogError(status, ("DaemonTCPTransport::Start(): Error starting name service"));
         return status;
@@ -693,6 +698,14 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
                      * must be a TCP transport, and we have an IP address
                      * already in a string, so we can easily put together the
                      * desired busAddr.
+                     */
+                    QCC_DbgTrace(("DaemonTCPTransport::GetListenAddresses(): %s match found", entries[i].m_name.c_str()));
+                    /*
+                     * We know we have an interface that speaks IP and
+                     * which has an IP address we can pass back. We know
+                     * it is capable of receiving incoming connections, but
+                     * the $64,000 questions are, does it have a listener
+                     * and what port is that listener listening on.
                      *
                      * Currently, however, the daemon can't handle IPv6
                      * addresses, so we filter them out and only let IPv4
@@ -728,6 +741,8 @@ QStatus DaemonTCPTransport::GetListenAddresses(const SessionOpts& opts, std::vec
                          * implies that DaemonTCPTransport::StartListen hasn't
                          * been called and there is no listener for this transport.
                          * We should only return an address if we have a listener.
+                         * Now put this information together into a bus address
+                         * that the rest of the AllJoyn world can understand.
                          */
                         if (port) {
                             /*
@@ -1035,7 +1050,8 @@ void* DaemonTCPTransport::Run(void* arg)
  * for TCP connections on any interfaces that are currently up or any that may
  * come up in the future.
  */
-static const char* ADDR_DEFAULT = "0.0.0.0";
+static const char* ADDR4_DEFAULT = "0.0.0.0";
+static const char* ADDR6_DEFAULT = "0::0";
 
 /*
  * The default port for use in listen specs.  This port is used by the TCP
@@ -1049,6 +1065,8 @@ static const uint16_t PORT_DEFAULT = 9955;
 
 QStatus DaemonTCPTransport::NormalizeListenSpec(const char* inSpec, qcc::String& outSpec, map<qcc::String, qcc::String>& argMap) const
 {
+    qcc::String family;
+
     /*
      * We don't make any calls that require us to be in any particular state
      * with respect to threading so we don't bother to call IsRunning() here.
@@ -1061,11 +1079,21 @@ QStatus DaemonTCPTransport::NormalizeListenSpec(const char* inSpec, qcc::String&
     if (status != ER_OK) {
         return status;
     }
+    /*
+     * If the family was specified we will check that address matches otherwise
+     * we will figure out the family from the address format.
+     */
+    map<qcc::String, qcc::String>::iterator iter = argMap.find("family");
+    if (iter != argMap.end()) {
+        family = iter->second;
+    }
 
-    map<qcc::String, qcc::String>::iterator i = argMap.find("addr");
-    if (i == argMap.end()) {
-        qcc::IPAddress addr(ADDR_DEFAULT);
-        qcc::String addrString = addr.ToString();
+    iter = argMap.find("addr");
+    if (iter == argMap.end()) {
+        if (family.empty()) {
+            family = "ipv4";
+        }
+        qcc::String addrString = (family == "ipv6") ? ADDR6_DEFAULT : ADDR4_DEFAULT;
         argMap["addr"] = addrString;
         outSpec = "tcp:addr=" + addrString;
     } else {
@@ -1074,17 +1102,25 @@ QStatus DaemonTCPTransport::NormalizeListenSpec(const char* inSpec, qcc::String&
          * a conversion function to make sure it's a valid value.
          */
         IPAddress addr;
-        status = addr.SetAddress(i->second);
+        status = addr.SetAddress(iter->second, false);
         if (status == ER_OK) {
-            i->second = addr.ToString();
-            outSpec = "tcp:addr=" + i->second;
+            if (family.empty()) {
+                family = addr.IsIPv6() ? "ipv6" : "ipv4";
+            } else if (addr.IsIPv6() != (family == "ipv6")) {
+                return ER_BUS_BAD_TRANSPORT_ARGS;
+            }
+            // Normalize address representation
+            iter->second = addr.ToString();
+            outSpec = "tcp:addr=" + iter->second;
         } else {
             return ER_BUS_BAD_TRANSPORT_ARGS;
         }
     }
+    argMap["family"] = family;
+    outSpec += ",family=" + family;
 
-    i = argMap.find("port");
-    if (i == argMap.end()) {
+    iter = argMap.find("port");
+    if (iter == argMap.end()) {
         qcc::String portString = U32ToString(PORT_DEFAULT);
         argMap["port"] = portString;
         outSpec += ",port=" + portString;
@@ -1093,10 +1129,10 @@ QStatus DaemonTCPTransport::NormalizeListenSpec(const char* inSpec, qcc::String&
          * We have a value associated with the "port" key.  Run it through
          * a conversion function to make sure it's a valid value.
          */
-        uint32_t port = StringToU32(i->second);
+        uint32_t port = StringToU32(iter->second);
         if (port > 0 && port <= 0xffff) {
-            i->second = U32ToString(port);
-            outSpec += ",port=" + i->second;
+            iter->second = U32ToString(port);
+            outSpec += ",port=" + iter->second;
         } else {
             return ER_BUS_BAD_TRANSPORT_ARGS;
         }
@@ -1126,7 +1162,7 @@ QStatus DaemonTCPTransport::NormalizeTransportSpec(const char* inSpec, qcc::Stri
      */
     map<qcc::String, qcc::String>::iterator i = argMap.find("addr");
     assert(i != argMap.end());
-    if (i->second == ADDR_DEFAULT) {
+    if ((i->second == ADDR4_DEFAULT) || (i->second == ADDR6_DEFAULT)) {
         return ER_BUS_BAD_TRANSPORT_ARGS;
     }
 
@@ -1179,9 +1215,12 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, const SessionOpts& 
         QCC_LogError(status, ("TCPTransport::Connect(): Invalid TCP connect spec \"%s\"", connectSpec));
         return status;
     }
-
-    IPAddress ipAddr(argMap.find("addr")->second); // Guaranteed to be there.
-    uint16_t port = StringToU32(argMap["port"]);   // Guaranteed to be there.
+    /*
+     * These fields (addr, port, family) are all guaranteed to be present
+     */
+    IPAddress ipAddr(argMap.find("addr")->second);
+    uint16_t port = StringToU32(argMap["port"]);
+    qcc::AddressFamily family = argMap["family"] == "ipv6" ?  QCC_AF_INET6 : QCC_AF_INET;
 
     /*
      * The semantics of the Connect method tell us that we want to connect to a
@@ -1214,9 +1253,12 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, const SessionOpts& 
      * match the address provided in the connectSpec.  If so, we are attempting
      * to connect to ourself and we must fail that request.
      */
-    char anyspec[28];
-    snprintf(anyspec, sizeof(anyspec), "tcp:addr=0.0.0.0,port=%d", port & 0xffff);
-
+    char anyspec[40];
+    if (family == QCC_AF_INET) {
+        snprintf(anyspec, sizeof(anyspec), "tcp:addr=0.0.0.0,port=%u,family=ipv4", port);
+    } else {
+        snprintf(anyspec, sizeof(anyspec), "tcp:addr=0::0,port=%u,family=ipv6", port);
+    }
     qcc::String normAnySpec;
     map<qcc::String, qcc::String> normArgMap;
     status = NormalizeListenSpec(anyspec, normAnySpec, normArgMap);
@@ -1302,7 +1344,7 @@ QStatus DaemonTCPTransport::Connect(const char* connectSpec, const SessionOpts& 
      * to connect to the remote TCP address and port specified in the connectSpec.
      */
     SocketFd sockFd = -1;
-    status = Socket(QCC_AF_INET, QCC_SOCK_STREAM, sockFd);
+    status = Socket(family, QCC_SOCK_STREAM, sockFd);
     if (status == ER_OK) {
         /* Turn off Nagle */
         status = SetNagle(sockFd, false);
@@ -1518,14 +1560,14 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
         return status;
     }
 
-    QCC_DbgPrintf(("DaemonTCPTransport::StartListen(): addr = \"%s\", port = \"%s\"",
-                   argMap["addr"].c_str(), argMap["port"].c_str()));
+    QCC_DbgPrintf(("DaemonTCPTransport::StartListen(): addr = \"%s\", port = \"%s\", family=\"%s\"",
+                   argMap["addr"].c_str(), argMap["port"].c_str(), argMap["family"].c_str()));
 
     m_listenFdsLock.Lock(MUTEX_CONTEXT);
 
     /*
      * Check to see if the requested address and port is already being listened
-     * to.  The normalized listen spec is saved to define the instance of the
+     * on. The normalized listen spec is saved to define the instance of the
      * listener.
      */
     for (list<pair<qcc::String, SocketFd> >::iterator i = m_listenFds.begin(); i != m_listenFds.end(); ++i) {
@@ -1534,14 +1576,12 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
             return ER_BUS_ALREADY_LISTENING;
         }
     }
-
     /*
      * Figure out what local address and port the listener should use.
      */
-    IPAddress listenAddr;
-    listenAddr.SetAddress(argMap["addr"]);
+    IPAddress listenAddr(argMap["addr"]);
     uint16_t listenPort = StringToU32(argMap["port"]);
-
+    qcc::AddressFamily family = argMap["family"] == "ipv6" ?  QCC_AF_INET6 : QCC_AF_INET;
     /*
      * Get the configuration item telling us which network interfaces we
      * should run the name service over.  The item can specify an IP address,
@@ -1569,35 +1609,29 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
             currentInterface = interfaces;
             interfaces.clear();
         }
-
         /*
-         * Be careful about just wanging the current interface string into an
-         * IP address to see what it is, since SetAddress() will try to
-         * interpret a string that doesn't work as an IP address as a host name.
-         * This means possibly contacting a domain name server, and going out
-         * to the network which may not have a DNS.  We certainly don't want
-         * that, so we do a crude out-of-band check here.  We assume that an
-         * IPv4 address has at least one "." in it and an IPv6 address has at
-         * least one ':' in it.
+         * If we were given and IP address use it to find the interface names
+         * otherwise use the interface name that was specified. Note we need
+         * to disallow hostnames otherwise SetAddress will attempt to treat
+         * the interface name as a host name and start doing DNS lookups.
          */
-        i = currentInterface.find_first_of(".:");
-        if (i != qcc::String::npos) {
-            IPAddress currentAddress(currentInterface);
+        IPAddress currentAddress;
+        if (currentAddress.SetAddress(currentInterface, false) == ER_OK) {
             status = m_ns->OpenInterface(currentAddress);
         } else {
             status = m_ns->OpenInterface(currentInterface);
         }
-
         if (status != ER_OK) {
             QCC_LogError(status, ("DaemonTCPTransport::StartListen(): OpenInterface() failed for %s", currentInterface.c_str()));
         }
     }
 
     /*
-     * XXX We should enable IPv6 listerners.
+     * Create the TCP listener sockets and set SO_REUSEADDR/SO_REUSEPORT so we don't have
+     * to wait for four minutes to relaunch the daemon if it crashes.
      */
     SocketFd listenFd = -1;
-    status = Socket(QCC_AF_INET, QCC_SOCK_STREAM, listenFd);
+    status = Socket(family, QCC_SOCK_STREAM, listenFd);
     if (status != ER_OK) {
         m_listenFdsLock.Unlock(MUTEX_CONTEXT);
         QCC_LogError(status, ("DaemonTCPTransport::StartListen(): Socket() failed"));
@@ -1632,14 +1666,13 @@ QStatus DaemonTCPTransport::StartListen(const char* listenSpec)
 
         status = qcc::Listen(listenFd, SOMAXCONN);
         if (status == ER_OK) {
-            QCC_DbgPrintf(("DaemonTCPTransport::StartListen(): Listening on %s:%d", argMap["addr"].c_str(), listenPort));
+            QCC_DbgPrintf(("DaemonTCPTransport::StartListen(): Listening on %s/%d", argMap["addr"].c_str(), listenPort));
             m_listenFds.push_back(pair<qcc::String, SocketFd>(normSpec, listenFd));
         } else {
             QCC_LogError(status, ("DaemonTCPTransport::StartListen(): Listen failed"));
         }
     } else {
-        QCC_LogError(status, ("DaemonTCPTransport::StartListen(): Failed to bind to %s:%d", listenAddr.ToString().c_str(),
-                              listenPort));
+        QCC_LogError(status, ("DaemonTCPTransport::StartListen(): Failed to bind to %s/%d", listenAddr.ToString().c_str(), listenPort));
     }
 
 
@@ -1906,7 +1939,6 @@ void DaemonTCPTransport::FoundCallback::Found(const qcc::String& busAddr, const 
      * remote daemons will send keepalive messages that the local daemon will
      * recieve, also via this callback.
      *
-     * Our job here is just to pass the messages on up the stack to the daemon.
      *
      * XXX Currently this transport has no clue how to handle an advertised
      * IPv6 address so we filter them out.  We should support IPv6.

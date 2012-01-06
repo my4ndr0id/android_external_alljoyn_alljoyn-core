@@ -41,41 +41,6 @@ void ConfigL2capMTU(qcc::SocketFd sockFd);
 
 void ConfigL2capMaster(qcc::SocketFd sockFd);
 
-QStatus IsMaster(uint16_t deviceId, const BDAddress& addr, bool& master);
-
-QStatus RequestBTRole(uint16_t deviceId, const BDAddress& addr, bt::BluetoothRole role);
-
-
-/**
- * @param deviceId    The Bluetooth device id
- * @param window      The inquiry window in milliseconds (10 .. 2560)
- * @param interval    The inquiry interval in milliseconds (11 .. 2560)
- * @param interlaced  If true use interlaced inquiry.
- */
-QStatus ConfigureInquiryScan(uint16_t deviceId,
-                             uint16_t window,
-                             uint16_t interval,
-                             bool interlaced,
-                             int8_t txPower);
-
-/**
- * @param deviceId      The Bluetooth device id
- * @param minPeriod     Value in range 2..0xFFFE expressed as multiple of 1.28 seconds
- * @param maxPeriod     Value in range 3..0xFFFF expressed as multiple of 1.28 seconds
- * @param length        Value in range 1..0x30  (0 will turn off periodic inquiry)
- * @param maxResponses  0 means no limit
- */
-QStatus ConfigurePeriodicInquiry(uint16_t deviceId,
-                                 uint16_t minPeriod,
-                                 uint16_t maxPeriod,
-                                 uint8_t length,
-                                 uint8_t maxResponses);
-
-
-QStatus ConfigureSimplePairingDebugMode(uint16_t deviceId, bool enable);
-
-QStatus ConfigureClassOfDevice(uint16_t deviceId, uint32_t cod);
-
 } // namespace bluez
 } // namespace ajn
 

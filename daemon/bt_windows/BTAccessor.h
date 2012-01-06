@@ -71,11 +71,8 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
     {
         isStarted = true;
 
-        // If Bluetooth becomes available later then transport->BTDeviceAvailable(true)
-        // will be called then.
-        if (BluetoothIsAvailable()) {
-            transport->BTDeviceAvailable(true);
-        }
+        // All start and stop tasks are handled by adapterChangeThread.
+        adapterChangeThread.Alert();
 
         return ER_OK;
     }
@@ -86,7 +83,9 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
     void Stop()
     {
         isStarted = false;
-        transport->BTDeviceAvailable(false);
+
+        // All start and stop tasks are handled by adapterChangeThread.
+        adapterChangeThread.Alert();
     }
 
     /**
@@ -198,7 +197,11 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
      * @return  ER_OK if successful; an error will be returned if there is no
      *          connection with the specified device
      */
-    QStatus IsMaster(const BDAddress& addr, bool& master) const;
+    QStatus IsMaster(const BDAddress& addr, bool& master) const
+    {
+        return ER_NOT_IMPLEMENTED;    // Windows doesn't support this.
+    }
+
 
     /**
      * This method forces a role switch in the HCI device so that we become
@@ -207,7 +210,10 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
      * @param addr  Bluetooth device address for the connection of interest
      * @param role  Requested Bluetooth connection role
      */
-    void RequestBTRole(const BDAddress& addr, ajn::bt::BluetoothRole role);
+    void RequestBTRole(const BDAddress& addr, ajn::bt::BluetoothRole role)
+    {
+        // Windows doesn't support this.
+    }
 
     bool IsEIRCapable() const { return false; }
 
@@ -359,16 +365,25 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
     };
 
     /**
+     * Set the Bluetooth radio handle to this new value. The new value may be 0.
+     */
+    void SetRadioHandle(HANDLE newHandle);
+
+    /**
      * This connects to the driver in the kernel and does other initialization when a bluetooth
      * device becomes available.
+     *
+     * @param newRadioHandle The radio handle to use for this connection.
      */
-    QStatus KernelConnect(void);
+    QStatus KernelConnect(HANDLE newRadioHandle);
 
     /**
      * This disconnects from the driver in the kernel and does other cleanup when a bluetooth
      * device becomes unavailable.
+     *
+     * @param radioIsOn True if the bluetooth radio is on and driver should be up and running.
      */
-    void KernelDisconnect(void);
+    void KernelDisconnect(bool radioIsOn);
 
     /**
      * This initializes the array of pointers for the WindowsBTEndpoints to be saved.
@@ -399,16 +414,6 @@ class BTTransport::BTAccessor : public MessageReceiver, public qcc::AlarmListene
      * @return  The endpoint connection to the remote device.
      */
     WindowsBTEndpoint* EndPointsFind(BTH_ADDR address, L2CAP_CHANNEL_HANDLE handle = 0) const;
-
-    /**
-     * This finds a WindowsBTEndpoint associated with the given address. Any endpoint that
-     * matches the address and has a non-NULL handle qualifies as a match.
-     *
-     * @param addr Bluetooth device address for the connection of interest.
-     *
-     * @return  The endpoint connection to the remote device.
-     */
-    WindowsBTEndpoint* EndPointsFindAnyHandle(BTH_ADDR address) const;
 
     /**
      * Initializes the circular queue for incoming connection requests.

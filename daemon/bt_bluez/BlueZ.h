@@ -52,6 +52,29 @@
 #define HCI_ACL_LINK  0x01
 #define HCI_ESCO_LINK 0x02
 
+#define HCIEvtToMask(_evt) (static_cast<uint64_t>(1) << (_evt))
+
+#define HCIOpcode(_ogf, _ocf) (((_ogf) << 10) | ((_ocf) & 0x3ff))
+
+#define HCI_CMD_PERIODIC_INQUIRY_MODE           (HCIOpcode(0x01, 0x003))
+#define HCI_CMD_EXIT_PERIODIC_INQUIRY_MODE      (HCIOpcode(0x01, 0x004))
+#define HCI_CMD_ROLE_SWITCH                     (HCIOpcode(0x02, 0x00b))
+#define HCI_CMD_WRITE_INQUIRY_SCAN_ACTIVITY     (HCIOpcode(0x03, 0x01e))
+#define HCI_CMD_WRITE_INQUIRY_SCAN_TYPE         (HCIOpcode(0x03, 0x043))
+#define HCI_CMD_WRITE_INQUIRY_TX_POWER_LEVEL    (HCIOpcode(0x03, 0x059))
+#define HCI_CMD_READ_LOCAL_SUPPORTED_FEATURES   (HCIOpcode(0x04, 0x003))
+#define HCI_CMD_WRITE_SIMPLE_PAIRING_DEBUG_MODE (HCIOpcode(0x06, 0x004))
+#define HCI_CMD_WRITE_CLASS_OF_DEVICE           (HCIOpcode(0x03, 0x024))
+#define HCI_CMD_ENTER_SNIFF_MODE                (HCIOpcode(0x02, 0x003))
+#define HCI_CMD_EXIT_SNIFF_MODE                 (HCIOpcode(0x02, 0x004))
+
+#define HCI_EVT_CMD_COMPLETE 0x0e
+#define HCI_EVT_CMD_STATUS   0x0f
+#define HCI_EVT_ROLE_CHANGE  0x12
+
+
+
+
 
 namespace ajn {
 namespace bluez {
@@ -99,6 +122,14 @@ struct hci_conn_info {
     uint8_t out;
     uint16_t state;
     uint32_t link_mode;
+#if defined(QCC_OS_ANDROID)
+    /* Android developers broke the kernel ioctl API for hci_conn_info_req, so
+     * we need padding to prevent stack corruption.  This only affects
+     * Android.  More padding than necessary is added in case they break the
+     * API even further.
+     */
+    uint32_t padding[16];
+#endif
 };
 
 struct hci_conn_info_req {
