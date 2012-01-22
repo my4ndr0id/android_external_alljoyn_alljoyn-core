@@ -340,21 +340,9 @@ QStatus BTTransport::Connect(const char* connectSpec, const SessionOpts& opts, R
     }
 
     qcc::String spec = connectSpec;
-    QStatus status = ER_OK;
+    BTBusAddress addr = spec;
 
-    while (status == ER_OK) {
-        qcc::String redirection;
-        BTBusAddress addr(spec);
-        status = Connect(addr, newep, redirection);
-        if (status == ER_OK) {
-            break;
-        }
-        if (status == ER_BUS_ENDPOINT_REDIRECTED) {
-            spec = redirection;
-            status = ER_OK;
-        }
-    }
-    return status;
+    return Connect(addr, newep);
 }
 
 QStatus BTTransport::Disconnect(const char* connectSpec)
@@ -397,10 +385,10 @@ void BTTransport::BTDeviceAvailable(bool avail)
     }
 }
 
-bool BTTransport::CheckIncomingAddress(const BDAddress& addr) const
+bool BTTransport::CheckIncomingAddress(const BDAddress& addr, BTBusAddress& redirectAddr) const
 {
     if (btController) {
-        return btController->CheckIncomingAddress(addr);
+        return btController->CheckIncomingAddress(addr, redirectAddr);
     } else {
         return false;
     }
@@ -568,15 +556,17 @@ QStatus BTTransport::GetDeviceInfo(const BDAddress& addr,
 
 
 QStatus BTTransport::Connect(const BTBusAddress& addr,
-                             RemoteEndpoint** newep,
-                             qcc::String& redirection)
+                             RemoteEndpoint** newep)
 {
     QStatus status;
     RemoteEndpoint* conn = NULL;
 
     qcc::String authName;
+    qcc::String redirection;
+    BTNodeInfo connNode;
 
-    BTNodeInfo connNode = btController->PrepConnect(addr);
+redirect:
+    connNode = btController->PrepConnect(addr, redirection);
     if (!connNode->IsValid()) {
         status = ER_FAIL;
         QCC_LogError(status, ("No connect route to device with address %s", addr.ToString().c_str()));
@@ -599,6 +589,7 @@ QStatus BTTransport::Connect(const BTBusAddress& addr,
     threadListLock.Unlock(MUTEX_CONTEXT);
     QCC_DbgPrintf(("BTTransport::Connect: Calling conn->Establish() [addr = %s via %s]",
                    addr.ToString().c_str(), connNode->ToString().c_str()));
+    redirection.clear();
     status = conn->Establish("ANONYMOUS", authName, redirection);
     if (status != ER_OK) {
         QCC_LogError(status, ("BTEndpoint::Establish failed"));
@@ -659,6 +650,11 @@ exit:
 
     String emptyName;
     btController->PostConnect(status, connNode, conn ? conn->GetRemoteName() : emptyName);
+
+    if ((status == ER_BUS_ENDPOINT_REDIRECTED) && !redirection.empty()) {
+        QCC_DbgPrintf(("Redirecting connection to %s.", redirection.c_str()));
+        goto redirect;
+    }
 
     return status;
 }

@@ -180,7 +180,6 @@ BTController::BTController(BusAttachment& bus, BluetoothDeviceInterface& bt) :
     master(NULL),
     masterUUIDRev(bt::INVALID_UUIDREV),
     directMinions(0),
-    eirMinions(0),
     maxConnections(min(StringToU32(Environ::GetAppEnviron()->Find("ALLJOYN_MAX_BT_CONNECTIONS"), 0, DEFAULT_MAX_CONNECTIONS),
                        ABSOLUTE_MAX_CONNECTIONS)),
     listening(false),
@@ -271,7 +270,6 @@ BTController::~BTController()
 void BTController::ObjectRegistered() {
     // Set our unique name now that we know it.
     self->SetUniqueName(bus.GetUniqueName());
-    self->SetEIRCapable(bt.IsEIRCapable());
 }
 
 
@@ -365,18 +363,7 @@ QStatus BTController::RemoveAdvertiseName(const qcc::String& name)
 
 QStatus BTController::RemoveFindName(const qcc::String& name)
 {
-    QStatus status = DoNameOp(name, *org.alljoyn.Bus.BTController.CancelFindName, false, find);
-
-    if (self->FindNamesEmpty() && !IsMaster()) {
-        // We're not looking for any names so our master will stop sending us
-        // updates and assume that our set of found names is empty if we do
-        // start finding names again so we need tell AlljoynObj that the BT
-        // names we know about are expired.  Set an expiration timer for the
-        // names we currently know about.
-        foundNodeDB.RefreshExpiration(LOST_DEVICE_TIMEOUT);
-        ResetExpireNameAlarm();
-    }
-    return status;
+    return DoNameOp(name, *org.alljoyn.Bus.BTController.CancelFindName, false, find);
 }
 
 
@@ -616,7 +603,7 @@ void BTController::ProcessDeviceChange(const BDAddress& adBdAddr,
 }
 
 
-BTNodeInfo BTController::PrepConnect(const BTBusAddress& addr)
+BTNodeInfo BTController::PrepConnect(const BTBusAddress& addr, const String& redirection)
 {
     BTNodeInfo node;
 
@@ -642,8 +629,54 @@ BTNodeInfo BTController::PrepConnect(const BTBusAddress& addr)
         if (!IsMinion()) {
             node = nodeDB.FindNode(addr);
             if (IsMaster() && !node->IsValid() && ((nodeDB.Size() - 1) < maxConnections)) {
-                node = foundNodeDB.FindNode(addr);
-                newDevice = node->IsValid() && (node != joinSessionNode);
+                if (redirection.empty()) {
+                    node = foundNodeDB.FindNode(addr);
+                    newDevice = node->IsValid() && (node != joinSessionNode);
+                } else {
+                    foundNodeDB.Lock();
+
+                    /*
+                     * We need a redirect node to be in one of the node DBs.  Since we may not have
+                     * found it before we got redirected, put it in.
+                     */
+                    BTBusAddress redirAddr(redirection);
+                    BTNodeInfo redirNode = nodeDB.FindNode(redirAddr);
+                    if (!redirNode->IsValid()) {
+                        redirNode = foundNodeDB.FindNode(redirAddr);
+                    }
+                    if (!redirNode->IsValid()) {
+                        redirNode = BTNodeInfo(redirAddr);
+                        Timespec now;
+                        GetTimeNow(&now);
+                        redirNode->SetExpireTime(now.GetAbsoluteMillis() + 5000);
+                        /*
+                         * The GUID of the redirection node is invalid.  However as soon as we do
+                         * the SetState handshake we will get the correct GUID (or it is found via
+                         * SDP query).
+                         */
+                        foundNodeDB.AddNode(redirNode);
+                    }
+
+                    node = foundNodeDB.FindNode(addr);
+                    if (node->IsValid()) {
+                        /*
+                         * A redirection is essentially telling us that our connect node information
+                         * is stale.  Update that info now.
+                         */
+                        BTNodeInfo connNode = node->GetConnectNode();
+                        connNode->SetConnectNode(redirNode);
+                    } else {
+                        /*
+                         * It's possible that our target node is gone due to the name expiring
+                         * between the original connect attempt and the redirected connect attempt.
+                         * So just go straight to the redirection node and the name will be found
+                         * again during the SetState handshake if it's still being advertised.
+                         */
+                        node = redirNode;
+                    }
+                    newDevice = node->IsValid() && (node != joinSessionNode);
+                    foundNodeDB.Unlock();
+                }
             }
         }
 
@@ -826,10 +859,12 @@ void BTController::BTDeviceAvailable(bool on)
 }
 
 
-bool BTController::CheckIncomingAddress(const BDAddress& addr) const
+bool BTController::CheckIncomingAddress(const BDAddress& addr, BTBusAddress& redirectAddr) const
 {
     QCC_DbgTrace(("BTController::CheckIncomingAddress(addr = %s)", addr.ToString().c_str()));
     if (IsMaster()) {
+        redirectAddr = BTBusAddress(); // Master redirects to no one.
+
         const BTNodeInfo& node = nodeDB.FindNode(addr);
         if (node->IsValid()) {
             bool allow  = node->IsDirectMinion();
@@ -860,19 +895,22 @@ bool BTController::CheckIncomingAddress(const BDAddress& addr) const
 
     } else if (IsDrone()) {
         const BTNodeInfo& node = nodeDB.FindNode(addr);
-        bool allow = node->IsValid() && node->IsDirectMinion();
+        bool redirect = !node->IsValid();
+        bool allow = redirect || node->IsDirectMinion();
         QCC_DbgPrintf(("% incoming connection from %s %s.",
-                       allow ? "Accept" : "Reject",
+                       redirect ? "Redirect" : (allow ? "Accept" : "Reject"),
                        node->IsValid() ?
                        (node->IsDirectMinion() ? "direct" : "indirect") : "unknown node:",
                        node->IsValid() ? "minion" : addr.ToString().c_str()));
+        redirectAddr = redirect ? masterNode->GetBusAddress() : BTBusAddress();
         return allow;
     }
 
-    QCC_DbgPrintf(("Reject incoming connection from %s because we are a minion (our master is %s).",
+    QCC_DbgPrintf(("Redirect incoming connection from %s because we are a minion (our master is %s).",
                    addr.ToString().c_str(),
                    masterNode->GetBusAddress().addr.ToString().c_str()));
-    return false;
+    redirectAddr = masterNode->GetBusAddress();
+    return true;
 }
 
 
@@ -1107,6 +1145,7 @@ void BTController::HandleNameSignal(const InterfaceDescription::Member* member,
             }
 
             bool isMaster = IsMaster();
+            bool isDrone = IsDrone();
             lock.Unlock(MUTEX_CONTEXT);
 
             if (isMaster) {
@@ -1139,6 +1178,19 @@ void BTController::HandleNameSignal(const InterfaceDescription::Member* member,
                 size_t numArgs;
                 msg->GetArgs(numArgs, args);
                 Signal(masterNode->GetUniqueName().c_str(), masterNode->GetSessionID(), *member, args, numArgs);
+
+                if (isDrone && !findOp) {
+                    BTNodeDB newAdInfo;
+                    BTNodeDB oldAdInfo;
+                    BTNodeInfo nodeChange = node->Clone();
+                    nodeChange->AddAdvertiseName(name);
+                    if (addName) {
+                        newAdInfo.AddNode(nodeChange);
+                    } else {
+                        oldAdInfo.AddNode(nodeChange);
+                    }
+                    DistributeAdvertisedNameChanges(&newAdInfo, &oldAdInfo);
+                }
             }
         } else {
             QCC_LogError(ER_FAIL, ("Did not find node %s in node DB", addr.ToString().c_str()));
@@ -1491,24 +1543,16 @@ void BTController::HandleFoundNamesChange(const InterfaceDescription::Member* me
     if ((status == ER_OK) && (adInfo.Size() > 0)) {
 
         // Figure out which name changes belong to which DB (nodeDB or foundNodeDB).
-        BTNodeDB minionDB;
         BTNodeDB externalDB;
         nodeDB.NodeDiff(adInfo, &externalDB, NULL);
-        externalDB.NodeDiff(adInfo, &minionDB, NULL);
 
-        const BTNodeDB* newAdInfo = lost ? NULL : &adInfo;
-        const BTNodeDB* oldAdInfo = lost ? &adInfo : NULL;
-        const BTNodeDB* newMinionDB = lost ? NULL : &minionDB;
-        const BTNodeDB* oldMinionDB = lost ? &minionDB : NULL;
         const BTNodeDB* newExternalDB = lost ? NULL : &externalDB;
         const BTNodeDB* oldExternalDB = lost ? &externalDB : NULL;
 
-        nodeDB.UpdateDB(newMinionDB, oldMinionDB, false);
         foundNodeDB.UpdateDB(newExternalDB, oldExternalDB, false);
         foundNodeDB.DumpTable("foundNodeDB - Updated set of found devices");
-        assert(!devAvailable || (nodeDB.Size() > 0));
 
-        DistributeAdvertisedNameChanges(newAdInfo, oldAdInfo);
+        DistributeAdvertisedNameChanges(newExternalDB, oldExternalDB);
     }
 }
 
@@ -1591,6 +1635,13 @@ void BTController::DeferredBTDeviceAvailable(bool on)
 {
     QCC_DbgTrace(("BTController::DeferredBTDeviceAvailable(<%s>)", on ? "on" : "off"));
     lock.Lock(MUTEX_CONTEXT);
+
+    /*
+     * Update our EIR capability.  This can only be true once a device is available.  When not,
+     * it will default to false, so this is safe to call in any case.
+     */
+    self->SetEIRCapable(bt.IsEIRCapable());
+
     if (on && !devAvailable) {
         BTBusAddress listenAddr;
         devAvailable = true;
@@ -1731,7 +1782,7 @@ void BTController::DeferredProcessSetStateReply(Message& reply,
                   newMaster, joinSessionNode->ToString().c_str()));
 
     lock.Lock(MUTEX_CONTEXT);
-    QStatus status = ER_FAIL;;
+    QStatus status = ER_FAIL;
 
     if (reply->GetType() == MESSAGE_METHOD_RET) {
         size_t numNodeStateArgs;
@@ -2019,10 +2070,6 @@ void BTController::DeferredNameLostHander(const String& name)
         }
 
 
-
-
-        // the entire foundNodeDB will cause their advertised names to expire
-        // as well.  No need to distribute lost names at this time.
         if (!find.Empty()) {
             // We're going to be doing discovery so set the expiration all
             // found nodes to half the normal expiration.
@@ -2086,10 +2133,6 @@ void BTController::DeferredNameLostHander(const String& name)
 
             find.count -= minion->FindNamesSize();
             find.dirty = true;
-
-            if (minion->IsEIRCapable()) {
-                --eirMinions;
-            }
 
             if (!RotateMinions() && wasRotateMinions) {
                 advertise.StopAlarm();
@@ -2326,6 +2369,14 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
         }
 
         if (nodeAddr == connectingNode->GetBusAddress()) {
+            /*
+             * We need the remote GUID of the connectingNode, but it's not included in the "header"
+             * fields of SetState.  However, it should always be included in the list of node
+             * states.  Putting the GUID in the header fields would be a protocol change, so set it
+             * here instead of changing the protocol.
+             */
+            connectingNode->SetGUID(guid);
+
             // incomingNode needs to refer to the same instance as
             // connectingNode since other nodes already point to
             // connectingNode as their connect node and that instance is the
@@ -2346,11 +2397,8 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
         }
         incomingNode->SetConnectNode(connectingNode);
         incomingNode->SetEIRCapable(eirCapable);
-        if (IsMaster() && eirCapable) {
-            ++eirMinions;
-        }
 
-        QCC_DbgPrintf(("Processing names for new minion %s (GUID: %s  uniqueName: %s):",
+        QCC_DbgPrintf(("Processing names for newly connected node %s (GUID: %s  uniqueName: %s):",
                        incomingNode->ToString().c_str(),
                        guid.ToString().c_str(),
                        busName.c_str()));
@@ -2370,6 +2418,9 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
             char* n;
             status = anList[j].Get(SIG_NAME, &n);
             if (status != ER_OK) {
+                QCC_LogError(status, ("Get advertise name failed"));
+                foundNodeDB.Unlock(MUTEX_CONTEXT);
+                lock.Unlock(MUTEX_CONTEXT);
                 return status;
             }
             QCC_DbgPrintf(("    Ad Name: %s", n));
@@ -2385,6 +2436,9 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
             char* n;
             status = fnList[j].Get(SIG_NAME, &n);
             if (status != ER_OK) {
+                QCC_LogError(status, ("Get find name failed"));
+                foundNodeDB.Unlock(MUTEX_CONTEXT);
+                lock.Unlock(MUTEX_CONTEXT);
                 return status;
             }
             QCC_DbgPrintf(("    Find Name: %s", n));
@@ -2425,8 +2479,9 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
             if (IsMaster()) {
                 // Move the node from foundNodeDB to nodeDB since it is now a minion.
                 foundNodeDB.RemoveNode(foundNode);
-                // Make sure node's unique name is up-to-date
+                // Make sure node's unique name and EIR capability are up-to-date
                 foundNode->SetUniqueName(incomingNode->GetUniqueName());
+                foundNode->SetEIRCapable(incomingNode->IsEIRCapable());
                 nodeDB.AddNode(foundNode);
             }
         } else {
@@ -2772,6 +2827,7 @@ void BTController::FillNodeStateMsgArgs(vector<MsgArg>& args) const
             QCC_DbgPrintf(("        Find name: %s", nit->c_str()));
             nodeFindNames.push_back(nit->c_str());
         }
+        QCC_DbgPrintf(("        EIR capable: %d", node->IsEIRCapable()));
 
         args.push_back(MsgArg(SIG_NODE_STATE_ENTRY,
                               node->GetGUID().ToString().c_str(),
@@ -2791,20 +2847,32 @@ void BTController::FillNodeStateMsgArgs(vector<MsgArg>& args) const
 void BTController::FillFoundNodesMsgArgs(vector<MsgArg>& args, const BTNodeDB& adInfo)
 {
     BTNodeDB::const_iterator it;
-    map<BTBusAddress, BTNodeDB> xformMap;
+    map<BTBusAddress, BTNodeDB*>::iterator xmit;
+    map<BTBusAddress, BTNodeDB*> xformMap;
+
     adInfo.Lock(MUTEX_CONTEXT);
     for (it = adInfo.Begin(); it != adInfo.End(); ++it) {
-        xformMap[(&adInfo == &nodeDB) ? self->GetBusAddress() : (*it)->GetConnectNode()->GetBusAddress()].AddNode(*it);
+        BTBusAddress key = (&adInfo == &nodeDB) ? self->GetBusAddress() : (*it)->GetConnectNode()->GetBusAddress();
+        BTNodeDB* xdb;
+        xmit = xformMap.find(key);
+
+        if (xmit == xformMap.end()) {
+            xdb = new BTNodeDB();
+            xformMap.insert(pair<BTBusAddress, BTNodeDB*>(key, xdb));
+        } else {
+            xdb = xmit->second;
+        }
+        xdb->AddNode(*it);
     }
     adInfo.Unlock(MUTEX_CONTEXT);
 
     args.reserve(args.size() + xformMap.size());
-    map<BTBusAddress, BTNodeDB>::const_iterator xmit;
-    for (xmit = xformMap.begin(); xmit != xformMap.end(); ++xmit) {
+    xmit = xformMap.begin();
+    while (xmit != xformMap.end()) {
         vector<MsgArg> adNamesArgs;
 
-        const BTNodeDB& db = xmit->second;
-        BTNodeInfo connNode = xmit->second.FindNode(xmit->first);
+        const BTNodeDB& db = *(xmit->second);
+        BTNodeInfo connNode = db.FindNode(xmit->first);
 
         if (!connNode->IsValid()) {
             connNode = foundNodeDB.FindNode(xmit->first);
@@ -2814,43 +2882,47 @@ void BTController::FillFoundNodesMsgArgs(vector<MsgArg>& args, const BTNodeDB& a
             connNode = nodeDB.FindNode(xmit->first);
         }
 
-        if (!connNode->IsValid()) {
+        if (connNode->IsValid()) {
+            adNamesArgs.reserve(adInfo.Size());
+            for (it = db.Begin(); it != db.End(); ++it) {
+                const BTNodeInfo& node = *it;
+                NameSet::const_iterator nit;
+
+                vector<const char*> nodeAdNames;
+                nodeAdNames.reserve(node->AdvertiseNamesSize());
+                for (nit = node->GetAdvertiseNamesBegin(); nit != node->GetAdvertiseNamesEnd(); ++nit) {
+                    nodeAdNames.push_back(nit->c_str());
+                }
+
+                adNamesArgs.push_back(MsgArg(SIG_AD_NAME_MAP_ENTRY,
+                                             node->GetGUID().ToString().c_str(),
+                                             node->GetBusAddress().addr.GetRaw(),
+                                             node->GetBusAddress().psm,
+                                             nodeAdNames.size(), &nodeAdNames.front()));
+                adNamesArgs.back().Stabilize();
+            }
+
+            BTBusAddress connAddr = nodeDB.FindNode(xmit->first)->IsValid() ? self->GetBusAddress() : xmit->first;
+
+            args.push_back(MsgArg(SIG_FOUND_NODE_ENTRY,
+                                  connAddr.addr.GetRaw(),
+                                  connAddr.psm,
+                                  connNode->GetUUIDRev(),
+                                  adNamesArgs.size(), &adNamesArgs.front()));
+            args.back().Stabilize();
+
+        } else {
             // Should never happen, since it is an internal bug (hence assert
             // check below), but gracefully handle it in case it does in
             // release mode.
             QCC_LogError(ER_NONE, ("Failed to find address %s in DB that should contain it!", xmit->first.ToString().c_str()));
             db.DumpTable("db: Corrupt DB?");
             assert(connNode->IsValid());
-            continue;
         }
 
-        adNamesArgs.reserve(adInfo.Size());
-        for (it = db.Begin(); it != db.End(); ++it) {
-            const BTNodeInfo& node = *it;
-            NameSet::const_iterator nit;
-
-            vector<const char*> nodeAdNames;
-            nodeAdNames.reserve(node->AdvertiseNamesSize());
-            for (nit = node->GetAdvertiseNamesBegin(); nit != node->GetAdvertiseNamesEnd(); ++nit) {
-                nodeAdNames.push_back(nit->c_str());
-            }
-
-            adNamesArgs.push_back(MsgArg(SIG_AD_NAME_MAP_ENTRY,
-                                         node->GetGUID().ToString().c_str(),
-                                         node->GetBusAddress().addr.GetRaw(),
-                                         node->GetBusAddress().psm,
-                                         nodeAdNames.size(), &nodeAdNames.front()));
-            adNamesArgs.back().Stabilize();
-        }
-
-        BTBusAddress connAddr = nodeDB.FindNode(xmit->first)->IsValid() ? self->GetBusAddress() : xmit->first;
-
-        args.push_back(MsgArg(SIG_FOUND_NODE_ENTRY,
-                              connAddr.addr.GetRaw(),
-                              connAddr.psm,
-                              connNode->GetUUIDRev(),
-                              adNamesArgs.size(), &adNamesArgs.front()));
-        args.back().Stabilize();
+        delete xmit->second;
+        xformMap.erase(xmit);
+        xmit = xformMap.begin();
     }
 }
 
@@ -3218,6 +3290,7 @@ void BTController::AdvertiseNameArgInfo::SetArgs()
                                     node->GetBusAddress().addr.GetRaw(),
                                     node->GetBusAddress().psm,
                                     names.size(), &names.front()));
+        adInfoArgs.back().Stabilize();
     }
 
     bto.nodeDB.Unlock(MUTEX_CONTEXT);
@@ -3383,6 +3456,24 @@ QStatus BTController::FindNameArgInfo::StopLocal(bool immediate)
     QStatus status = bto.bt.StopFind();
     active = !(status == ER_OK);
     return status;
+}
+
+
+size_t BTController::NumEIRMinions() const
+{
+    if (!IsMaster()) {
+        return 0;
+    }
+
+    size_t eirMinions = 0;
+    nodeDB.Lock(MUTEX_CONTEXT);
+    for (BTNodeDB::const_iterator it = nodeDB.Begin(); it != nodeDB.End(); ++it) {
+        if (((*it) != self) && (*it)->IsEIRCapable()) {
+            ++eirMinions;
+        }
+    }
+    nodeDB.Unlock(MUTEX_CONTEXT);
+    return eirMinions;
 }
 
 

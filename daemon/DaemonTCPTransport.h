@@ -196,10 +196,9 @@ class DaemonTCPTransport : public Transport, public RemoteEndpoint::EndpointList
 
     /**
      * @internal
-     * @brief Stop discovering busses to connect to.  No action needs to be
-     * taken in the IP-based name service we use.
+     * @brief Stop discovering busses.
      */
-    void DisableDiscovery(const char* namePrefix) { }
+    void DisableDiscovery(const char* namePrefix);
 
     /**
      * Start advertising a well-known name with the given quality of service.
@@ -306,28 +305,44 @@ class DaemonTCPTransport : public Transport, public RemoteEndpoint::EndpointList
     std::list<qcc::String> m_listenSpecs;                          /**< Listen specs clients have requested us to listen on */
     qcc::Mutex m_listenSpecsLock;                                  /**< Mutex that protects m_listenSpecs */
 
+    std::list<qcc::String> m_discovering;                          /**< Name prefixes the transport is looking for */
+    std::list<qcc::String> m_advertising;                          /**< Names the transport is advertising */
+    std::list<qcc::String> m_listening;                            /**< ListenSpecs on which the transport is listening */
+    qcc::Mutex m_discoLock;                                        /**< Mutex that protects discovery and advertisement lists */
+
     /**
      * @internal
      * @brief Commmand codes sent to the server accept loop thread.
      */
-    enum Request {
-        START_LISTEN,   /**< A request to start listening on a particular address/port combination */
-        STOP_LISTEN     /**< A request to stop listening on a particular address/port combination */
+    enum RequestOp {
+        START_LISTEN_INSTANCE,           /**< A StartListen() has happened */
+        STOP_LISTEN_INSTANCE,            /**< A StopListen() has happened */
+        ENABLE_ADVERTISEMENT_INSTANCE,   /**< An EnableAdvertisement() has happened */
+        DISABLE_ADVERTISEMENT_INSTANCE,  /**< A DisableAdvertisement() has happened */
+        ENABLE_DISCOVERY_INSTANCE,       /**< An EnableDiscovery() has happened */
+        DISABLE_DISCOVERY_INSTANCE,      /**< A DisableDiscovery() has happened */
     };
 
     /**
      * @internal
-     * @brief Request code for communicating StartListen and StopListen requests
-     * to the server accept loop thread.
+     * @brief Request code for communicating StartListen, StopListen requests
+     * and started-advertising and stopped-advertising notifications to the
+     * server accept loop thread.
      */
     class ListenRequest {
       public:
-        Request m_request;
-        qcc::String m_listenSpec;
+        RequestOp m_requestOp;
+        qcc::String m_requestParam;
     };
 
     std::queue<ListenRequest> m_listenRequests;                    /**< Queue of StartListen and StopListen requests */
     qcc::Mutex m_listenRequestsLock;                               /**< Mutex that protects m_listenRequests */
+
+    /**
+     * @internal
+     * @brief Manage the list of endpoints for the transport.
+     */
+    void ManageEndpoints(qcc::Timespec tTimeout);
 
     /**
      * @internal
@@ -507,6 +522,114 @@ class DaemonTCPTransport : public Transport, public RemoteEndpoint::EndpointList
      * attacks from "abroad" and trust ourselves implicitly.
      */
     static const uint32_t ALLJOYN_MAX_COMPLETED_CONNECTIONS_TCP_DEFAULT = 50;
+
+    /*
+     * The Android Compatibility Test Suite (CTS) is used by Google to enforce a
+     * common idea of what it means to be Android.  One of their tests is to
+     * make sure there are no TCP or UDP listeners in running processes when the
+     * phone is idle.  Since we want to be able to run our daemon on idle phones
+     * and manufacturers want their Android phones to pass the CTS, we have got
+     * to be able to shut off our listeners unless they are actually required.
+     *
+     * To do this, we need to keep track of whether or not the daemon is
+     * actively advertising or discovering.  To this end, we keep track of the
+     * advertise and discover calls, and if there are any outstanding (not
+     * canceled) we enable the Name Service to talk to the outside world.  If
+     * there are no outstanding operations, we tell the Name Service to shut up.
+     *
+     * There is nothing preventing us from receiving multiple identical
+     * discovery and advertisement requests, so we allow multiple instances of
+     * an identical name on the list.  We could reference count the entries, but
+     * this seems like a relatively rare condition, so we take the
+     * straightforward approach.
+     */
+    enum DiscoveryOp {
+        ENABLE_DISCOVERY,  /**< A request to start a discovery has been received */
+        DISABLE_DISCOVERY  /**< A request to cancel a discovery has been received */
+    };
+
+    enum AdvertiseOp {
+        ENABLE_ADVERTISEMENT,  /**< A request to start advertising has been received */
+        DISABLE_ADVERTISEMENT  /**< A request to cancel advertising has been received */
+    };
+
+    enum ListenOp {
+        START_LISTEN,  /**< A request to start listening has been received */
+        STOP_LISTEN    /**< A request to stop listening has been received */
+    };
+
+    /**
+     * @brief Add or remove a discover indication.
+     *
+     * The transport has received a new discovery operation.  This will either
+     * be an EnableDiscovery() or DisbleDiscovery() discriminated by the
+     * DiscoveryOp enum.
+     *
+     * We want to keep a list of name prefixes that are currently active for
+     * well-known name discovery.  The presence of a non-zero size of this list
+     * indicates discovery is in-process and the Name Service should be kept
+     * alive (it can be listening for inbound packets in particular).
+     *
+     * @return true if the list of discoveries is empty as a result of the
+     *              operation.
+     */
+    bool NewDiscoveryOp(DiscoveryOp op, qcc::String namePrefix, bool& isFirst);
+
+    /**
+     * @brief Add or remove an advertisement indication.
+     *
+     * Called when the transport has received a new advertisement operation.
+     * This will either be an EnableAdvertisement() or DisbleAdvertisement()
+     * discriminated by the AdvertiseOp enum.
+     *
+     * We want to keep a list of names that are currently being advertised.  The
+     * presence of a non-zero size of this list indicates that at least one
+     * advertisement is in-process and the Name Service should be kept alive to
+     * respond to WHO_HAS queries.
+     *
+     * @return true if the list of advertisements is empty as a result of the
+     *              operation.
+     */
+    bool NewAdvertiseOp(AdvertiseOp op, qcc::String name, bool& isFirst);
+
+    /**
+     * @brief Add or remove a listen operation.
+     *
+     * Called when the transport has received a new listen operation.
+     * This will either be an StartListen() or StopListen()
+     * discriminated by the ListenOp enum.
+     *
+     * We want to keep a list of listen specs that are currently being listened
+     * on.  This lest is kept so we can tear down the listeners if there are no
+     * advertisements and recreate it if an advertisement is started.
+     *
+     * This is keep TCP from having a listener so that the Android Compatibility
+     * test suite can pass with when the daemon is in the quiescent state.
+     *
+     * @return true if the list of listeners is empty as a result of the
+     *              operation.
+     */
+    bool NewListenOp(ListenOp op, qcc::String name);
+
+    void QueueEnableDiscovery(const char* namePrefix);
+    void QueueDisableDiscovery(const char* namePrefix);
+    void QueueEnableAdvertisement(const qcc::String& advertiseName);
+    void QueueDisableAdvertisement(const qcc::String& advertiseName);
+
+    void RunListenMachine(void);
+
+    void StartListenInstance(ListenRequest& listenRequest);
+    void StopListenInstance(ListenRequest& listenRequest);
+    void EnableAdvertisementInstance(ListenRequest& listenRequest);
+    void DisableAdvertisementInstance(ListenRequest& listenRequest);
+    void EnableDiscoveryInstance(ListenRequest& listenRequest);
+    void DisableDiscoveryInstance(ListenRequest& listenRequest);
+
+    bool m_isAdvertising;
+    bool m_isDiscovering;
+    bool m_isListening;
+    bool m_isNsEnabled;
+
 };
 
 } // namespace ajn

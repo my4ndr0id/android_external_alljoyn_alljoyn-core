@@ -4,7 +4,7 @@
  */
 
 /******************************************************************************
- * Copyright 2010-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2010-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -149,7 +149,16 @@ void OptParse::PrintUsage()
            "    --no-bt\n"
            "        Disable the Bluetooth transport (override config file setting).\n\n"
            "    --verbosity=LEVEL\n"
-           "        Set the logging level to LEVEL.\n\n"
+           "        Set the logging level to LEVEL.\n"
+           "	LEVEL can take one of the following values\n"
+           "	0       LOG_EMERG       system is unusable\n"
+           "	1       LOG_ALERT       action must be taken immediately\n"
+           "	2       LOG_CRIT        critical conditions\n"
+           "	3       LOG_ERR         error conditions\n"
+           "	4       LOG_WARNING     warning conditions\n"
+           "	5       LOG_NOTICE      normal but significant condition\n"
+           "	6       LOG_INFO        informational\n"
+           "	7       LOG_DEBUG       debug-level messages\n\n"
            "    --version\n"
            "        Print the version and copyright string, and exit.\n",
            argv[0]);
@@ -166,7 +175,7 @@ OptParse::ParseResultCode OptParse::ParseResult()
 
         if (arg.compare("--version") == 0) {
             printf("AllJoyn Message Bus Daemon version: %s\n"
-                   "Copyright (c) 2009-2011 Qualcomm Innovation Center, Inc.\n"
+                   "Copyright (c) 2009-2012 Qualcomm Innovation Center, Inc.\n"
                    "Licensed under Apache2.0: http://www.apache.org/licenses/LICENSE-2.0.html\n"
                    "\n"
                    "Build: %s\n", ajn::GetVersion(), GetBuildInfo());
@@ -377,4 +386,9 @@ DAEMONLIBRARY_API int LoadDaemon(int argc, char** argv)
     }
 
     return daemon(opts);
+}
+
+DAEMONLIBRARY_API void UnloadDaemon() {
+    g_interrupt = true;
+    return;
 }

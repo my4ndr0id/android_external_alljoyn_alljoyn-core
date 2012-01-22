@@ -579,10 +579,13 @@ qcc::ThreadReturn STDCALL BTTransport::BTAccessor::DiscoveryThread::Run(void* ar
                 // Report found devices unless duration has gone to zero
                 while (deviceFindHandle && duration) {
                     BDAddress address(deviceInfo.Address.ullLong);
-                    // Filter out devices that don't have the INFORMATION bit set
-                    if (GET_COD_SERVICE(deviceInfo.ulClassofDevice) & COD_SERVICE_INFORMATION) {
-
-                        QCC_DbgHLPrintf(("DiscoveryThread found AllJoyn %s", address.ToString().c_str()));
+                    // Filter out computers (as opposed to phones and other devices) that don't
+                    // have the INFORMATION bit set.
+                    if ((GET_COD_MAJOR(deviceInfo.ulClassofDevice) & COD_MAJOR_COMPUTER) &&
+                        !(GET_COD_SERVICE(deviceInfo.ulClassofDevice) & COD_SERVICE_INFORMATION)) {
+                        QCC_DbgHLPrintf(("DiscoveryThread non-AllJoyn %s", address.ToString().c_str()));
+                    } else {
+                        QCC_DbgHLPrintf(("DiscoveryThread found %s", address.ToString().c_str()));
 
                         btAccessor.deviceLock.Lock(MUTEX_CONTEXT);
                         bool ignoreThisOne = btAccessor.discoveryIgnoreAddrs->count(address) != 0;
@@ -593,8 +596,6 @@ qcc::ThreadReturn STDCALL BTTransport::BTAccessor::DiscoveryThread::Run(void* ar
                         } else {
                             btAccessor.DeviceFound(address);
                         }
-                    } else {
-                        QCC_DbgHLPrintf(("DiscoveryThread non-AllJoyn %s", address.ToString().c_str()));
                     }
                     if (!BluetoothFindNextDevice(deviceFindHandle, &deviceInfo)) {
                         break;
@@ -1051,8 +1052,18 @@ RemoteEndpoint* BTTransport::BTAccessor::Accept(BusAttachment& alljoyn, Event* c
 
         BTBusAddress incomingAddr(remAddr, bt::INCOMING_PSM);
         BTNodeInfo dummyNode(incomingAddr);
+        BTBusAddress redirectAddr;
 
-        conn = new WindowsBTEndpoint(alljoyn, true, dummyNode, this, address);
+        // The rejection of the incoming request must come after the normal accept proceedure.
+        // So save this status for later testing and potentially reject it then.
+        QStatus redirectStatus = ER_OK;
+
+        if (!transport->CheckIncomingAddress(remAddr, redirectAddr)) {
+            redirectStatus = ER_BUS_CONNECTION_REJECTED;
+            QCC_DbgPrintf(("Rejected connection from: %s", remAddr.ToString().c_str()));
+        }
+
+        conn = new WindowsBTEndpoint(alljoyn, true, dummyNode, this, address, redirectAddr);
 
         if (conn) {
             conn->SetChannelHandle(channelHandle);
@@ -1082,7 +1093,7 @@ RemoteEndpoint* BTTransport::BTAccessor::Accept(BusAttachment& alljoyn, Event* c
                                    QCC_StatusText(conn->GetConnectionStatus())));
                 }
 
-                if (ER_OK != status || ER_OK != conn->GetConnectionStatus()) {
+                if (ER_OK != redirectStatus || ER_OK != status || ER_OK != conn->GetConnectionStatus()) {
                     // The destructor will cause a disconnect to be send to the kernel and
                     // for it to be removed from activeEndPoints[].
                     delete conn;
@@ -1104,6 +1115,7 @@ RemoteEndpoint* BTTransport::BTAccessor::Connect(BusAttachment& alljoyn,
     USER_KERNEL_MESSAGE messageIn = { USRKRNCMD_CONNECT };
     USER_KERNEL_MESSAGE messageOut;
     const BTBusAddress& connAddr = node->GetBusAddress();
+    BTBusAddress noRedirect;
 
     QCC_DbgTrace(("BTTransport::BTAccessor::Connect(node = %s)",
                   connAddr.ToString().c_str()));
@@ -1120,7 +1132,7 @@ RemoteEndpoint* BTTransport::BTAccessor::Connect(BusAttachment& alljoyn,
 
     QCC_DbgPrintf(("L2CapConnect(address = 0x%012I64X, psm = 0x%04X)", address, connAddr.psm));
 
-    conn = new WindowsBTEndpoint(alljoyn, false, node, this, address);
+    conn = new WindowsBTEndpoint(alljoyn, false, node, this, address, noRedirect);
 
     if (conn) {
         // The connection must be added before we send the message to the kernel because the kernel
