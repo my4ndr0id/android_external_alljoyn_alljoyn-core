@@ -31,7 +31,7 @@ PROJECT_NAME           = "AllJoyn C++ API Reference Manual"
 # This could be handy for archiving the generated documentation or
 # if some version control system is used.
 
-PROJECT_NUMBER         = "Version 2.3.2"
+PROJECT_NUMBER         = "Version 2.3.3"
 
 # The OUTPUT_DIRECTORY tag is used to specify the (relative or absolute)
 # base path where the generated documentation will be put.
@@ -793,7 +793,10 @@ HTML_FILE_EXTENSION    = .html
 # each generated HTML page. If it is left blank doxygen will generate a
 # standard header.
 
-HTML_HEADER            = header.html
+# 20120131: header.html should no longer be used in production builds [MBUS-463]
+#   doxygen 1.7.4 and later will generate buggy html if header.html is included
+
+HTML_HEADER            =
 
 # The HTML_FOOTER tag can be used to specify a personal HTML footer for
 # each generated HTML page. If it is left blank doxygen will generate a
