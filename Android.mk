@@ -176,8 +176,7 @@ LOCAL_SRC_FILES += \
 	autogen/version.cc
 
 LOCAL_SHARED_LIBRARIES := \
-    liballjoyn \
-	libstlport \
+	liballjoyn \
 	libcrypto \
 	libssl \
 	liblog
