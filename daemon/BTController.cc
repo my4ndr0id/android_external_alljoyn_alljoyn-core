@@ -798,7 +798,7 @@ void BTController::PostConnect(QStatus status, BTNodeInfo& node, const String& r
         }
 
         foundNodeDB.Lock(MUTEX_CONTEXT);
-        if (foundNodeDB.FindNode(node->GetBusAddress())->IsValid()) {
+        if (foundNodeDB.FindNode(node->GetBusAddress())->IsValid() && IsMaster()) {
             // Failed to connect to the device.  Send out a lost advertised
             // name for all names in all nodes connectable via this node so
             // that if we find the name of interest again, we will send out a
@@ -809,9 +809,11 @@ void BTController::PostConnect(QStatus status, BTNodeInfo& node, const String& r
             foundNodeDB.UpdateDB(NULL, &reapDB);
             foundNodeDB.Unlock(MUTEX_CONTEXT);
 
+            QCC_LogError(status, ("Connection failed to %s, removing found names", node->ToString().c_str()));
             DistributeAdvertisedNameChanges(NULL, &reapDB);
         } else {
             foundNodeDB.Unlock(MUTEX_CONTEXT);
+            QCC_LogError(status, ("Connection failed to %s", node->ToString().c_str()));
         }
     }
 }
@@ -922,7 +924,7 @@ void BTController::NameOwnerChanged(const qcc::String& alias,
                   alias.c_str(),
                   oldOwner ? oldOwner->c_str() : "<null>",
                   newOwner ? newOwner->c_str() : "<null>"));
-    if (oldOwner && (alias == *oldOwner)) {
+    if (oldOwner && (alias == *oldOwner) && (alias != bus.GetUniqueName())) {
         DispatchOperation(new NameLostDispatchInfo(alias));
     } else if (!oldOwner && newOwner && (alias == org::alljoyn::Daemon::WellKnownName)) {
         /*
@@ -1063,6 +1065,7 @@ QStatus BTController::DoNameOp(const qcc::String& name,
 
     bool devAvail = devAvailable;
     bool isMaster = IsMaster();
+    bool isDrone = IsDrone();
     lock.Unlock(MUTEX_CONTEXT);
 
     if (devAvail) {
@@ -1088,6 +1091,33 @@ QStatus BTController::DoNameOp(const qcc::String& name,
             status = Signal(masterNode->GetUniqueName().c_str(), masterNode->GetSessionID(), signal, args, argsSize);
             if (status != ER_OK) {
                 QCC_LogError(status, ("Failed to send %s signal to %s (%s)", signal.name.c_str(), masterNode->ToString().c_str(), masterNode->GetUniqueName().c_str()));
+            }
+            /*
+             * Drone is responsible for telling its direct minions about changes in advertised
+             * names.  The signal to the master will take care of the rest.
+             */
+            if (isDrone) {
+                /*
+                 * Make an empty node DB and put the name in it to tell
+                 * DistributeAdvertisedNameChanges about the name change.
+                 */
+                BTNodeDB db;
+                BTNodeInfo node = self->Clone();
+                if (&nameArgInfo == static_cast<NameArgInfo*>(&advertise)) {
+                    node->AddAdvertiseName(name);
+                    db.AddNode(node);
+                    if (add) {
+                        DistributeAdvertisedNameChanges(&db, NULL);
+                    } else {
+                        DistributeAdvertisedNameChanges(NULL, &db);
+                    }
+                } else {
+                    /*
+                     * DoNameOp is also called for FindName and CancelFindName, but the only thing
+                     * the drone needs to do for those ops is to inform the master (which is already
+                     * done above).
+                     */
+                }
             }
         }
     }
@@ -2371,9 +2401,9 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
         if (nodeAddr == connectingNode->GetBusAddress()) {
             /*
              * We need the remote GUID of the connectingNode, but it's not included in the "header"
-             * fields of SetState.  However, it should always be included in the list of node
-             * states.  Putting the GUID in the header fields would be a protocol change, so set it
-             * here instead of changing the protocol.
+             * fields of SetState.  However, it should always be included in the list of node states
+             * if we remain the topology master.  Putting the GUID in the header fields would be a
+             * protocol change, so set it here instead of changing the protocol.
              */
             connectingNode->SetGUID(guid);
 
@@ -2546,6 +2576,17 @@ QStatus BTController::ImportState(BTNodeInfo& connectingNode,
         for (nodeit = peerDB.Begin(); nodeit != peerDB.End(); ++nodeit) {
             BTNodeInfo foundNode = foundNodeDB.FindNode((*nodeit)->GetBusAddress());
             if (foundNode->IsValid()) {
+                /*
+                 * The remote GUID of foundNode may not be correct if it is a node we were
+                 * redirected too (see PrepConnect).  But nodeit does include the GUID, so update
+                 * the GUID of foundNode with the correct information here.
+                 *
+                 * This is important to do before adding entries to addedDB or removedDB since
+                 * the name found/lost machinery relies on the GUID being correct.
+                 */
+                if (foundNode->GetBusAddress() == connectingNode->GetBusAddress()) {
+                    foundNode->SetGUID((*nodeit)->GetGUID());
+                }
                 BTNodeInfo added, removed;
                 foundNode->Diff(*nodeit, &added, &removed);
 
@@ -2770,11 +2811,6 @@ QStatus BTController::ExtractNodeInfo(const MsgArg* entries, size_t size, BTNode
             BTBusAddress nodeAddr(BDAddress(rawBdAddr), psm);
             BTNodeInfo node = (nodeAddr == connNode->GetBusAddress()) ? connNode : BTNodeInfo(nodeAddr);
 
-            QCC_DbgPrintf(("    Processing advertised names for device %lu-%lu %s (connectable via %s):",
-                           i, j,
-                           node->ToString().c_str(),
-                           connNode->ToString().c_str()));
-
             // If the node is in our subnet, then use the real connect address.
             BTNodeInfo n = nodeDB.FindNode(nodeAddr);
             assert((n->IsValid() ? n->GetConnectNode() : connNode)->IsValid());
@@ -2785,6 +2821,10 @@ QStatus BTController::ExtractNodeInfo(const MsgArg* entries, size_t size, BTNode
             node->SetGUID(guid);
             node->SetUUIDRev(uuidRev);
             node->SetExpireTime(expireTime);
+            QCC_DbgPrintf(("    Processing advertised names for device %lu-%lu %s (connectable via %s):",
+                           i, j,
+                           node->ToString().c_str(),
+                           node->GetConnectNode()->ToString().c_str()));
             for (k = 0; k < anSize; ++k) {
                 char* n;
                 status = anList[k].Get(SIG_NAME, &n);
@@ -3518,17 +3558,22 @@ void BTController::FlushCachedNames()
             if (!ifc) {
                 InterfaceDescription* newIfc;
                 bus.CreateInterface("org.alljoyn.Bus.Debug.BT", newIfc);
-                newIfc->AddMethod("FlushDiscoverTimes", NULL, NULL, NULL, 0);
-                newIfc->AddMethod("FlushSDPQueryTimes", NULL, NULL, NULL, 0);
-                newIfc->AddMethod("FlushConnectTimes", NULL, NULL, NULL, 0);
-                newIfc->AddMethod("FlushCachedNames", NULL, NULL, NULL, 0);
-                newIfc->AddProperty("DiscoverTimes", "a(su)", PROP_ACCESS_READ);
-                newIfc->AddProperty("SDPQueryTimes", "a(su)", PROP_ACCESS_READ);
-                newIfc->AddProperty("ConnectTimes", "a(su)", PROP_ACCESS_READ);
-                newIfc->Activate();
-                ifc = newIfc;
+                if (newIfc) {
+                    newIfc->AddMethod("FlushDiscoverTimes", NULL, NULL, NULL, 0);
+                    newIfc->AddMethod("FlushSDPQueryTimes", NULL, NULL, NULL, 0);
+                    newIfc->AddMethod("FlushConnectTimes", NULL, NULL, NULL, 0);
+                    newIfc->AddMethod("FlushCachedNames", NULL, NULL, NULL, 0);
+                    newIfc->AddProperty("DiscoverTimes", "a(su)", PROP_ACCESS_READ);
+                    newIfc->AddProperty("SDPQueryTimes", "a(su)", PROP_ACCESS_READ);
+                    newIfc->AddProperty("ConnectTimes", "a(su)", PROP_ACCESS_READ);
+                    newIfc->Activate();
+                    ifc = newIfc;
+                }
             }
-            master->AddInterface(*ifc);
+
+            if (ifc) {
+                master->AddInterface(*ifc);
+            }
         }
 
         if (ifc) {

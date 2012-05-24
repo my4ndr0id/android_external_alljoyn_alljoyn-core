@@ -5,7 +5,7 @@
  */
 
 /******************************************************************************
- * Copyright 2009-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2009-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -83,8 +83,8 @@ namespace ajn {
 
 #define MarshalReversed(data, len) \
     do { \
-        uint8_t* p = ((uint8_t*)data) + len; \
-        while (p-- != (uint8_t*)data) { \
+        uint8_t* p = ((uint8_t*)(void*)data) + len; \
+        while (p-- != (uint8_t*)(void*)data) { \
             *bufPos++ = *p; \
         } \
     } while (0)
@@ -143,7 +143,7 @@ QStatus _Message::MarshalArgs(const MsgArg* arg, size_t numArgs)
             status = ER_BUS_BAD_VALUE;
             break;
         }
-        // QCC_DbgPrintf(("MarshalArgs @%ld %s", bufPos - bodyPtr, arg->ToString().c_str()));
+        //QCC_DbgPrintf(("MarshalArgs @%ld %s", bufPos - bodyPtr, arg->ToString().c_str()));
         switch (arg->typeId) {
         case ALLJOYN_DICT_ENTRY:
             MarshalPad8();
@@ -232,7 +232,7 @@ QStatus _Message::MarshalArgs(const MsgArg* arg, size_t numArgs)
             for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
                 uint32_t b = arg->v_scalarArray.v_bool[i] ? 1 : 0;
                 if (endianSwap) {
-                    MarshalReversed(b, 4);
+                    MarshalReversed(&b, 4);
                 } else {
                     Marshal4(b);
                 }
@@ -253,7 +253,7 @@ QStatus _Message::MarshalArgs(const MsgArg* arg, size_t numArgs)
             if (endianSwap) {
                 MarshalReversed(&len, 4);
                 for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
-                    MarshalReversed(arg->v_scalarArray.v_uint32[i], 4);
+                    MarshalReversed(&arg->v_scalarArray.v_uint32[i], 4);
                 }
             } else {
                 Marshal4(len);
@@ -278,7 +278,7 @@ QStatus _Message::MarshalArgs(const MsgArg* arg, size_t numArgs)
                     MarshalReversed(&len, 4);
                     MarshalPad8();
                     for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
-                        MarshalReversed(arg->v_scalarArray.v_uint64[i], 8);
+                        MarshalReversed(&arg->v_scalarArray.v_uint64[i], 8);
                     }
                 } else {
                     Marshal4(len);
@@ -306,7 +306,7 @@ QStatus _Message::MarshalArgs(const MsgArg* arg, size_t numArgs)
             if (endianSwap) {
                 MarshalReversed(&len, 4);
                 for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
-                    MarshalReversed(arg->v_scalarArray.v_uint16[i], 2);
+                    MarshalReversed(&arg->v_scalarArray.v_uint16[i], 2);
                 }
             } else {
                 Marshal4(len);
@@ -500,7 +500,7 @@ QStatus _Message::Deliver(RemoteEndpoint& endpoint)
         return status;
     }
     /*
-     * If the mssage has a TTL check if it has expired
+     * If the message has a TTL, check if it has expired
      */
     if (ttl && IsExpired()) {
         QCC_DbgHLPrintf(("TTL has expired - discarding message %s", Description().c_str()));
@@ -512,18 +512,10 @@ QStatus _Message::Deliver(RemoteEndpoint& endpoint)
     if (encrypt) {
         status = EncryptMessage();
         /*
-         * Need to authenticate if we don't have a key
+         * Delivery is retried when the authentication completes
          */
-        if (status == ER_BUS_KEY_UNAVAILABLE) {
-            QCC_DbgHLPrintf(("Deliver: Key not available requesting authentication", Description().c_str()));
-            Message msg(this);
-            status = bus.GetInternal().GetLocalEndpoint().GetPeerObj()->RequestAuthentication(msg, &endpoint);
-            /*
-             * Delivery is retried when the authentication completes
-             */
-            if (status == ER_OK) {
-                return ER_OK;
-            }
+        if (status == ER_BUS_AUTHENTICATION_PENDING) {
+            return ER_OK;
         }
     }
     /*
@@ -641,7 +633,7 @@ void _Message::MarshalHeaderFields()
                     Marshal4(field->v_string.len);
                 }
                 tPos = (char*)bufPos;
-                tLen = field->v_signature.len;
+                tLen = field->v_string.len;
                 MarshalBytes((void*)field->v_string.str, field->v_string.len + 1);
                 field->Clear();
                 field->typeId = id;
@@ -691,18 +683,37 @@ size_t _Message::ComputeHeaderLen()
 
 QStatus _Message::EncryptMessage()
 {
-    QStatus status;
-    PeerStateTable* peerStateTable = bus.GetInternal().GetPeerStateTable();
     KeyBlob key;
-    status = peerStateTable->GetPeerState(GetDestination())->GetKey(key, PEER_SESSION_KEY);
+    PeerState peerState = bus->GetInternal().GetPeerStateTable()->GetPeerState(GetDestination());
+    QStatus status = peerState->GetKey(key, PEER_SESSION_KEY);
+
     if (status == ER_OK) {
-        size_t argsLen = msgHeader.bodyLen - ajn::Crypto::ExpansionBytes;
+        /*
+         * Check we are authorized to send messages of this type to the remote peer.
+         */
+        if (!peerState->IsAuthorized((AllJoynMessageType)msgHeader.msgType, _PeerState::ALLOW_SECURE_TX)) {
+            status = ER_BUS_NOT_AUTHORIZED;
+        }
+    }
+    if (status == ER_OK) {
+        size_t argsLen = msgHeader.bodyLen - ajn::Crypto::MACLength;
         size_t hdrLen = ROUNDUP8(sizeof(msgHeader) + msgHeader.headerLen);
         status = ajn::Crypto::Encrypt(*this, key, (uint8_t*)msgBuf, hdrLen, argsLen);
         if (status == ER_OK) {
             authMechanism = key.GetTag();
             assert(msgHeader.bodyLen == argsLen);
             encrypt = false;
+        }
+    }
+    /*
+     * Need to request an authentication if we don't have a key.
+     */
+    if (status == ER_BUS_KEY_UNAVAILABLE) {
+        QCC_DbgHLPrintf(("Deliver: Key not available requesting authentication", Description().c_str()));
+        Message msg(this);
+        status = bus->GetInternal().GetLocalEndpoint().GetPeerObj()->RequestAuthentication(msg);
+        if (status == ER_OK) {
+            status = ER_BUS_AUTHENTICATION_PENDING;
         }
     }
     return status;
@@ -721,30 +732,29 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     size_t argsLen = (numArgs == 0) ? 0 : SignatureUtils::GetSize(args, numArgs);
     size_t hdrLen = 0;
 
-    if (!bus.IsStarted()) {
+    if (!bus->IsStarted()) {
         return ER_BUS_BUS_NOT_STARTED;
     }
     /*
-     * Toggle the autostart flag bit which is a 0 over the air but we prefer as a 1.
+     * Check if endianess needs to be swapped.
      */
-    flags ^= ALLJOYN_FLAG_AUTO_START;
+    endianSwap = outEndian != myEndian;
     /*
      * We marshal new messages in native endianess
      */
     encrypt = (flags & ALLJOYN_FLAG_ENCRYPTED) ? true : false;
-    endianSwap = false;
-    msgHeader.endian = this->myEndian;
-    msgHeader.msgType = (uint8_t)msgType;
+    msgHeader.endian = outEndian;
     msgHeader.flags = flags;
+    msgHeader.msgType = (uint8_t)msgType;
     msgHeader.majorVersion = ALLJOYN_MAJOR_PROTOCOL_VERSION;
-    msgHeader.serialNum = bus.GetInternal().NextSerial();
+    msgHeader.serialNum = bus->GetInternal().NextSerial();
     /*
      * Encryption will typically make the body length slightly larger because the encryption
-     * algorithm adds appends a MAC block to the end of the encrypted data.
+     * algorithm appends a MAC block to the end of the encrypted data.
      */
     if (encrypt) {
         QCC_DbgHLPrintf(("Encrypting messge to %s", destination.empty() ? "broadcast listeners" : destination.c_str()));
-        msgHeader.bodyLen = static_cast<uint32_t>(argsLen + ajn::Crypto::ExpansionBytes);
+        msgHeader.bodyLen = static_cast<uint32_t>(argsLen + ajn::Crypto::MACLength);
     } else {
         msgHeader.bodyLen = static_cast<uint32_t>(argsLen);
     }
@@ -752,7 +762,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
      * Keep the old message buffer around until we are done because some of the strings we are
      * marshaling may point into the old message.
      */
-    uint64_t* oldMsgBuf = msgBuf;
+    uint8_t* _oldMsgBuf = _msgBuf;
     /*
      * Clear out stale message data
      */
@@ -760,6 +770,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     bufPos = NULL;
     bufEOD = NULL;
     msgBuf = NULL;
+    _msgBuf = NULL;
     /*
      * There should be a mapping for every field type
      */
@@ -776,7 +787,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
     /*
      * Sender is obtained from the bus
      */
-    const qcc::String& sender = bus.GetInternal().GetLocalEndpoint().GetUniqueName();
+    const qcc::String& sender = bus->GetInternal().GetLocalEndpoint().GetUniqueName();
     hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].Clear();
     if (!sender.empty()) {
         hdrFields.field[ALLJOYN_HDR_FIELD_SENDER].typeId = ALLJOYN_STRING;
@@ -821,7 +832,7 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
      */
     hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].Clear();
     if ((msgHeader.flags & ALLJOYN_FLAG_COMPRESSED)) {
-        hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].v_uint32 = bus.GetInternal().GetCompressionRules().GetToken(hdrFields);
+        hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].v_uint32 = bus->GetInternal().GetCompressionRules()->GetToken(hdrFields);
         hdrFields.field[ALLJOYN_HDR_FIELD_COMPRESSION_TOKEN].typeId = ALLJOYN_UINT32;
     }
     /*
@@ -840,22 +851,32 @@ QStatus _Message::MarshalMessage(const qcc::String& expectedSignature,
      * Allocate buffer for entire message.
      */
     bufSize = (hdrLen + msgHeader.bodyLen + 7);
-    msgBuf = new uint64_t[bufSize / 8];
+    _msgBuf = new uint8_t[bufSize + 7];
+    msgBuf = (uint64_t*)((uintptr_t)(_msgBuf + 7) & ~7); /* Align to 8 byte boundary */
     /*
      * Initialize the buffer and copy in the message header
      */
     bufPos = (uint8_t*)msgBuf;
+    /*
+     * Toggle the autostart flag bit which is a 0 over the air but internally we prefer as a 1.
+     */
+    msgHeader.flags ^= ALLJOYN_FLAG_AUTO_START;
     memcpy(bufPos, &msgHeader, sizeof(msgHeader));
+    msgHeader.flags ^= ALLJOYN_FLAG_AUTO_START;
     bufPos += sizeof(msgHeader);
     /*
-     * Perfom endian-swap on the buffer so the header member remains in native endianess.
+     * Perfom endian-swap on the buffer so the header member is in message endianess.
      */
     if (endianSwap) {
         MessageHeader* hdr = (MessageHeader*)msgBuf;
-        EndianSwap32(hdr->bodyLen);
-        EndianSwap32(hdr->serialNum);
-        EndianSwap32(hdr->headerLen);
+        hdr->bodyLen = EndianSwap32(hdr->bodyLen);
+        hdr->serialNum = EndianSwap32(hdr->serialNum);
+        hdr->headerLen = EndianSwap32(hdr->headerLen);
     }
+    /*
+     *
+     */
+    msgHeader.flags = flags;
     /*
      * Marshal the header fields
      */
@@ -901,14 +922,15 @@ ExitMarshalMessage:
     /*
      * Don't need the old message buffer any more
      */
-    delete [] oldMsgBuf;
+    delete [] _oldMsgBuf;
 
     if (status == ER_OK) {
         QCC_DbgHLPrintf(("MarshalMessage: %d+%d %s", hdrLen, msgHeader.bodyLen, Description().c_str()));
     } else {
         QCC_LogError(status, ("MarshalMessage: %s", Description().c_str()));
-        delete [] msgBuf;
         msgBuf = NULL;
+        delete [] _msgBuf;
+        _msgBuf = NULL;
         bodyPtr = NULL;
         bufPos = NULL;
         bufEOD = NULL;
@@ -931,7 +953,7 @@ QStatus _Message::HelloMessage(bool isBusToBus, bool allowRemote, uint32_t& seri
         hdrFields.field[ALLJOYN_HDR_FIELD_INTERFACE].Set("s", org::alljoyn::Bus::InterfaceName);
         hdrFields.field[ALLJOYN_HDR_FIELD_MEMBER].Set("s", "BusHello");
 
-        qcc::String guid = bus.GetInternal().GetGlobalGUID().ToString();
+        qcc::String guid = bus->GetInternal().GetGlobalGUID().ToString();
         MsgArg args[2];
         args[0].Set("s", guid.c_str());
         args[1].Set("u", ALLJOYN_PROTOCOL_VERSION);
@@ -982,7 +1004,7 @@ QStatus _Message::HelloReply(bool isBusToBus, const qcc::String& uniqueName)
     hdrFields.field[ALLJOYN_HDR_FIELD_REPLY_SERIAL].Set("u", msgHeader.serialNum);
 
     if (isBusToBus) {
-        guidStr = bus.GetInternal().GetGlobalGUID().ToString();
+        guidStr = bus->GetInternal().GetGlobalGUID().ToString();
         MsgArg args[3];
         args[0].Set("s", uniqueName.c_str());
         args[1].Set("s", guidStr.c_str());
@@ -1295,7 +1317,7 @@ void _Message::ErrorMsg(QStatus status,
 QStatus _Message::GetExpansion(uint32_t token, MsgArg& replyArg)
 {
     QStatus status = ER_OK;
-    const HeaderFields* expFields = bus.GetInternal().GetCompressionRules().GetExpansion(token);
+    const HeaderFields* expFields = bus->GetInternal().GetCompressionRules()->GetExpansion(token);
     if (expFields) {
         MsgArg* hdrArray = new MsgArg[ALLJOYN_HDR_FIELD_UNKNOWN];
         size_t numElements = 0;

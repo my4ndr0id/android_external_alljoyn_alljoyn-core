@@ -6,7 +6,7 @@
  */
 
 /******************************************************************************
- * Copyright 2009-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2009-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -170,8 +170,8 @@ class _Message {
     friend class RemoteEndpoint;
     friend class EndpointAuth;
     friend class LocalEndpoint;
+    friend class NullEndpoint;
     friend class DaemonRouter;
-    friend class DBusObj;
     friend class AllJoynObj;
     friend class DeferredMsg;
     friend class AllJoynPeerObj;
@@ -483,6 +483,22 @@ class _Message {
      */
     bool operator==(const _Message& other) { return this == &other; }
 
+    /**
+     * Set the endianess for outgoing messages. This is mainly for testing purposes.
+     *
+     * @param endian  Either ALLJOYN_LITTLE_ENDIAN or ALLJOYN_BIG_ENDIAN. Any other value
+     *                sets the endianess to the native endianess for this platform.
+     *
+     *
+     */
+    static void SetEndianess(const char endian) {
+        if ((endian == ALLJOYN_LITTLE_ENDIAN) || (endian == ALLJOYN_BIG_ENDIAN)) {
+            outEndian = endian;
+        } else {
+            outEndian = myEndian;
+        }
+    }
+
   protected:
 
     /*
@@ -491,7 +507,7 @@ class _Message {
     /// @cond ALLJOYN_DEV
     /**
      * @internal
-     * Generate an method reply message from a method call.
+     * Generate a method reply message from a method call.
      *
      * @param call        The call message - can be this message.
      * @param args        The arguments for the reply (can be NULL)
@@ -730,13 +746,16 @@ class _Message {
     static const char myEndian = ALLJOYN_BIG_ENDIAN;    ///< Native endianness of host system we are running on: big endian.
 #endif
 
-    BusAttachment& bus;          ///< The bus this message was received or will be sent on.
+    static char outEndian;       ///< Endianess for outgoing messages
+
+    BusAttachment* bus;          ///< The bus this message was received or will be sent on.
 
     bool endianSwap;             ///< true if endianness will be swapped.
 
     MessageHeader msgHeader;     ///< Current message header.
 
-    uint64_t* msgBuf;            ///< Pointer to the current msg buffer (uint64_t to ensure 8 byte alignment).
+    uint8_t* _msgBuf;            ///< Pointer to the current msg buffer.
+    uint64_t* msgBuf;            ///< Pointer to the current msg buffer (8 byte aligned pointer into _msgBuf).
     MsgArg* msgArgs;             ///< Pointer to the unmarshaled arguments.
     uint8_t numMsgArgs;          ///< Number of message args (signature cannot be longer than 255 chars).
 
@@ -767,7 +786,7 @@ class _Message {
     /* Internal methods unmarshal side */
 
     void ClearHeader();
-    QStatus ParseValue(MsgArg* arg, const char*& sigPtr);
+    QStatus ParseValue(MsgArg* arg, const char*& sigPtr, bool arrayElem = false);
     QStatus ParseStruct(MsgArg* arg, const char*& sigPtr);
     QStatus ParseDictEntry(MsgArg* arg, const char*& sigPtr);
     QStatus ParseArray(MsgArg* arg, const char*& sigPtr);

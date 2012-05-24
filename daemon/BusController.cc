@@ -8,7 +8,7 @@
 /******************************************************************************
  *
  *
- * Copyright 2009-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2009-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -33,23 +33,20 @@
 
 using namespace std;
 using namespace qcc;
+using namespace ajn;
 
-namespace ajn {
-
-BusController::BusController(Bus& alljoynBus, QStatus& status) :
+BusController::BusController(Bus& alljoynBus) :
     bus(alljoynBus),
-#ifndef NDEBUG
-    alljoynDebugObj(bus),
-#endif
     dbusObj(bus, this),
-    alljoynObj(bus, this)
+    alljoynObj(bus, this),
+#ifndef NDEBUG
+    alljoynDebugObj(bus, this),
+#endif
+    initComplete(NULL)
+
 {
     DaemonRouter& router(reinterpret_cast<DaemonRouter&>(bus.GetInternal().GetRouter()));
     router.SetBusController(this);
-    status = dbusObj.Init();
-    if (ER_OK != status) {
-        QCC_LogError(status, ("DBusObj::Init failed"));
-    }
 }
 
 BusController::~BusController()
@@ -58,25 +55,69 @@ BusController::~BusController()
     router.SetBusController(NULL);
 }
 
-#ifndef NDEBUG
-debug::AllJoynDebugObj* debug::AllJoynDebugObj::self = NULL;
-#endif
-
-
-void BusController::ObjectRegistered(BusObject* obj)
+QStatus BusController::Init(const qcc::String& listenSpecs)
 {
-    QStatus status = ER_OK;
-    if (obj == &dbusObj) {
-        status = alljoynObj.Init();
-#ifndef NDEBUG
-    } else if (obj == &alljoynObj) {
-        status = alljoynDebugObj.Init();
-#endif
+    QStatus status;
+    qcc::Event initEvent;
+
+    initComplete = &initEvent;
+
+    /*
+     * Start the object initialization chain (see ObjectRegistered callback below)
+     */
+    status = dbusObj.Init();
+    if (ER_OK != status) {
+        QCC_LogError(status, ("DBusObj::Init failed"));
+    } else {
+        if (status == ER_OK) {
+            status = bus.Start();
+        }
+        if (status == ER_OK) {
+            status = Event::Wait(initEvent);
+        }
+        if (status == ER_OK) {
+            status = bus.StartListen(listenSpecs.c_str());
+            if (status != ER_OK) {
+                bus.Stop();
+                bus.Join();
+            }
+        }
     }
 
-    if (status != ER_OK) {
-        QCC_LogError(status, ("BusController::ObjectRegistered failed"));
-    }
+    initComplete = NULL;
+    return status;
 }
 
+/*
+ * The curious code below is to force various bus objects to be registered in order:
+ *
+ * /org/freedesktop/DBus
+ * /org/alljoyn/Bus
+ * /org/alljoyn/Debug
+ *
+ * The last one is optional and only registered for debug builds
+ */
+void BusController::ObjectRegistered(BusObject* obj)
+{
+    QStatus status;
+
+    if (obj == &dbusObj) {
+        status = alljoynObj.Init();
+        if (status == ER_OK) {
+            return;
+        }
+        QCC_LogError(status, ("alljoynObj::Init failed"));
+    }
+#ifndef NDEBUG
+    if (obj == &alljoynObj) {
+        status = alljoynDebugObj.Init();
+        if (status == ER_OK) {
+            return;
+        }
+        QCC_LogError(status, ("alljoynDebugObj::Init failed"));
+    }
+#endif
+    if (initComplete) {
+        initComplete->SetEvent();
+    }
 }

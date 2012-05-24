@@ -6,7 +6,7 @@
  */
 
 /******************************************************************************
- * Copyright 2009-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2009-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@
 #include <qcc/Mutex.h>
 #include <qcc/StringMapKey.h>
 #include <qcc/Timer.h>
+#include <qcc/ThreadPool.h>
 #include <qcc/Util.h>
 
 #include <alljoyn/BusObject.h>
@@ -78,7 +79,7 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
     /**
      * Constructor
      *
-     * @param bus   Bus associated with endpoint.
+     * @param bus          Bus associated with endpoint.
      */
     LocalEndpoint(BusAttachment& bus);
 
@@ -340,12 +341,12 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
     /**
      * Assignment operator is private - LocalEndpoints cannot be assigned.
      */
-    LocalEndpoint& operator=(const LocalEndpoint& other) { return *this; }
+    LocalEndpoint& operator=(const LocalEndpoint& other);
 
     /**
      * Copy constructor is private - LocalEndpoints cannot be copied.
      */
-    LocalEndpoint(const LocalEndpoint& other) : BusEndpoint(BusEndpoint::ENDPOINT_TYPE_LOCAL), bus(other.bus) { }
+    LocalEndpoint(const LocalEndpoint& other);
 
     /**
      * Type definition for a method call reply context
@@ -452,6 +453,13 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
      */
     AllJoynPeerObj* peerObj;
 
+    /**
+     * A thread pool to use when executing concurrent methods and signals.  This
+     * cannot be a member variable due to a consructor ordering catch-22 between
+     * BusAttachment and BusAttachment::Internal.
+     */
+    qcc::ThreadPool* threadPool;
+
     /** Helper to diagnose misses in the methodTable */
     QStatus Diagnose(Message& msg);
 
@@ -483,8 +491,21 @@ class LocalEndpoint : public BusEndpoint, public qcc::AlarmListener, public Mess
      * Do not call this method externally.
      */
     QStatus DoRegisterBusObject(BusObject& object, BusObject* parent, bool isPlaceholder);
-};
 
+    friend class MethodCallRunnable;
+    /**
+     * A function to allow a method call closure to call into the transport in
+     * order to, in turn, call into a bus object in order to actually dispatch
+     * the method.  We don't do this directly from the closure since the caller
+     * needs to be a friend of the bus object and we don't want to litter our
+     * bus objects with a bunch of seemingly random friends.  This is a private
+     * method so we have to be friends with the closure (see immediately above).
+     */
+    void DoCallMethodHandler(const MethodTable::Entry* entry, Message& message)
+    {
+        entry->object->CallMethodHandler(entry->handler, entry->member, message, entry->context);
+    }
+};
 
 /**
  * %LocalTransport is a special type of Transport that is responsible
@@ -563,7 +584,7 @@ class LocalTransport : public Transport {
      * @param newep           [OUT] Endpoint created as a result of successful connect.
      * @return  ER_NOT_IMPLEMENTED.
      */
-    QStatus Connect(const char* connectSpec, const SessionOpts& opts, RemoteEndpoint** newep) { return ER_NOT_IMPLEMENTED; }
+    QStatus Connect(const char* connectSpec, const SessionOpts& opts, BusEndpoint** newep) { return ER_NOT_IMPLEMENTED; }
 
     /**
      * Disconnect a local endpoint. (Not used for local transports)
@@ -674,20 +695,11 @@ class LocalTransport : public Transport {
     QStatus GetListenAddresses(const SessionOpts& opts, std::vector<qcc::String>& busAddrs) const { return ER_OK; }
 
     /**
-     * Indicates whether this transport may be used for a connection between
-     * an application and the daemon on the same machine or not.
+     * Indicates whether this transport is used for client-to-bus or bus-to-bus connections.
      *
-     * @return  true indicates this transport may be used for local connections.
+     * @return  Always returns false, the LocalTransport belongs to the local application.
      */
-    bool LocallyConnectable() const { return false; }
-
-    /**
-     * Indicates whether this transport may be used for a connection between
-     * an application and the daemon on a different machine or not.
-     *
-     * @return  true indicates this transport may be used for external connections.
-     */
-    bool ExternallyConnectable() const { return false; }
+    bool IsBusToBus() const { return false; }
 
   private:
 

@@ -20,93 +20,96 @@ LOCAL_C_INCLUDES := \
 	external/openssl/include \
 
 LOCAL_SRC_FILES := \
-	../common/src/XmlElement.cc \
-	../common/src/IPAddress.cc \
-	../common/src/Logger.cc \
-	../common/src/CryptoSRP.cc \
-	../common/src/Util.cc \
-	../common/src/String.cc \
 	../common/src/ASN1.cc \
-	../common/src/StringUtil.cc \
-	../common/src/BufferedSource.cc \
-	../common/src/Stream.cc \
-	../common/src/SDPRecord.cc \
-	../common/src/ScatterGatherList.cc \
-	../common/src/Crypto.cc \
-	../common/src/Timer.cc \
-	../common/src/GUID.cc \
-	../common/src/StreamPump.cc \
-	../common/src/Debug.cc \
-	../common/src/KeyBlob.cc \
-	../common/src/StringSource.cc \
-	../common/src/Pipe.cc \
-	../common/src/Config.cc \
 	../common/src/BigNum.cc \
-	../common/src/SocketStream.cc \
 	../common/src/BufferedSink.cc \
+	../common/src/BufferedSource.cc \
+	../common/src/Config.cc \
+	../common/src/Crypto.cc \
+	../common/src/CryptoSRP.cc \
+	../common/src/Debug.cc \
+	../common/src/GUID.cc \
+	../common/src/IPAddress.cc \
+	../common/src/KeyBlob.cc \
 	../common/src/LockTrace.cc \
-	../common/os/posix/Mutex.cc \
-	../common/os/posix/Socket.cc \
-	../common/os/posix/Event.cc \
-	../common/os/posix/atomic.cc \
-	../common/os/posix/time.cc \
-	../common/os/posix/Environ.cc \
-	../common/os/posix/FileStream.cc \
+	../common/src/Logger.cc \
+	../common/src/Pipe.cc \
+	../common/src/ScatterGatherList.cc \
+	../common/src/SocketStream.cc \
+	../common/src/Stream.cc \
+	../common/src/StreamPump.cc \
+	../common/src/String.cc \
+	../common/src/StringSource.cc \
+	../common/src/StringUtil.cc \
+	../common/src/ThreadPool.cc \
+	../common/src/Timer.cc \
+	../common/src/Util.cc \
+	../common/src/XmlElement.cc \
 	../common/os/posix/AdapterUtil.cc \
-	../common/os/posix/osUtil.cc \
-	../common/os/posix/Thread.cc \
+	../common/os/posix/atomic.cc \
+	../common/os/posix/Environ.cc \
+	../common/os/posix/Event.cc \
+	../common/os/posix/FileStream.cc \
 	../common/os/posix/IfConfigLinux.cc \
-	../common/crypto/openssl/CryptoRand.cc \
-	../common/crypto/openssl/CryptoRSA.cc \
+	../common/os/posix/Mutex.cc \
+	../common/os/posix/osUtil.cc \
+	../common/os/posix/Socket.cc \
+	../common/os/posix/SslSocket.cc \
+	../common/os/posix/Thread.cc \
+	../common/os/posix/time.cc \
+	../common/crypto/openssl/CryptoAES.cc \
 	../common/crypto/openssl/CryptoHash.cc \
-	../common/crypto/openssl/CryptoAES.cc
+	../common/crypto/openssl/CryptoRand.cc \
+	../common/crypto/openssl/CryptoRSA.cc
+
+
 
 LOCAL_SRC_FILES += \
-	src/BusUtil.cc \
-	src/MethodTable.cc \
-	src/DBusStd.cc \
-	src/RemoteEndpoint.cc \
-	src/CompressionRules.cc \
-	src/KeyStore.cc \
-	src/Transport.cc \
-	src/BusEndpoint.cc \
-	src/PermissionDB.cc \
-	src/UnixTransport.cc \
-	src/TCPTransport.cc \
-	src/AuthMechSRP.cc \
-	src/SimpleBusListener.cc \
-	src/Message_Gen.cc \
-	src/Message.cc \
-	src/BusAttachment.cc \
-	src/TransportList.cc \
-	src/PeerState.cc \
-	src/AuthMechLogon.cc \
-	src/AllJoynPeerObj.cc \
-	src/SessionOpts.cc \
-	src/AuthMechRSA.cc \
-	src/SignalTable.cc \
-	src/InterfaceDescription.cc \
-	src/DBusCookieSHA1.cc \
-	src/EndpointAuth.cc \
-	src/ClientRouter.cc \
-	src/MsgArg.cc \
-	src/BusObject.cc \
-	src/ProxyBusObject.cc \
-	src/XmlHelper.cc \
-	src/SASLEngine.cc \
-	src/Message_Parse.cc \
 	src/AllJoynCrypto.cc \
+	src/AllJoynPeerObj.cc \
 	src/AllJoynStd.cc \
-	src/LaunchdTransport.cc \
+	src/AuthMechLogon.cc \
+	src/AuthMechRSA.cc \
+	src/AuthMechSRP.cc \
+	src/BusAttachment.cc \
+	src/BusEndpoint.cc \
+	src/BusObject.cc \
+	src/BusUtil.cc \
+	src/ClientRouter.cc \
+	src/ClientTransport.cc \
+	src/CompressionRules.cc \
+	src/DBusCookieSHA1.cc \
+	src/DBusStd.cc \
+	src/EndpointAuth.cc \
+	src/InterfaceDescription.cc \
+	src/KeyStore.cc \
+	src/LocalTransport.cc \
+	src/Message.cc \
+	src/Message_Gen.cc \
+	src/Message_Parse.cc \
+	src/MethodTable.cc \
+	src/MsgArg.cc \
+	src/NullTransport.cc \
+	src/PeerState.cc \
+	src/PermissionDB.cc \
+	src/PersistGUID.cc \
+	src/ProxyBusObject.cc \
+	src/RemoteEndpoint.cc \
+	src/SASLEngine.cc \
+	src/SessionOpts.cc \
+	src/SignalTable.cc \
 	src/SignatureUtils.cc \
-	src/LocalTransport.cc
+	src/SimpleBusListener.cc \
+	src/Transport.cc \
+	src/TransportList.cc \
+	src/XmlHelper.cc \
+	src/posix/ClientTransport.cc
 
 LOCAL_SRC_FILES += \
 	autogen/Status.c \
 	autogen/version.cc
 
 LOCAL_SHARED_LIBRARIES := \
-	libstlport \
 	libcrypto \
 	libssl \
 	liblog
@@ -135,41 +138,88 @@ LOCAL_CFLAGS += \
 	-DQCC_OS_GROUP_POSIX
 
 LOCAL_C_INCLUDES := \
-	external/connectivity/stlport/stlport \
-	external/alljoyn/common/inc \
-	external/alljoyn/alljoyn_core/inc \
-	external/alljoyn/alljoyn_core/src \
-	external/alljoyn/alljoyn_core/daemon \
 	external/alljoyn/alljoyn_core/autogen \
+	external/alljoyn/alljoyn_core/daemon \
+	external/alljoyn/alljoyn_core/daemon/ice \
+	external/alljoyn/alljoyn_core/daemon/posix \
+	external/alljoyn/alljoyn_core/inc \
+	external/alljoyn/alljoyn_core/JSON \
+	external/alljoyn/alljoyn_core/src \
+	external/alljoyn/common/inc \
+	external/connectivity/stlport/stlport \
 	external/openssl/include \
 
 LOCAL_SRC_FILES := \
-	daemon/DaemonRouter.cc \
-	daemon/RuleTable.cc \
-	daemon/DaemonUnixTransport.cc \
-	daemon/NameService.cc \
-	daemon/bt_bluez/AdapterObject.cc \
-	daemon/bt_bluez/BlueZUtils.cc \
-	daemon/bt_bluez/BlueZIfc.cc \
-	daemon/bt_bluez/BTAccessor.cc \
-	daemon/bt_bluez/BlueZHCIUtils.cc \
-	daemon/BTNodeDB.cc \
-	daemon/Bus.cc \
-	daemon/BusController.cc \
+	daemon/AllJoynDebugObj.cc \
 	daemon/AllJoynObj.cc \
 	daemon/BTController.cc \
-	daemon/ServiceDB.cc \
-	daemon/DBusObj.cc \
-	daemon/VirtualEndpoint.cc \
-	daemon/DaemonLaunchdTransport.cc \
+	daemon/BTNodeDB.cc \
 	daemon/BTTransport.cc \
-	daemon/NsProtocol.cc \
+	daemon/Bus.cc \
+	daemon/BusController.cc \
+	daemon/ConfigDB.cc \
+	daemon/DBusObj.cc \
+	daemon/DaemonRouter.cc \
+	daemon/DaemonTransport.cc \
+	daemon/NameService.cc \
 	daemon/NameTable.cc \
+	daemon/NetworkInterface.cc \
+	daemon/NsProtocol.cc \
+	daemon/Packet.cc \
+	daemon/PacketEngine.cc \
+	daemon/PacketEngineStream.cc \
+	daemon/PacketPool.cc \
 	daemon/PolicyDB.cc \
 	daemon/PropertyDB.cc \
-	daemon/DaemonTCPTransport.cc \
+	daemon/RuleTable.cc \
+	daemon/ServiceDB.cc \
+	daemon/TCPTransport.cc \
+	daemon/VirtualEndpoint.cc \
+	daemon/bt_bluez/AdapterObject.cc \
+	daemon/bt_bluez/BlueZHCIUtils.cc \
+	daemon/bt_bluez/BlueZIfc.cc \
+	daemon/bt_bluez/BlueZUtils.cc \
+	daemon/bt_bluez/BTAccessor.cc \
+	daemon/ice/Component.cc \
+	daemon/ice/DaemonICETransport.cc \
+	daemon/ice/DiscoveryManager.cc \
+	daemon/ice/HttpConnection.cc \
+	daemon/ice/ICECandidate.cc \
+	daemon/ice/ICECandidatePair.cc \
+	daemon/ice/ICEManager.cc \
+	daemon/ice/ICESession.cc \
+	daemon/ice/ICEStream.cc \
+	daemon/ice/ProximityScanEngine.cc \
+	daemon/ice/RendezvousServerConnection.cc \
+	daemon/ice/RendezvousServerInterface.cc \
+	daemon/ice/SCRAM_SHA1.cc \
+	daemon/ice/STUNSocketStream.cc \
+	daemon/ice/Stun.cc \
+	daemon/ice/StunActivity.cc \
+	daemon/ice/StunAttributeBase.cc \
+	daemon/ice/StunAttributeChannelNumber.cc \
+	daemon/ice/StunAttributeData.cc \
+	daemon/ice/StunAttributeErrorCode.cc \
+	daemon/ice/StunAttributeEvenPort.cc \
+	daemon/ice/StunAttributeFingerprint.cc \
+	daemon/ice/StunAttributeMappedAddress.cc \
+	daemon/ice/StunAttributeMessageIntegrity.cc \
+	daemon/ice/StunAttributeRequestedTransport.cc \
+	daemon/ice/StunAttributeStringBase.cc \
+	daemon/ice/StunAttributeUnknownAttributes.cc \
+	daemon/ice/StunAttributeXorMappedAddress.cc \
+	daemon/ice/StunCredential.cc \
+	daemon/ice/StunMessage.cc \
+	daemon/ice/StunRetry.cc \
+	daemon/ice/StunTransactionID.cc \
+	daemon/JSON/json_reader.cc \
+	daemon/JSON/json_value.cc \
+	daemon/JSON/json_writer.cc \
 	daemon/posix/daemon-main.cc \
-	daemon/ConfigDB.cc \
+	daemon/posix/DaemonTransport.cc \
+	daemon/posix/ICEPacketStream.cc \
+	daemon/posix/ProximityScanner.cc \
+	daemon/posix/UDPPacketStream.cc
 
 LOCAL_SRC_FILES += \
 	autogen/Status.c \
@@ -191,3 +241,5 @@ LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE := alljoyn-daemon
 
 include $(BUILD_EXECUTABLE)
+
+

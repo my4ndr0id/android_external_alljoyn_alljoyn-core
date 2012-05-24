@@ -5,7 +5,7 @@
  */
 
 /******************************************************************************
- * Copyright 2010-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2010-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@
 
 #include <alljoyn/KeyStoreListener.h>
 
+#include "PeerState.h"
 #include "KeyStore.h"
 
 #include <Status.h>
@@ -48,7 +49,15 @@ using namespace qcc;
 namespace ajn {
 
 
-static const uint16_t KeyStoreVersion = 0x0102;
+/*
+ * Lowest version number we can read
+ */
+static const uint16_t LowStoreVersion = 0x0102;
+
+/*
+ * Current key store version we will write
+ */
+static const uint16_t KeyStoreVersion = 0x0103;
 
 
 QStatus KeyStoreListener::PutKeys(KeyStore& keyStore, const qcc::String& source, const qcc::String& password)
@@ -182,6 +191,7 @@ KeyStore::~KeyStore()
     }
     lock.Unlock(MUTEX_CONTEXT);
     delete defaultListener;
+    delete listener;
     delete keyStoreKey;
     delete keys;
 }
@@ -191,7 +201,7 @@ QStatus KeyStore::SetListener(KeyStoreListener& listener)
     if (this->listener != NULL) {
         return ER_BUS_LISTENER_ALREADY_SET;
     } else {
-        this->listener = &listener;
+        this->listener = new ProtectedKeyStoreListener(&listener);
         return ER_OK;
     }
 }
@@ -200,7 +210,8 @@ QStatus KeyStore::Init(const char* fileName, bool isShared)
 {
     if (storeState == UNAVAILABLE) {
         if (listener == NULL) {
-            listener = defaultListener = new DefaultKeyStoreListener(application, fileName);
+            defaultListener = new DefaultKeyStoreListener(application, fileName);
+            listener = new ProtectedKeyStoreListener(defaultListener);
         }
         shared = isShared;
         return Load();
@@ -299,7 +310,7 @@ QStatus KeyStore::Pull(Source& source, const qcc::String& password)
 
     /* Pull and check the key store version */
     QStatus status = source.PullBytes(&version, sizeof(version), pulled);
-    if ((status == ER_OK) && (version != KeyStoreVersion)) {
+    if ((status == ER_OK) && ((version > KeyStoreVersion) || (version < LowStoreVersion))) {
         status = ER_BUS_KEYSTORE_VERSION_MISMATCH;
         QCC_LogError(status, ("Keystore has wrong version expected %d got %d", KeyStoreVersion, version));
     }
@@ -314,6 +325,7 @@ QStatus KeyStore::Pull(Source& source, const qcc::String& password)
     }
 
     /* This is the only chance to generate the key store key */
+    delete keyStoreKey;
     keyStoreKey = new KeyBlob(password + GetGuid(), Crypto_AES::AES128_SIZE, KeyBlob::AES);
 
     /* Allow for an uninitialized (empty) key store */
@@ -371,6 +383,18 @@ QStatus KeyStore::Pull(Source& source, const qcc::String& password)
                     KeyRecord& keyRec = (*keys)[guid];
                     keyRec.revision = rev;
                     status = keyRec.key.Load(strSource);
+                    if (status == ER_OK) {
+                        if (version > LowStoreVersion) {
+                            status = strSource.PullBytes(&keyRec.accessRights, sizeof(keyRec.accessRights), pulled);
+                        } else {
+                            /*
+                             * Maintain backwards compatibility with an older key store
+                             */
+                            for (size_t i = 0; i < ArraySize(keyRec.accessRights); ++i) {
+                                keyRec.accessRights[i] = _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX;
+                            }
+                        }
+                    }
                     QCC_DbgPrintf(("KeyStore::Pull rev:%d GUID %s %s", rev, QCC_StatusText(status), guid.ToString().c_str()));
                 }
             }
@@ -517,6 +541,7 @@ QStatus KeyStore::Push(Sink& sink)
         strSink.PushBytes(&it->second.revision, sizeof(revision), pushed);
         strSink.PushBytes(it->first.GetBytes(), qcc::GUID128::SIZE, pushed);
         it->second.key.Store(strSink);
+        strSink.PushBytes(&it->second.accessRights, sizeof(it->second.accessRights), pushed);
         QCC_DbgPrintf(("KeyStore::Push rev:%d GUID %s", it->second.revision, it->first.ToString().c_str()));
     }
     size_t keysLen = strSink.GetString().size();
@@ -579,7 +604,7 @@ ExitPush:
     return status;
 }
 
-QStatus KeyStore::GetKey(const qcc::GUID128& guid, KeyBlob& key)
+QStatus KeyStore::GetKey(const qcc::GUID128& guid, KeyBlob& key, uint8_t accessRights[4])
 {
     if (storeState == UNAVAILABLE) {
         return ER_BUS_KEYSTORE_NOT_LOADED;
@@ -588,7 +613,10 @@ QStatus KeyStore::GetKey(const qcc::GUID128& guid, KeyBlob& key)
     lock.Lock(MUTEX_CONTEXT);
     QCC_DbgPrintf(("KeyStore::GetKey %s", guid.ToString().c_str()));
     if (keys->find(guid) != keys->end()) {
-        key = (*keys)[guid].key;
+        KeyRecord& keyRec = (*keys)[guid];
+        key = keyRec.key;
+        memcpy(accessRights, &keyRec.accessRights, sizeof(accessRights));
+        QCC_DbgPrintf(("AccessRights %1x%1x%1x%1x", accessRights[0], accessRights[1], accessRights[2], accessRights[3]));
         status = ER_OK;
     } else {
         status = ER_BUS_KEY_UNAVAILABLE;
@@ -609,7 +637,7 @@ bool KeyStore::HasKey(const qcc::GUID128& guid)
     return hasKey;
 }
 
-QStatus KeyStore::AddKey(const qcc::GUID128& guid, const KeyBlob& key)
+QStatus KeyStore::AddKey(const qcc::GUID128& guid, const KeyBlob& key, const uint8_t accessRights[4])
 {
     if (storeState == UNAVAILABLE) {
         return ER_BUS_KEYSTORE_NOT_LOADED;
@@ -619,6 +647,8 @@ QStatus KeyStore::AddKey(const qcc::GUID128& guid, const KeyBlob& key)
     KeyRecord& keyRec = (*keys)[guid];
     keyRec.revision = revision + 1;
     keyRec.key = key;
+    QCC_DbgPrintf(("AccessRights %1x%1x%1x%1x", accessRights[0], accessRights[1], accessRights[2], accessRights[3]));
+    memcpy(&keyRec.accessRights, accessRights, sizeof(accessRights));
     storeState = MODIFIED;
     deletions.erase(guid);
     lock.Unlock(MUTEX_CONTEXT);

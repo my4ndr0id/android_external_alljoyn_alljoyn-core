@@ -269,7 +269,7 @@ QStatus AdvTunnel::RelayAdv()
         return status;
     }
 
-    uint32_t count;
+    uint32_t count = 0;
     status = PullInt(count);
     std::vector<qcc::String> nameList;
     for (size_t i = 0; (status == ER_OK) && (i < count); ++i) {
@@ -462,6 +462,8 @@ int main(int argc, char** argv)
 
     ns.SetCallback(new CallbackImpl<AdvTunnel, void, const qcc::String&, const qcc::String&, std::vector<qcc::String>&, uint8_t>
                        (&tunnel, &AdvTunnel::Found));
+
+    ns.Enable();
 
     /*
      * In sniffMode we just report advertisements

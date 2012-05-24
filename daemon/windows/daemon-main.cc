@@ -42,12 +42,9 @@
 #include <Status.h>
 
 #include "Transport.h"
-#include "DaemonTCPTransport.h"
-#if defined(QCC_OS_DARWIN)
-#warning BT Support on Darwin needs to be implemented
-#else
+#include "TCPTransport.h"
+#include "DaemonTransport.h"
 #include "BTTransport.h"
-#endif
 
 #include "Bus.h"
 #include "BusController.h"
@@ -74,7 +71,9 @@ static const char defaultConfig[] =
     "<busconfig>"
     "  <type>alljoyn</type>"
     "  <listen>tcp:addr=0.0.0.0,port=9955,family=ipv4</listen>"
+    "  <listen>localhost:port=9956</listen>"
     "  <listen>bluetooth:</listen>"
+    "  <listen>ice:</listen>"
     "  <policy context=\"default\">"
     "    <!-- Allow everything to be sent -->"
     "    <allow send_destination=\"*\" eavesdrop=\"false\"/>"
@@ -88,6 +87,14 @@ static const char defaultConfig[] =
     "  <limit name=\"max_completed_connections_tcp\">64</limit>"
     "  <alljoyn module=\"ipns\">"
     "    <property interfaces=\"*\"/>"
+    "  </alljoyn>"
+    "  <alljoyn module=\"icedm\">"
+    "    <property interfaces=\"*\"/>"
+    "    <property server=\"rdvs-test.qualcomm.com\"/>"
+    "    <property EthernetPrefix=\"eth\"/>"
+    "    <property WiFiPrefix=\"wlan\"/>"
+    "    <property MobileNwPrefix=\"ppp\"/>"
+    "    <property Protocol=\"HTTPS\"/>"
     "  </alljoyn>"
     "</busconfig>";
 
@@ -254,6 +261,8 @@ int daemon(OptParse& opts)
         qcc::String addrStr(*it);
         if (it->compare(0, sizeof("tcp:") - 1, "tcp:") == 0) {
             // No special processing needed for TCP.
+        } else if (it->compare(0, sizeof("localhost:") - 1, "localhost:") == 0) {
+            // No special processing needed for localhost.
         } else if (it->compare("bluetooth:") == 0) {
             skip = opts.GetNoBT();
         } else {
@@ -287,48 +296,37 @@ int daemon(OptParse& opts)
     // specified in the listen spec, they will be instantiated.
     //
     TransportFactoryContainer cntr;
-    cntr.Add(new TransportFactory<DaemonTCPTransport>("tcp", false));
+    cntr.Add(new TransportFactory<DaemonTransport>(DaemonTransport::TransportName, false));
+    cntr.Add(new TransportFactory<TCPTransport>(TCPTransport::TransportName, false));
     if (!opts.GetNoBT()) {
         cntr.Add(new TransportFactory<BTTransport>("bluetooth", false));
     }
 
     Bus ajBus("alljoyn-daemon", cntr, listenSpecs.c_str());
-    BusController ajBusController(ajBus, status);
-    if (ER_OK != status) {
-        Log(LOG_ERR, "Failed to create BusController: %s\n", QCC_StatusText(status));
-        return DAEMON_EXIT_STARTUP_ERROR;
-    }
-
-    status = ajBus.Start();
-    if (status != ER_OK) {
-        Log(LOG_ERR, "Failed to start AllJoyn system: %s\n", QCC_StatusText(status));
-        return DAEMON_EXIT_STARTUP_ERROR;
-    }
-
+    /*
+     * Check we have at least one authentication mechanism registered.
+     */
     if (!config->GetAuth().empty()) {
         if (ajBus.GetInternal().FilterAuthMechanisms(config->GetAuth()) == 0) {
             Log(LOG_ERR, "No supported authentication mechanisms.  Aborting...\n");
-            ajBus.Stop();
-            ajBus.Join();
             return DAEMON_EXIT_STARTUP_ERROR;
         }
     }
-
-    status = ajBus.StartListen(listenSpecs.c_str());
+    /*
+     * Create the bus controller and initialize and start the bus.
+     */
+    BusController ajBusController(ajBus);
+    status = ajBusController.Init(listenSpecs);
     if (ER_OK != status) {
-        Log(LOG_ERR, "Failed to start listening on specified addresses\n");
-        ajBus.Stop();
-        ajBus.Join();
+        Log(LOG_ERR, "Failed to initialize BusController: %s\n", QCC_StatusText(status));
         return DAEMON_EXIT_STARTUP_ERROR;
     }
-
 
     if (opts.PrintAddress()) {
         qcc::String addrStr(listenSpecs);
         addrStr += "\n";
         printf("%s", addrStr.c_str());
     }
-
     /*
      * Wait until we find a Control-C happening.
      */

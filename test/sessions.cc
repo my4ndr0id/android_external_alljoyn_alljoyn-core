@@ -283,6 +283,7 @@ class AutoChatThread : public Thread, public ThreadListener {
             buf[len] = 'a' + (len % 26);
             qcc::Sleep(delay);
         }
+        delete[] buf;
         return 0;
     }
 
@@ -595,7 +596,7 @@ int main(int argc, char** argv)
     const char* connectSpec = getenv("BUS_ADDRESS");
     if (connectSpec == NULL) {
 #ifdef _WIN32
-        connectSpec = "tcp:addr=127.0.0.1,port=9955";
+        connectSpec = "tcp:addr=127.0.0.1,port=9956";
 #else
         connectSpec = "unix:abstract=alljoyn";
 #endif

@@ -35,9 +35,14 @@ using namespace ajn;
 using namespace qcc;
 using namespace std;
 
+/*
+ * Set the number of concurrent method and signal handlers on our local endpoint
+ * to four.
+ */
+const uint32_t EP_CONCURRENCY = 4;
 
 Bus::Bus(const char* applicationName, TransportFactoryContainer& factories, const char* listenSpecs) :
-    BusAttachment(new Internal(applicationName, *this, factories, new DaemonRouter, true, listenSpecs)),
+    BusAttachment(new Internal(applicationName, *this, factories, new DaemonRouter, true, listenSpecs), EP_CONCURRENCY),
     busListener(NULL)
 {
     GetInternal().GetRouter().SetGlobalGUID(GetInternal().GetGlobalGUID());
@@ -52,17 +57,16 @@ QStatus Bus::StartListen(const qcc::String& listenSpec, bool& listening)
     if (trans) {
         status = trans->StartListen(listenSpec.c_str());
         if (ER_OK == status) {
-            if (trans->LocallyConnectable()) {
-                if (!localAddrs.empty()) {
-                    localAddrs += ';';
-                }
-                localAddrs += listenSpec + ",guid=" + GetInternal().GetGlobalGUID().ToString();
-            }
-            if (trans->ExternallyConnectable()) {
+            if (trans->IsBusToBus()) {
                 if (!externalAddrs.empty()) {
                     externalAddrs += ';';
                 }
                 externalAddrs += listenSpec + ",guid=" + GetInternal().GetGlobalGUID().ToString();
+            } else {
+                if (!localAddrs.empty()) {
+                    localAddrs += ';';
+                }
+                localAddrs += listenSpec + ",guid=" + GetInternal().GetGlobalGUID().ToString();
             }
             listening = true;
         }

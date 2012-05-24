@@ -65,11 +65,13 @@ class _BTNodeInfo {
         SESSION_UP
     };
 
+    #define BTNODEINFO_INVALID_GUID "dd464c6f2163464db492d8e5180519b9"
+
     /**
      * Default constructor.
      */
     _BTNodeInfo() :
-        guid(),
+        guid(BTNODEINFO_INVALID_GUID),
         uniqueName(),
         nodeAddr(),
         relationship(UNAFFILIATED),
@@ -88,7 +90,7 @@ class _BTNodeInfo {
      * @param nodeAddr      Bus address of the node
      */
     _BTNodeInfo(const BTBusAddress& nodeAddr) :
-        guid(),
+        guid(BTNODEINFO_INVALID_GUID),
         uniqueName(),
         nodeAddr(nodeAddr),
         relationship(UNAFFILIATED),
@@ -108,7 +110,7 @@ class _BTNodeInfo {
      * @param uniqueName    Unique bus name of the daemon on the node
      */
     _BTNodeInfo(const BTBusAddress& nodeAddr, const qcc::String& uniqueName) :
-        guid(),
+        guid(BTNODEINFO_INVALID_GUID),
         uniqueName(uniqueName),
         nodeAddr(nodeAddr),
         relationship(UNAFFILIATED),
@@ -523,11 +525,11 @@ class _BTNodeInfo {
      * Create in a human readable form for the node (includes the memory
      * address of the managed object instance.
      *
-     * @return  a string representation of node: "XX:XX:XX:XX:XX:XX-XXXX (0xXXXXXXX)"
+     * @return  a string representation of node: "XX:XX:XX:XX:XX:XX-XXXX XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (0xXXXXXXX)"
      */
     qcc::String ToString() const
     {
-        return nodeAddr.ToString() + " (0x" + qcc::U64ToString(reinterpret_cast<uint64_t>(this), 16) + ")";
+        return nodeAddr.ToString() + " " + guid.ToString() + " (0x" + qcc::U64ToString(reinterpret_cast<uint64_t>(&(*this)), 16) + ")";
     }
 
     /**

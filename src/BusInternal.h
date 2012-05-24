@@ -128,6 +128,11 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
     CompressionRules& GetCompressionRules() { return compressionRules; };
 
     /**
+     * Override the compressions rules for this bus attachment.
+     */
+    void OverrideCompressionRules(CompressionRules& newRules) { compressionRules = newRules; }
+
+    /**
      * Get the shared timer.
      */
     qcc::Timer& GetTimer() { return timer; }
@@ -274,16 +279,16 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
     qcc::String application;              /* Name of the that owns the BusAttachment application */
     BusAttachment& bus;                   /* Reference back to the bus attachment that owns this state */
     qcc::Mutex listenersLock;             /* Mutex that protects BusListeners vector */
-    std::list<BusListener*> listeners;     /* List of registered BusListeners */
+    std::list<BusListener*> listeners;    /* List of registered BusListeners */
     TransportList transportList;          /* List of active transports */
     KeyStore keyStore;                    /* The key store for the bus attachment */
     AuthManager authManager;              /* The authentication manager for the bus attachment */
-    qcc::GUID128 globalGuid;                 /* Global GUID for this BusAttachment */
+    qcc::GUID128 globalGuid;              /* Global GUID for this BusAttachment */
     int32_t msgSerial;                    /* Serial number is updated for every message sent by this bus */
     Router* router;                       /* Message bus router */
     PeerStateTable peerStateTable;        /* Table that maintains state information about remote peers */
     LocalEndpoint& localEndpoint;         /* The local endpoint */
-    CompressionRules compressionRules;    /* Rules for compresssing headers */
+    CompressionRules compressionRules;    /* Rules for compresssing and decompressing headers */
     std::map<qcc::StringMapKey, InterfaceDescription> ifaceDescriptions;
 
     qcc::Timer timer;                     /* Timer used for various timeouts such as method replies */
@@ -293,7 +298,12 @@ class BusAttachment::Internal : public MessageReceiver, public qcc::AlarmListene
     qcc::Mutex stopLock;                  /* Protects BusAttachement::Stop from being reentered */
     int32_t stopCount;                    /* Number of caller's blocked in BusAttachment::Stop() */
 
-    std::map<SessionPort, SessionPortListener*> sessionPortListeners;  /* Lookup SessionPortListener by session port */
+    struct ProtectedSessionPortListener {
+        SessionPortListener* listener;
+        int32_t refCount;
+        ProtectedSessionPortListener(SessionPortListener* listener) : listener(listener), refCount(0) { }
+    };
+    std::map<SessionPort, ProtectedSessionPortListener> sessionPortListeners;  /* Lookup SessionPortListener by session port */
     std::map<SessionId, SessionListener*> sessionListeners;            /* Lookup SessionListener by session id */
     qcc::Mutex sessionListenersLock;                                   /* Lock protecting sessionListners maps */
 };

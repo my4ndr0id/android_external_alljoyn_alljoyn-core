@@ -292,7 +292,7 @@ static QStatus TestMarshal(const MsgArg* argList, size_t numArgs, const char* ex
     TestPipe stream;
     MyMessage msg;
     uint32_t serial;
-    RemoteEndpoint ep(*gBus, false, "", stream, "dummy", false);
+    RemoteEndpoint ep(*gBus, false, "", &stream, "dummy", false);
     ep.GetFeatures().handlePassing = true;
 
     if (numArgs == 0) {
@@ -957,7 +957,7 @@ QStatus TestMsgUnpack()
     size_t numArgs = ArraySize(args);
     uint32_t serial;
     double d = 0.9;
-    RemoteEndpoint ep(*gBus, false, "", stream, "dummy", false);
+    RemoteEndpoint ep(*gBus, false, "", &stream, "dummy", false);
     ep.GetFeatures().handlePassing = true;
 
     MsgArg::Set(args, numArgs, "usyd", 4, "hello", 8, d);
@@ -1167,6 +1167,55 @@ int main(int argc, char** argv)
     if (status == ER_OK) {
         status = TestMsgUnpack();
     }
+    /* Test illegal dictionary element constructions */
+    if (status == ER_OK) {
+        MsgArg arg;
+        status = arg.Set("{sy}", s, y);
+        if (status == ER_OK) {
+            status = TestMarshal(&arg, 1);
+        }
+        if (status == ER_OK) {
+            status = ER_FAIL;
+        } else {
+            status = ER_OK;
+        }
+    }
+    if (status == ER_OK) {
+        MsgArg arg;
+        status = arg.Set("{ays}", ArraySize(ay), ay, s);
+        if (status == ER_OK) {
+            status = ER_FAIL;
+        } else {
+            status = ER_OK;
+        }
+    }
+    /* Not a complete type */
+    if (status == ER_OK) {
+        MsgArg arg;
+        status = arg.Set("iii", 1, 2, 3);
+        if (status == ER_OK) {
+            status = ER_FAIL;
+        } else {
+            status = ER_OK;
+        }
+    }
+    if (status == ER_OK) {
+        MsgArg arg("iii", 1, 2, 3);
+        if (arg.typeId != ALLJOYN_INVALID) {
+            status = ER_FAIL;
+        }
+    }
+    /* Truncated array */
+    if (status == ER_OK) {
+        MsgArg arg;
+        status = arg.Set("a", ArraySize(ay), ay);
+        if (status == ER_OK) {
+            status = ER_FAIL;
+        } else {
+            status = ER_OK;
+        }
+    }
+
     if (status == ER_OK) {
         status = MarshalTests();
     }

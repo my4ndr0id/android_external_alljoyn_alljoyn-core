@@ -5,7 +5,7 @@
  */
 
 /******************************************************************************
- * Copyright 2010-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2010-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -53,6 +53,40 @@ using namespace qcc;
 namespace ajn {
 
 static const uint32_t PEER_AUTH_VERSION = 0x00010000;
+
+static void SetRights(PeerState& peerState, bool mutual, bool challenger)
+{
+    if (mutual) {
+        QCC_DbgHLPrintf(("SetRights mutual"));
+        peerState->SetAuthorization(MESSAGE_METHOD_CALL, _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX);
+        peerState->SetAuthorization(MESSAGE_METHOD_RET,  _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX);
+        peerState->SetAuthorization(MESSAGE_ERROR,       _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX);
+        peerState->SetAuthorization(MESSAGE_SIGNAL,      _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX);
+    } else {
+        if (challenger) {
+            QCC_DbgHLPrintf(("SetRights challenger"));
+            /*
+             * We are the challenger in the auth conversation. The authentication was one-side so we
+             * will accept encrypted calls from the remote peer but will not send them.
+             */
+            peerState->SetAuthorization(MESSAGE_METHOD_CALL, _PeerState::ALLOW_SECURE_RX);
+            peerState->SetAuthorization(MESSAGE_METHOD_RET,  _PeerState::ALLOW_SECURE_TX);
+            peerState->SetAuthorization(MESSAGE_ERROR,       _PeerState::ALLOW_SECURE_TX);
+            peerState->SetAuthorization(MESSAGE_SIGNAL,      _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX);
+        } else {
+            QCC_DbgHLPrintf(("SetRights responder"));
+            /*
+             * We initiated the authentication and responded to challenges from the remote peer. The
+             * authentication was not mutual so we are not going to allow encrypted method calls
+             * from the remote peer.
+             */
+            peerState->SetAuthorization(MESSAGE_METHOD_CALL, _PeerState::ALLOW_SECURE_TX);
+            peerState->SetAuthorization(MESSAGE_METHOD_RET,  _PeerState::ALLOW_SECURE_RX);
+            peerState->SetAuthorization(MESSAGE_ERROR,       _PeerState::ALLOW_SECURE_RX);
+            peerState->SetAuthorization(MESSAGE_SIGNAL,      _PeerState::ALLOW_SECURE_TX | _PeerState::ALLOW_SECURE_RX);
+        }
+    }
+}
 
 AllJoynPeerObj::AllJoynPeerObj(BusAttachment& bus) :
     BusObject(bus, org::alljoyn::Bus::Peer::ObjectPath, false),
@@ -152,25 +186,65 @@ void AllJoynPeerObj::GetExpansion(const InterfaceDescription::Member* member, Me
 
 QStatus AllJoynPeerObj::RequestHeaderExpansion(Message& msg, RemoteEndpoint* sender)
 {
+    bool expansionPending = false;
+    uint32_t token = msg->GetCompressionToken();
+
     assert(sender == bus.GetInternal().GetRouter().FindEndpoint(msg->GetRcvEndpointName()));
-    return DispatchRequest(msg, EXPAND_HEADER, sender->GetRemoteName());
+
+    lock.Lock(MUTEX_CONTEXT);
+    /*
+     * First check if there are any other messages waiting for the same expansion rule.
+     */
+    for (std::deque<Message>::iterator iter = msgsPendingExpansion.begin(); iter != msgsPendingExpansion.end(); ++iter) {
+        if ((*iter)->GetCompressionToken() == token) {
+            expansionPending = true;
+            break;
+        }
+    }
+    msgsPendingExpansion.push_back(msg);
+    lock.Unlock(MUTEX_CONTEXT);
+    /*
+     * If there is already an expansion request for this message we don't need another one.
+     */
+    if (expansionPending) {
+        return ER_OK;
+    } else {
+        return DispatchRequest(msg, EXPAND_HEADER, sender->GetRemoteName());
+    }
 }
 
-QStatus AllJoynPeerObj::RequestAuthentication(Message& msg, RemoteEndpoint* endpoint)
+QStatus AllJoynPeerObj::RequestAuthentication(Message& msg)
 {
-    return DispatchRequest(msg, AUTHENTICATE_PEER, endpoint->GetUniqueName());
+    return DispatchRequest(msg, AUTHENTICATE_PEER);
+}
+
+bool AllJoynPeerObj::RemoveCompressedMessage(Message& msg, uint32_t token)
+{
+    lock.Lock(MUTEX_CONTEXT);
+    for (std::deque<Message>::iterator iter = msgsPendingExpansion.begin(); iter != msgsPendingExpansion.end(); ++iter) {
+        if ((*iter)->GetCompressionToken() == token) {
+            msg = *iter;
+            msgsPendingExpansion.erase(iter);
+            lock.Unlock(MUTEX_CONTEXT);
+            return true;
+        }
+    }
+    lock.Unlock(MUTEX_CONTEXT);
+    return false;
 }
 
 /**
- * How long (in milliseconds) to wait for a response to an expansion request.
+ * We keep the timeout for the expansion request small to bound the number of unexpanded messages
+ * that we have to queue while we wait for the response. This neutralizes a DOS attack where a remote device
+ * that is sending compressed messages never responds to the request for the expansion rule.
  */
-#define EXPANSION_TIMEOUT   10000
+#define EXPANSION_TIMEOUT   1000
 
 void AllJoynPeerObj::ExpandHeader(Message& msg, const qcc::String& receivedFrom)
 {
     QStatus status = ER_OK;
     uint32_t token = msg->GetCompressionToken();
-    const HeaderFields* expFields = bus.GetInternal().GetCompressionRules().GetExpansion(token);
+    const HeaderFields* expFields = bus.GetInternal().GetCompressionRules()->GetExpansion(token);
     if (!expFields) {
         Message replyMsg(bus);
         MsgArg arg("u", token);
@@ -189,7 +263,7 @@ void AllJoynPeerObj::ExpandHeader(Message& msg, const qcc::String& receivedFrom)
         if (status == ER_OK) {
             status = replyMsg->AddExpansionRule(token, replyMsg->GetArg(0));
             if (status == ER_OK) {
-                expFields = bus.GetInternal().GetCompressionRules().GetExpansion(token);
+                expFields = bus.GetInternal().GetCompressionRules()->GetExpansion(token);
                 if (!expFields) {
                     status = ER_BUS_HDR_EXPANSION_INVALID;
                 }
@@ -197,9 +271,20 @@ void AllJoynPeerObj::ExpandHeader(Message& msg, const qcc::String& receivedFrom)
         }
     }
     /*
-     * If we have an expansion rule we can decompress the message.
+     * Clean up if we can't expand the messages.
      */
-    if (status == ER_OK) {
+    if (status != ER_OK) {
+        while (RemoveCompressedMessage(msg, token)) {
+            QCC_LogError(status, ("Failed to expand message %s", msg->Description().c_str()));
+        }
+        return;
+    }
+    /*
+     * Calling RemoveCompressedMessage() in a loop may look innefficient but it is highly unlikely
+     * we will be expanding different headers at the same time so we are really just removing the
+     * front message from the list.
+     */
+    while (RemoveCompressedMessage(msg, token)) {
         Router& router = bus.GetInternal().GetRouter();
         BusEndpoint* sender = router.FindEndpoint(msg->GetRcvEndpointName());
         if (sender) {
@@ -225,10 +310,7 @@ void AllJoynPeerObj::ExpandHeader(Message& msg, const qcc::String& receivedFrom)
              */
             router.PushMessage(msg, *sender);
         }
-    } else {
-        QCC_LogError(status, ("Failed to expand message %s", msg->Description().c_str()));
     }
-
 }
 
 /*
@@ -262,13 +344,14 @@ void AllJoynPeerObj::ExchangeGroupKeys(const InterfaceDescription::Member* membe
         StringSource src(msg->GetArg(0)->v_scalarArray.v_byte, msg->GetArg(0)->v_scalarArray.numElements);
         status = key.Load(src);
         if (status == ER_OK) {
+            PeerState peerState = peerStateTable->GetPeerState(msg->GetSender());
             /*
              * Tag the group key with the auth mechanism used by ExchangeGroupKeys. Group keys
              * are inherently directional - only initiator encrypts with the group key. We set
              * the role to NO_ROLE otherwise senders can't decrypt their own broadcast messages.
              */
             key.SetTag(msg->GetAuthMechanism(), KeyBlob::NO_ROLE);
-            peerStateTable->GetPeerState(msg->GetSender())->SetKey(key, PEER_GROUP_KEY);
+            peerState->SetKey(key, PEER_GROUP_KEY);
             /*
              * Return the local group key.
              */
@@ -331,7 +414,7 @@ QStatus AllJoynPeerObj::KeyGen(PeerState& peerState, String seed, qcc::String& v
     static const char* label = "session key";
     KeyBlob masterSecret;
 
-    status = keyStore.GetKey(peerState->GetGuid(), masterSecret);
+    status = keyStore.GetKey(peerState->GetGuid(), masterSecret, peerState->authorizations);
     if ((status == ER_OK) && masterSecret.HasExpired()) {
         status = ER_BUS_KEY_EXPIRED;
     }
@@ -431,6 +514,8 @@ void AllJoynPeerObj::AuthAdvance(Message& msg)
      * If auth conversation was sucessful store the master secret in the key store.
      */
     if ((status == ER_OK) && (authState == SASLEngine::ALLJOYN_AUTH_SUCCESS)) {
+        PeerState peerState = bus.GetInternal().GetPeerStateTable()->GetPeerState(sender);
+        SetRights(peerState, sasl->AuthenticationIsMutual(), true /*challenger*/);
         KeyBlob masterSecret;
         KeyStore& keyStore = bus.GetInternal().GetKeyStore();
         status = sasl->GetMasterSecret(masterSecret);
@@ -439,7 +524,7 @@ void AllJoynPeerObj::AuthAdvance(Message& msg)
             qcc::GUID128 remotePeerGuid(sasl->GetRemoteId());
             /* Tag the master secret with the auth mechanism used to generate it */
             masterSecret.SetTag(mech, KeyBlob::RESPONDER);
-            status = keyStore.AddKey(remotePeerGuid, masterSecret);
+            status = keyStore.AddKey(remotePeerGuid, masterSecret, peerState->authorizations);
         }
         /*
          * Report the succesful authentication to allow application to clear UI etc.
@@ -448,7 +533,9 @@ void AllJoynPeerObj::AuthAdvance(Message& msg)
             peerAuthListener.AuthenticationComplete(mech.c_str(), sender.c_str(), true /* success */);
         }
         delete sasl;
+        sasl = NULL;
     }
+
     if (status != ER_OK) {
         /*
          * Report the failed authentication to allow application to clear UI etc.
@@ -642,6 +729,8 @@ QStatus AllJoynPeerObj::AuthenticatePeer(AllJoynMessageType msgType, const qcc::
         peerState->SetKey(key, PEER_SESSION_KEY);
         /* Record in the peer state that this peer is the local peer */
         peerState->isLocalPeer = true;
+        /* Set rights on the local peer - treat as mutual authentication */
+        SetRights(peerState, true, false);
         /* We are still holding the lock */
         lock.Unlock(MUTEX_CONTEXT);
         return ER_OK;
@@ -728,6 +817,7 @@ QStatus AllJoynPeerObj::AuthenticatePeer(AllJoynMessageType msgType, const qcc::
             status = remotePeerObj.MethodCall(*(ifc->GetMember("AuthChallenge")), &arg, 1, replyMsg, AUTH_TIMEOUT);
             if (status == ER_OK) {
                 if (authState == SASLEngine::ALLJOYN_AUTH_SUCCESS) {
+                    SetRights(peerState, sasl.AuthenticationIsMutual(), false /*responder*/);
                     break;
                 }
                 inStr = qcc::String(replyMsg->GetArg(0)->v_string.str);
@@ -737,9 +827,10 @@ QStatus AllJoynPeerObj::AuthenticatePeer(AllJoynMessageType msgType, const qcc::
                     mech = sasl.GetMechanism();
                     status = sasl.GetMasterSecret(masterSecret);
                     if (status == ER_OK) {
+                        SetRights(peerState, sasl.AuthenticationIsMutual(), false /*responder*/);
                         /* Tag the master secret with the auth mechanism used to generate it */
                         masterSecret.SetTag(mech, KeyBlob::INITIATOR);
-                        status = keyStore.AddKey(remotePeerGuid, masterSecret);
+                        status = keyStore.AddKey(remotePeerGuid, masterSecret, peerState->authorizations);
                     }
                 }
             } else {

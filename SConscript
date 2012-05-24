@@ -1,4 +1,4 @@
-# Copyright 2010 - 2011, Qualcomm Innovation Center, Inc.
+# Copyright 2010 - 2012, Qualcomm Innovation Center, Inc.
 # 
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -16,12 +16,18 @@
 Import('env')
 
 # Indicate that this SConscript file has been loaded already
+#
 env['_ALLJOYNCORE_'] = True
 
 # Dependent Projects
 common_hdrs, common_objs = env.SConscript(['../common/SConscript'])
 if env['OS_GROUP'] == 'windows' or env['OS'] == 'android':
     env.SConscript(['../stlport/SConscript'])
+
+if(not(env.has_key('BULLSEYE_BIN'))):
+    print('BULLSEYE_BIN not specified')
+else:
+    env.PrependENVPath('PATH', env.get('BULLSEYE_BIN'))
 
 # manually add dependencies for xml to h, and for files included in the xml
 env.Depends('inc/Status.h', 'src/Status.xml');
@@ -50,17 +56,34 @@ env.Append(CPPPATH = [env.Dir('src')])
 
 # AllJoyn Libraries
 libs = env.SConscript('$OBJDIR/SConscript', exports = ['common_objs'])
-dlibs = env.Install('$DISTDIR/lib', libs)
+ajlib = env.Install('$DISTDIR/lib', libs)
 env.Append(LIBPATH = [env.Dir('$DISTDIR/lib')])
-env.Prepend(LIBS = dlibs)
 
-# AllJoyn Daemon
-daemon_progs = env.SConscript('$OBJDIR/daemon/SConscript')
+# Set the alljoyn library 
+env.Prepend(LIBS = ajlib)
+
+# AllJoyn Daemon, daemon library, and bundled daemon object file
+daemon_progs, bdlib, bdobj = env.SConscript('$OBJDIR/daemon/SConscript')
+daemon_lib = env.Install('$DISTDIR/lib', bdlib)
+daemon_obj = env.Install('$DISTDIR/lib', bdobj)
 env.Install('$DISTDIR/bin', daemon_progs)
 
-# Test programs
+# Test programs to have built-in bundled daemon or not
+if env['BD'] == 'on':
+    env.Prepend(LIBS = daemon_lib)
+    env.Prepend(LIBS = daemon_obj)
+    env['bdlib'] = ""
+    env['bdobj'] = ""
+else:
+    env['bdlib'] = daemon_lib
+    env['bdobj'] = daemon_obj
+
+# Test programs 
 progs = env.SConscript('$OBJDIR/test/SConscript')
 env.Install('$DISTDIR/bin', progs)
+
+# Build unit Tests
+env.SConscript('unit_test/SConscript', variant_dir='$OBJDIR/unittest', duplicate=0)
 
 # Sample programs
 progs = env.SConscript('$OBJDIR/samples/SConscript')

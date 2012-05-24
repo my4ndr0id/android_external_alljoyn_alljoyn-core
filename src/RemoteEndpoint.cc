@@ -3,7 +3,7 @@
  */
 
 /******************************************************************************
- * Copyright 2009-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2009-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ static uint32_t threadCount = 0;
 RemoteEndpoint::RemoteEndpoint(BusAttachment& bus,
                                bool incoming,
                                const qcc::String& connectSpec,
-                               Stream& stream,
+                               Stream* stream,
                                const char* threadName,
                                bool isSocket) :
     BusEndpoint(BusEndpoint::ENDPOINT_TYPE_REMOTE),
@@ -118,12 +118,14 @@ QStatus RemoteEndpoint::Start()
     bool isTxStarted = false;
     bool isRxStarted = false;
 
+    assert(stream);
+
     if (features.isBusToBus) {
         endpointType = BusEndpoint::ENDPOINT_TYPE_BUS2BUS;
     }
 
     /* Set the send timeout for this endpoint */
-    stream.SetSendTimeout(120000);
+    stream->SetSendTimeout(120000);
 
     /* Start the TX thread */
     status = txThread.Start(this, this);
@@ -380,7 +382,7 @@ void* RemoteEndpoint::RxThread::Run(void* arg)
         }
     }
     if ((status != ER_OK) && (status != ER_STOPPING_THREAD) && (status != ER_SOCK_OTHER_END_CLOSED) && (status != ER_BUS_STOPPING)) {
-        QCC_LogError(status, ("Endpoint Rx thread (%s) exiting", GetName().c_str()));
+        QCC_LogError(status, ("Endpoint Rx thread (%s) exiting", GetName()));
     }
 
     /* On an unexpected disconnect save the status that cause the thread exit */
@@ -424,6 +426,15 @@ void* RemoteEndpoint::TxThread::Run(void* arg)
 
                 /* Deliver message */
                 status = msg->Deliver(*ep);
+                /* Report authorization failure as a security violation */
+                if (status == ER_BUS_NOT_AUTHORIZED) {
+                    bus.GetInternal().GetLocalEndpoint().GetPeerObj()->HandleSecurityViolation(msg, status);
+                    /*
+                     * Clear the error after reporting the security violation otherwise we will exit
+                     * this thread which will shut down the endpoint.
+                     */
+                    status = ER_OK;
+                }
                 queueLock.Lock(MUTEX_CONTEXT);
                 queue.pop_back();
             }
@@ -538,7 +549,7 @@ QStatus RemoteEndpoint::PushMessage(Message& msg)
     static uint32_t lastTime = 0;
     uint32_t now = GetTimestamp();
     if ((now - lastTime) > 1000) {
-        QCC_DbgPrintf(("Tx queue size (%s - %x) = %d", txThread.GetName().c_str(), txThread.GetHandle(), count));
+        QCC_DbgPrintf(("Tx queue size (%s - %x) = %d", txThread.GetName(), txThread.GetHandle(), count));
         lastTime = now;
     }
 #undef QCC_MODULE
@@ -567,17 +578,6 @@ void RemoteEndpoint::DecrementRef()
         } else {
             StopAfterTxEmpty(500);
         }
-    }
-}
-
-SocketFd RemoteEndpoint::GetSocketFd()
-{
-    if (isSocket) {
-        SocketStream& ss = static_cast<SocketStream&>(stream);
-        ss.DetachSocketFd();
-        return ss.GetSocketFd();
-    } else {
-        return -1;
     }
 }
 

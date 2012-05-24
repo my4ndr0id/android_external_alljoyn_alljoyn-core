@@ -4,7 +4,7 @@
  */
 
 /******************************************************************************
- * Copyright 2010-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2010-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@
 #include <qcc/time.h>
 
 #include <alljoyn/KeyStoreListener.h>
+#include "ProtectedKeyStoreListener.h"
 
 #include <Status.h>
 
@@ -92,6 +93,19 @@ class KeyStore {
     /**
      * Get a key blob from the key store
      *
+     * @param guid         The unique identifier for the key
+     * @param key          The key blob to get
+     * @param accessRights The access rights associated with the key
+     * @return
+     *      - ER_OK if successful
+     *      - ER_BUS_KEY_UNAVAILABLE if key is unavailable
+     *      - ER_BUS_KEY_EXPIRED if the requested key has expired
+     */
+    QStatus GetKey(const qcc::GUID128 & guid, qcc::KeyBlob & key, uint8_t accessRights[4]);
+
+    /**
+     * Get a key blob from the key store
+     *
      * @param guid     The unique identifier for the key
      * @param key      The key blob to get
      * @return
@@ -99,17 +113,32 @@ class KeyStore {
      *      - ER_BUS_KEY_UNAVAILABLE if key is unavailable
      *      - ER_BUS_KEY_EXPIRED if the requested key has expired
      */
-    QStatus GetKey(const qcc::GUID128& guid, qcc::KeyBlob& key);
+    QStatus GetKey(const qcc::GUID128& guid, qcc::KeyBlob& key) {
+        uint8_t accessRights[4];
+        return GetKey(guid, key, accessRights);
+    }
+
+    /**
+     * Add a key blob to the key store
+     *
+     * @param guid         The unique identifier for the key
+     * @param key          The key blob to add
+     * @param accessRights The access rights associated with the key
+     * @return ER_OK
+     */
+    QStatus AddKey(const qcc::GUID128& guid, const qcc::KeyBlob& key, const uint8_t accessRights[4]);
 
     /**
      * Add a key blob to the key store
      *
      * @param guid     The unique identifier for the key
      * @param key      The key blob to add
-     * @param expires  Time when the key expires.
      * @return ER_OK
      */
-    QStatus AddKey(const qcc::GUID128& guid, const qcc::KeyBlob& key);
+    QStatus AddKey(const qcc::GUID128& guid, const qcc::KeyBlob& key) {
+        const uint8_t accessRights[4] = { 0, 0, 0, 0 };
+        return AddKey(guid, key, accessRights);
+    }
 
     /**
      * Remove a key blob from the key store
@@ -269,8 +298,9 @@ class KeyStore {
     class KeyRecord {
       public:
         KeyRecord() : revision(0) { }
-        uint32_t revision; ///< Revision number when this key was added
-        qcc::KeyBlob key;  ///< The key blob for the key
+        uint32_t revision;       ///< Revision number when this key was added
+        qcc::KeyBlob key;        ///< The key blob for the key
+        uint8_t accessRights[4]; ///< Access rights associated with this record (see PeerState)
     };
 
     /**
@@ -296,7 +326,7 @@ class KeyStore {
     /**
      * Listener for handling load/store requests
      */
-    KeyStoreListener* listener;
+    ProtectedKeyStoreListener* listener;
 
     /**
      * The guid for this key store

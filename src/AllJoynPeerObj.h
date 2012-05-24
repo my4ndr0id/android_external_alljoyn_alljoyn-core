@@ -94,12 +94,11 @@ class AllJoynPeerObj : public BusObject, public BusListener, public qcc::AlarmLi
      * This function is called when an encrypted message requires authentication.
      *
      * @param msg     The message to be encrypted.
-     * @param sender  The remote endpoint that the encrypted message will be sent to
      * @return
      *      - ER_OK if successful
      *      - An error status otherwise
      */
-    QStatus RequestAuthentication(Message& msg, RemoteEndpoint* sender);
+    QStatus RequestAuthentication(Message& msg);
 
     /**
      * Setup for peer-to-peer authentication. The authentication mechanisms listed can only be used
@@ -328,6 +327,17 @@ class AllJoynPeerObj : public BusObject, public BusListener, public qcc::AlarmLi
     QStatus DispatchRequest(Message& msg, AllJoynPeerObj::RequestType reqType, const qcc::String data = "");
 
     /**
+     * Get the next compressed message from the msgsPendingExpansion queue that has the specified
+     * compression token. The message is removed from the list.
+     *
+     * @param msg       Message that was removed.
+     * @param token     The compression token
+     *
+     * @return  Returns true if a message was removed and returned.
+     */
+    bool RemoveCompressedMessage(Message& msg, uint32_t token);
+
+    /**
      * The peer-to-peer authentication mechanisms available to this object
      */
     qcc::String peerAuthMechanisms;
@@ -348,8 +358,11 @@ class AllJoynPeerObj : public BusObject, public BusListener, public qcc::AlarmLi
     /** Dispatcher for handling peer object requests */
     qcc::Timer dispatcher;
 
-    /** Queue of messages waiting for an authentication to complete */
+    /** Queue of encrypted messages waiting for an authentication to complete */
     std::deque<Message> msgsPendingAuth;
+
+    /** Queue of compressed messages waiting for an expansion rule to be supplied */
+    std::deque<Message> msgsPendingExpansion;
 };
 
 }

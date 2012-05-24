@@ -304,6 +304,13 @@ QStatus AllJoynObj::CheckTransportsPermission(qcc::String& sender, TransportMask
                 QCC_LogError(ER_ALLJOYN_ACCESS_PERMISSION_WARNING, ("AllJoynObj::%s() WARNING: No permission to use Wifi", ((callerName == NULL) ? "" : callerName)));
             }
         }
+        if (transports & TRANSPORT_ICE) {
+            bool allowed = router.GetPermissionDB().IsWifiAllowed(*srcEp);
+            if (!allowed) {
+                transports ^= TRANSPORT_ICE;
+                QCC_LogError(ER_ALLJOYN_ACCESS_PERMISSION_WARNING, ("AllJoynObj::%s() WARNING: No permission to use Wifi for ICE", ((callerName == NULL) ? "" : callerName)));
+            }
+        }
         if (transports == 0) {
             status = ER_BUS_NO_TRANSPORTS;
         }
@@ -323,7 +330,7 @@ void AllJoynObj::BindSessionPort(const InterfaceDescription::Member* member, Mes
     SessionOpts opts;
 
     msg->GetArgs(numArgs, args);
-    SessionPort sessionPort = args[0].v_uint32;
+    SessionPort sessionPort = args[0].v_uint16;
     QStatus status = GetSessionOpts(args[1], opts);
 
     /* Get the sender */
@@ -415,7 +422,7 @@ void AllJoynObj::UnbindSessionPort(const InterfaceDescription::Member* member, M
     SessionOpts opts;
 
     msg->GetArgs(numArgs, args);
-    SessionPort sessionPort = args[0].v_uint32;
+    SessionPort sessionPort = args[0].v_uint16;
 
     QCC_DbgTrace(("AllJoynObj::UnbindSession(%d)", sessionPort));
 
@@ -492,7 +499,8 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
         RemoteEndpoint* b2bEp = NULL;
         BusEndpoint* ep = sessionHost ? ajObj.router.FindEndpoint(sessionHost) : NULL;
         VirtualEndpoint* vSessionEp = (ep && (ep->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_VIRTUAL)) ? static_cast<VirtualEndpoint*>(ep) : NULL;
-        RemoteEndpoint* rSessionEp = (ep && (ep->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_REMOTE)) ? static_cast<RemoteEndpoint*>(ep) : NULL;
+        BusEndpoint* rSessionEp = (ep && ((ep->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_REMOTE) ||
+                                          (ep->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_NULL))) ? ep : NULL;
 
         if (rSessionEp) {
             /* Session is with another locally connected attachment */
@@ -679,12 +687,22 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
 
             String busAddr;
             if (!b2bEp) {
-                /* Step 1: If there is a busAddr from advertsement use it to (possibly) create a physical connection */
+                /* Step 1: If there is a busAddr from advertisement use it to (possibly) create a physical connection */
                 vector<String> busAddrs;
                 multimap<String, NameMapEntry>::iterator nmit = ajObj.nameMap.lower_bound(sessionHost);
                 while (nmit != ajObj.nameMap.end() && (nmit->first == sessionHost)) {
                     if (nmit->second.transport & optsIn.transports) {
-                        busAddrs.push_back(nmit->second.busAddr);
+                        String tempbusAddr = nmit->second.busAddr;
+                        TransportList& transList = ajObj.bus.GetInternal().GetTransportList();
+                        Transport* trans = transList.GetTransport(tempbusAddr);
+                        if (trans != NULL) {
+                            status = trans->ComposeBusAddrForConnect(tempbusAddr, sender, nmit->first);
+
+                            if (status == ER_OK) {
+                                busAddrs.push_back(tempbusAddr);
+                                QCC_DbgPrintf(("AllJoynObj::JoinSessionThread::RunJoin(): tempbusAddr(%s)", tempbusAddr.c_str()));
+                            }
+                        }
                         break;
                     }
                     ++nmit;
@@ -692,7 +710,7 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
                 ajObj.ReleaseLocks();
 
                 /*
-                 * Step 1b: If no advertisment (busAddr) and we are connected to the sesionHost, then ask it directly
+                 * Step 1b: If no advertisement (busAddr) and we are connected to the sesionHost, then ask it directly
                  * for the busAddr
                  */
                 if (vSessionEp && busAddrs.empty()) {
@@ -714,8 +732,11 @@ ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunJoin()
                                 QCC_DbgPrintf(("AllJoynObj:JoinSessionThread() skip unpermitted transport(%s)", trans->GetTransportName()));
                                 continue;
                             }
-                            status = trans->Connect(busAddrs[i].c_str(), optsIn, &b2bEp);
+
+                            BusEndpoint* ep;
+                            status = trans->Connect(busAddrs[i].c_str(), optsIn, &ep);
                             if (status == ER_OK) {
+                                b2bEp = static_cast<RemoteEndpoint*>(ep);
                                 b2bEp->IncrementRef();
                                 b2bEpName = b2bEp->GetUniqueName();
                                 busAddr = busAddrs[i];
@@ -1159,13 +1180,16 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
          * If there is an outstanding join involving (sessionHost,port), then destEp may not be valid yet.
          * Essentially, someone else might know we are a multipoint session member before we do.
          */
-        if (!destEp || ((destEp->GetEndpointType() != BusEndpoint::ENDPOINT_TYPE_REMOTE) && (destEp->GetEndpointType() != BusEndpoint::ENDPOINT_TYPE_LOCAL))) {
+        if (!destEp || ((destEp->GetEndpointType() != BusEndpoint::ENDPOINT_TYPE_REMOTE) &&
+                        (destEp->GetEndpointType() != BusEndpoint::ENDPOINT_TYPE_NULL) &&
+                        (destEp->GetEndpointType() != BusEndpoint::ENDPOINT_TYPE_LOCAL))) {
             qcc::Sleep(500);
             destEp = ajObj.router.FindEndpoint(destStr);
         }
 
         /* Determine if the dest is local to this daemon */
         if (destEp && ((destEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_REMOTE) ||
+                       (destEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_NULL) ||
                        (destEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_LOCAL))) {
             /* This daemon serves dest directly */
             /* Check for a session in the session map */
@@ -1329,9 +1353,11 @@ qcc::ThreadReturn STDCALL AllJoynObj::JoinSessionThread::RunAttach()
                     replyCode = ALLJOYN_JOINSESSION_REPLY_UNREACHABLE;
                 } else {
                     ajObj.ReleaseLocks();
-                    status = trans->Connect(busAddr, optsIn, &b2bEp);
+                    BusEndpoint* ep;
+                    status = trans->Connect(busAddr, optsIn, &ep);
                     ajObj.AcquireLocks();
                     if (status == ER_OK) {
+                        b2bEp = static_cast<RemoteEndpoint*>(ep);
                         b2bEp->IncrementRef();
                         b2bEpName = b2bEp->GetUniqueName();
                     } else {
@@ -1906,8 +1932,13 @@ QStatus AllJoynObj::SendGetSessionInfo(const char* creatorName,
 
 QStatus AllJoynObj::ShutdownEndpoint(RemoteEndpoint& b2bEp, SocketFd& sockFd)
 {
+    SocketStream& ss = static_cast<SocketStream&>(b2bEp.GetStream());
     /* Grab the file descriptor for the B2B endpoint and close the endpoint */
-    SocketFd epSockFd = b2bEp.GetSocketFd();
+    ss.DetachSocketFd();
+    SocketFd epSockFd = ss.GetSocketFd();
+    if (!epSockFd) {
+        return ER_BUS_NOT_CONNECTED;
+    }
     QStatus status = SocketDup(epSockFd, sockFd);
     if (status == ER_OK) {
         status = b2bEp.StopAfterTxEmpty();
@@ -2036,7 +2067,8 @@ void AllJoynObj::SetLinkTimeout(const InterfaceDescription::Member* member, Mess
                         actLinkTimeout = ((tTimeout == 0) || (actLinkTimeout == 0)) ? 0 : max(actLinkTimeout, tTimeout);
                         foundEp = true;
                     }
-                } else if (memberEp && (memberEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_REMOTE)) {
+                } else if (memberEp && ((memberEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_REMOTE) ||
+                                        (memberEp->GetEndpointType() == BusEndpoint::ENDPOINT_TYPE_NULL))) {
                     /*
                      * This is a locally connected client. These clients do not have per-session connecions
                      * therefore we silently allow this as if we had granted the user's request
@@ -2170,8 +2202,8 @@ void AllJoynObj::AdvertiseName(const InterfaceDescription::Member* member, Messa
                 Transport* trans = transList.GetTransport(i);
                 if (trans && (trans->GetTransportMask() & transports)) {
                     status = trans->EnableAdvertisement(advertiseNameStr);
-                    if (status != ER_OK) {
-                        QCC_LogError(status, ("EnableAdvertisment failed for mask=0x%x", transports));
+                    if ((status != ER_OK) && (status != ER_NOT_IMPLEMENTED)) {
+                        QCC_LogError(status, ("EnableAdvertisment failed for transport %s - mask=0x%x", trans->GetTransportName(), transports));
                     }
                 } else if (!trans) {
                     QCC_LogError(ER_BUS_TRANSPORT_NOT_AVAILABLE, ("NULL transport pointer found in transportList"));
@@ -2420,7 +2452,7 @@ void AllJoynObj::CancelFindAdvertisedName(const InterfaceDescription::Member* me
     assert((numArgs == 1) && (args[0].typeId == ALLJOYN_STRING));
 
     /* Cancel advertisement */
-    QCC_DbgPrintf(("Calling ProcCancelFindName from CancelFindAdvertisedName [%s]", Thread::GetThread()->GetName().c_str()));
+    QCC_DbgPrintf(("Calling ProcCancelFindName from CancelFindAdvertisedName [%s]", Thread::GetThread()->GetName()));
     QStatus status = ProcCancelFindName(msg->GetSender(), args[0].v_string.str);
     uint32_t replyCode = (ER_OK == status) ? ALLJOYN_CANCELFINDADVERTISEDNAME_REPLY_SUCCESS : ALLJOYN_CANCELFINDADVERTISEDNAME_REPLY_FAILED;
 
@@ -3120,7 +3152,7 @@ void AllJoynObj::NameOwnerChanged(const qcc::String& alias, const qcc::String* o
             while (it != discoverMap.end()) {
                 if (it->second == *oldOwner) {
                     last = it++->first;
-                    QCC_DbgPrintf(("Calling ProcCancelFindName from NameOwnerChanged [%s]", Thread::GetThread()->GetName().c_str()));
+                    QCC_DbgPrintf(("Calling ProcCancelFindName from NameOwnerChanged [%s]", Thread::GetThread()->GetName()));
                     QStatus status = ProcCancelFindName(*oldOwner, last);
                     if (ER_OK != status) {
                         QCC_LogError(status, ("Failed to cancel discover for name \"%s\"", last.c_str()));
@@ -3209,7 +3241,7 @@ void AllJoynObj::FoundNames(const qcc::String& busAddr,
                                         forbitIt->second.second.compare(dit->second) == 0 &&
                                         (forbitIt->second.first & transport) != 0) {
                                         forbidden = true;
-                                        QCC_DbgPrintf(("FoundNames: Forbit to send advertised name %s over transport %d to %s due to lack of permission", (*nit).c_str(), transport, forbitIt->second.second.c_str()));
+                                        QCC_DbgPrintf(("FoundNames: Forbid to send advertised name %s over transport %d to %s due to lack of permission", (*nit).c_str(), transport, forbitIt->second.second.c_str()));
                                         break;
                                     }
                                     ++forbitIt;
@@ -3223,8 +3255,8 @@ void AllJoynObj::FoundNames(const qcc::String& busAddr,
                     }
                 } else {
                     /*
-                     * If the busAddr doesn't match, then this is actually a new but redundant advertsement.
-                     * Don't track it. Don't updated the TTL for the existing advertisment with the same name
+                     * If the busAddr doesn't match, then this is actually a new but redundant advertisement.
+                     * Don't track it. Don't updated the TTL for the existing advertisement with the same name
                      * and don't tell clients about this alternate way to connect to the name
                      * since it will look like a duplicate to the client (that doesn't receive busAddr).
                      */
@@ -3320,20 +3352,27 @@ ThreadReturn STDCALL AllJoynObj::NameMapReaperThread::Run(void* arg)
     Event evt(waitTime);
     while (!IsStopping()) {
         ajnObj->AcquireLocks();
-        set<qcc::String> expiredBuses;
         multimap<String, NameMapEntry>::iterator it = ajnObj->nameMap.begin();
         uint32_t now = GetTimestamp();
         waitTime = Event::WAIT_FOREVER;
         while (it != ajnObj->nameMap.end()) {
-            if ((now - it->second.timestamp) >= it->second.ttl) {
+            // it->second.timestamp is an absolute time value
+            // it->second.ttl is a relative time value relative to it->second.timestamp
+            // now is an absolute time value for "right now" - may have rolled over relative to it->second.timestamp
+
+            uint32_t timeSinceTimestamp = now - it->second.timestamp; // relative time value - 2's compliment math solves rollover
+
+            if (timeSinceTimestamp >= it->second.ttl) {
                 QCC_DbgPrintf(("Expiring discovered name %s for guid %s", it->first.c_str(), it->second.guid.c_str()));
-                expiredBuses.insert(it->second.busAddr);
                 ajnObj->SendLostAdvertisedName(it->first, it->second.transport);
                 ajnObj->nameMap.erase(it++);
             } else {
                 if (it->second.ttl != numeric_limits<uint32_t>::max()) {
-                    uint32_t nextTime(it->second.ttl - (now - it->second.timestamp));
+                    // The TTL for this name map entry is less than infinte so we need to consider it
+
+                    uint32_t nextTime = it->second.ttl - timeSinceTimestamp; // relative time when name map entry expires
                     if (nextTime < waitTime) {
+                        // This name map entry expires before the time in waitTime so update waitTime.
                         waitTime = nextTime;
                     }
                 }
@@ -3341,10 +3380,6 @@ ThreadReturn STDCALL AllJoynObj::NameMapReaperThread::Run(void* arg)
             }
         }
         ajnObj->ReleaseLocks();
-
-        while (expiredBuses.begin() != expiredBuses.end()) {
-            expiredBuses.erase(expiredBuses.begin());
-        }
 
         evt.ResetTime(waitTime, 0);
         QStatus status = Event::Wait(evt);

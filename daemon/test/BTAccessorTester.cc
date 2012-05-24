@@ -227,6 +227,20 @@ class TestDriver : public BTTransport {
     String BuildName(const BTBusAddress& addr, const GUID128& guid, size_t entry);
     void HashName(const BTBusAddress& addr, const GUID128& guid, uint32_t serial, const String& name, String& hash);
 
+    // Don't report the transfer rate unless the number of bytes transferred is >= this many bytes.
+    static const size_t TRANFER_RATE_MIN_BYTES = 10000;
+
+    /**
+     * If bytesTransferred is >= TRANFER_RATE_MIN_BYTES then report to the user the number of
+     * bytes transferred per second.
+     *
+     *  @param t0[in] The start time of the transfer.
+     *  @param t1[in] The end time of the transfer.
+     *  @param bytesTransferred[in] The number of bytes transferred.
+     *  @param sending[in] True if the transfer was a send, false if it was a receive.
+     */
+    void ReportTransferRate(uint64_t t0, uint64_t t1, size_t bytesTransferred, bool sending) const;
+
   private:
     list<TestCaseInfo> tcList;
     uint32_t testcase;
@@ -250,6 +264,39 @@ class TestDriver : public BTTransport {
 
     void RunTest(TestCaseInfo& test);
     void OutputLine(String line, size_t indent = 0, bool bullet = false) const;
+
+    // Should never be called so making it private.
+    // This is created to stop code analysis tools from complaining about the possibilty of
+    // double freeing of memory.
+    TestDriver& operator=(const TestDriver& source)
+    {
+        // Not implemented so make sure we don't do anything with it.
+        assert(0);
+        return *this;
+    }
+
+    // Should never be called so making it private.
+    // This is created to stop code analysis tools from complaining about the possibilty of
+    // double freeing of memory.
+    TestDriver(const TestDriver& source) :
+        btAccessor(NULL),
+        bus("BTAccessorTester", cntr, ""),
+        opts(opts),
+        ep(NULL),
+        testcase(0),
+        success(true),
+        maxWidth(80),
+        tcNumWidth(2),
+        detailIndent(tcWidth + tcNumWidth + 1),
+        detailWidth(maxWidth - (detailIndent + dashWidth)),
+        lastLineRepeat(0),
+        lastIndent(0),
+        lastBullet(false),
+        silenceDetails(false)
+    {
+        // Not implemented so make sure we don't do anything with it.
+        assert(0);
+    }
 };
 
 
@@ -503,6 +550,9 @@ bool TestDriver::SendBuf(const uint8_t* buf, size_t size)
         return true;
     }
 
+    const size_t totalToSend = size;
+    uint64_t t0 = GetTimestamp64();
+
     while (size > 0) {
         status = ep->GetSink().PushBytes(buf + offset, size, sent);
         if (status != ER_OK) {
@@ -518,6 +568,11 @@ bool TestDriver::SendBuf(const uint8_t* buf, size_t size)
         offset += sent;
         size -= sent;
     }
+
+    uint64_t t1 = GetTimestamp64();
+
+    ReportTransferRate(t0, t1, totalToSend, true);
+
     return true;
 }
 
@@ -531,6 +586,9 @@ bool TestDriver::RecvBuf(uint8_t* buf, size_t size)
         ReportTestDetail("No connection to send data to.  Skipping.");
         return true;
     }
+
+    const size_t totalToReceive = size;
+    uint64_t t0 = GetTimestamp64();
 
     while (size > 0) {
         status = ep->GetSource().PullBytes(buf + offset, size, received, 30000);
@@ -550,6 +608,11 @@ bool TestDriver::RecvBuf(uint8_t* buf, size_t size)
         offset += received;
         size -= received;
     }
+
+    uint64_t t1 = GetTimestamp64();
+
+    ReportTransferRate(t0, t1, totalToReceive, false);
+
     return true;
 }
 
@@ -605,6 +668,25 @@ bool TestDriver::TestCheckIncomingAddress(const BDAddress& addr, BTBusAddress& r
     ReportTestDetail(detail);
 
     return false;
+}
+
+void TestDriver::ReportTransferRate(uint64_t t0, uint64_t t1, size_t bytesTransferred, bool sending) const
+{
+    uint64_t tDelta = t1 - t0;
+
+    if (bytesTransferred > TRANFER_RATE_MIN_BYTES && tDelta > 0) {
+        uint64_t bytesPerSecond = (bytesTransferred * 1000) / tDelta;
+        String detail = sending ? "Sent " : "Received ";
+
+        detail += U64ToString(bytesTransferred);
+        detail += " bytes in ";
+        detail += U64ToString(tDelta / 1000);
+        detail += " seconds. Or ";
+        detail += U64ToString(bytesPerSecond);
+        detail += " bytes per second.";
+
+        ReportTestDetail(detail);
+    }
 }
 
 bool ClientTestDriver::TestCheckIncomingAddress(const BDAddress& addr, BTBusAddress& redirectAddr) const
@@ -908,7 +990,7 @@ bool ClientTestDriver::TC_StartDiscovery()
             }
         }
 
-        ::Sleep(5000);
+        qcc::Sleep(5000);
 
         devChangeLock.Lock(MUTEX_CONTEXT);
         devChangeQueue.clear();
@@ -962,7 +1044,7 @@ bool ClientTestDriver::TC_StopDiscovery()
     }
 
     if (!opts.fastDiscovery) {
-        ::Sleep(5000);
+        qcc::Sleep(5000);
 
         devChangeLock.Lock(MUTEX_CONTEXT);
         count = devChangeQueue.size();
@@ -1196,7 +1278,7 @@ bool ClientTestDriver::TC_ConnectSingleReject()
     bool tcSuccess = true;
     BTNodeInfo node;
     String detail;
-    RemoteEndpoint* tep;
+    RemoteEndpoint* tep = NULL;
     char buf[100];
     size_t size = sizeof(buf);
     size_t received;
@@ -1243,7 +1325,7 @@ bool ClientTestDriver::TC_ConnectSingleRedirect()
     bool tcSuccess = true;
     BTNodeInfo node;
     String detail;
-    RemoteEndpoint* tep;
+    RemoteEndpoint* tep = NULL;
     BTBusAddress raddr;
     String authName;
     String redirectSpec;
@@ -1345,7 +1427,7 @@ bool ClientTestDriver::TC_ConnectMultiple()
         char sendBuffer[80];
         size_t sent;
 
-        uint8_t length = snprintf(sendBuffer, ArraySize(sendBuffer), "Endpoint %d.", i) + 1;    // Include the nul.
+        uint8_t length = snprintf(sendBuffer, ArraySize(sendBuffer), "Endpoint %d.", (int) i) + 1;    // Include the nul.
         QStatus status = eps[i]->GetSink().PushBytes(&length, sizeof(length), sent);
 
         if (ER_OK == status && sizeof(length) == sent) {
@@ -1736,7 +1818,7 @@ bool ServerTestDriver::TC_RedirectSingle()
     BTNodeInfo node;
     String detail;
     BDAddress invalidAddr;
-    RemoteEndpoint* tep;
+    RemoteEndpoint* tep = NULL;
     BTBusAddress raddr;
     String authName;
     String unused;

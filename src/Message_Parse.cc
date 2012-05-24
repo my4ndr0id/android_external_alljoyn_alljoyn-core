@@ -5,7 +5,7 @@
  */
 
 /******************************************************************************
- * Copyright 2009-2011, Qualcomm Innovation Center, Inc.
+ * Copyright 2009-2012, Qualcomm Innovation Center, Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -85,9 +85,10 @@ QStatus _Message::ParseArray(MsgArg* arg,
      */
     bufPos = AlignPtr(bufPos, 4);
     if (endianSwap) {
-        EndianSwap32(*((uint32_t*)bufPos));
+        len = EndianSwap32(*((uint32_t*)bufPos));
+    } else {
+        len = *((uint32_t*)bufPos);
     }
-    len = *((uint32_t*)bufPos);
     /*
      * Check array length is valid and in bounds.
      */
@@ -116,13 +117,16 @@ QStatus _Message::ParseArray(MsgArg* arg,
         if ((len & 1) == 0) {
             arg->typeId = (AllJoynTypeId)((elemTypeId << 8) | ALLJOYN_ARRAY);
             arg->v_scalarArray.numElements = (size_t)(len / 2);
-            arg->v_scalarArray.v_uint16 = (uint16_t*)bufPos;
             if (endianSwap) {
+                arg->v_scalarArray.v_uint16 = new uint16_t[arg->v_scalarArray.numElements];
+                uint16_t* p = (uint16_t*)arg->v_scalarArray.v_uint16;
                 uint16_t* n = (uint16_t*)bufPos;
                 for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
-                    EndianSwap16(*n);
-                    n++;
+                    *p++ = EndianSwap16(*n++);
                 }
+                arg->flags = MsgArg::OwnsData;
+            } else {
+                arg->v_scalarArray.v_uint16 = (uint16_t*)bufPos;
             }
             bufPos += len;
         } else {
@@ -135,10 +139,10 @@ QStatus _Message::ParseArray(MsgArg* arg,
             size_t num = (size_t)(len / 4);
             bool* bools = new bool[num];
             for (size_t i = 0; i < num; i++) {
-                if (endianSwap) {
-                    EndianSwap32(*((uint32_t*)bufPos));
-                }
                 uint32_t b = *bufPos;
+                if (endianSwap) {
+                    b = EndianSwap32(b);
+                }
                 if (b > 1) {
                     delete [] bools;
                     status = ER_BUS_BAD_VALUE;
@@ -170,13 +174,16 @@ QStatus _Message::ParseArray(MsgArg* arg,
         if ((len & 3) == 0) {
             arg->typeId = (AllJoynTypeId)((elemTypeId << 8) | ALLJOYN_ARRAY);
             arg->v_scalarArray.numElements = (size_t)(len / 4);
-            arg->v_scalarArray.v_uint32 = (uint32_t*)bufPos;
             if (endianSwap) {
+                arg->v_scalarArray.v_uint32 = new uint32_t[arg->v_scalarArray.numElements];
+                uint32_t* p = (uint32_t*)arg->v_scalarArray.v_uint32;
                 uint32_t* n = (uint32_t*)bufPos;
                 for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
-                    EndianSwap32(*n);
-                    n++;
+                    *p++ = EndianSwap32(*n++);
                 }
+                arg->flags = MsgArg::OwnsData;
+            } else {
+                arg->v_scalarArray.v_uint32 = (uint32_t*)bufPos;
             }
             bufPos += len;
         } else {
@@ -193,11 +200,15 @@ QStatus _Message::ParseArray(MsgArg* arg,
             bufPos = AlignPtr(bufPos, 8);
             arg->v_scalarArray.v_uint64 = (uint64_t*)bufPos;
             if (endianSwap) {
+                arg->v_scalarArray.v_uint64 = new uint64_t[arg->v_scalarArray.numElements];
+                uint64_t* p = (uint64_t*)arg->v_scalarArray.v_uint64;
                 uint64_t* n = (uint64_t*)bufPos;
                 for (size_t i = 0; i < arg->v_scalarArray.numElements; i++) {
-                    EndianSwap64(*n);
-                    n++;
+                    *p++ = EndianSwap64(*n++);
                 }
+                arg->flags = MsgArg::OwnsData;
+            } else {
+                arg->v_scalarArray.v_uint64 = (uint64_t*)bufPos;
             }
             bufPos += len;
         } else {
@@ -247,7 +258,7 @@ QStatus _Message::ParseArray(MsgArg* arg,
                     elements = bigger;
                 }
                 const char* esig = elemSig.c_str();
-                status = ParseValue(&elements[numElements++], esig);
+                status = ParseValue(&elements[numElements++], esig, true);
                 if (status != ER_OK) {
                     break;
                 }
@@ -387,7 +398,7 @@ QStatus _Message::ParseSignature(MsgArg* arg)
 }
 
 
-QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
+QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr, bool arrayElem)
 {
     QStatus status = ER_OK;
 
@@ -402,34 +413,39 @@ QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
     case ALLJOYN_UINT16:
         bufPos = AlignPtr(bufPos, 2);
         if (endianSwap) {
-            EndianSwap16(*((uint16_t*)bufPos));
+            arg->v_uint16 = EndianSwap16(*((uint16_t*)bufPos));
+        } else {
+            arg->v_uint16 = *((uint16_t*)bufPos);
         }
-        arg->v_uint16 = *((uint16_t*)bufPos);
         bufPos += 2;
         arg->typeId = typeId;
         break;
 
     case ALLJOYN_BOOLEAN:
+    {
         bufPos = AlignPtr(bufPos, 4);
+        uint32_t v = *((uint32_t*)bufPos);
         if (endianSwap) {
-            EndianSwap32(*((uint32_t*)bufPos));
+            v = EndianSwap32(v);
         }
-        if (*((uint32_t*)bufPos) > 1) {
+        if (v > 1) {
             status = ER_BUS_BAD_VALUE;
         } else {
-            arg->v_bool = *((uint32_t*)bufPos) == 1;
+            arg->v_bool = (v == 1);
             bufPos += 4;
             arg->typeId = typeId;
         }
-        break;
+    }
+    break;
 
     case ALLJOYN_INT32:
     case ALLJOYN_UINT32:
         bufPos = AlignPtr(bufPos, 4);
         if (endianSwap) {
-            EndianSwap32(*((uint32_t*)bufPos));
+            arg->v_uint32 = EndianSwap32(*((uint32_t*)bufPos));
+        } else {
+            arg->v_uint32 = *((uint32_t*)bufPos);
         }
-        arg->v_uint32 = *((uint32_t*)bufPos);
         bufPos += 4;
         arg->typeId = typeId;
         break;
@@ -439,9 +455,10 @@ QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
     case ALLJOYN_INT64:
         bufPos = AlignPtr(bufPos, 8);
         if (endianSwap) {
-            EndianSwap64(*((uint64_t*)bufPos));
+            arg->v_uint64 = EndianSwap64(*((uint64_t*)bufPos));
+        } else {
+            arg->v_uint64 = *((uint64_t*)bufPos);
         }
-        arg->v_uint64 = *((uint64_t*)bufPos);
         bufPos += 8;
         arg->typeId = typeId;
         break;
@@ -450,9 +467,10 @@ QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
     case ALLJOYN_STRING:
         bufPos = AlignPtr(bufPos, 4);
         if (endianSwap) {
-            EndianSwap32(*((uint32_t*)bufPos));
+            arg->v_string.len = (size_t)EndianSwap32(*((uint32_t*)bufPos));
+        } else {
+            arg->v_string.len = (size_t)(*((uint32_t*)bufPos));
         }
-        arg->v_string.len = (size_t)(*((uint32_t*)bufPos));
         if (arg->v_string.len > ALLJOYN_MAX_PACKET_LEN) {
             QCC_LogError(status, ("String length %ld at pos:%ld is too big", arg->v_string.len, bufPos - bodyPtr));
             status = ER_BUS_BAD_LENGTH;
@@ -479,7 +497,12 @@ QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
         break;
 
     case ALLJOYN_DICT_ENTRY_OPEN:
-        status = ParseDictEntry(arg, sigPtr);
+        if (arrayElem) {
+            status = ParseDictEntry(arg, sigPtr);
+        } else {
+            status = ER_BUS_BAD_SIGNATURE;
+            QCC_LogError(status, ("Message arg parse error naked dicitionary element"));
+        }
         break;
 
     case ALLJOYN_STRUCT_OPEN:
@@ -493,10 +516,10 @@ QStatus _Message::ParseValue(MsgArg* arg, const char*& sigPtr)
     case ALLJOYN_HANDLE:
     {
         bufPos = AlignPtr(bufPos, 4);
-        if (endianSwap) {
-            EndianSwap32(*((uint32_t*)bufPos));
-        }
         uint32_t index = *((uint32_t*)bufPos);
+        if (endianSwap) {
+            index = EndianSwap32(index);
+        }
         uint32_t numHandles = (hdrFields.field[ALLJOYN_HDR_FIELD_HANDLES].typeId == ALLJOYN_INVALID) ? 0 : hdrFields.field[ALLJOYN_HDR_FIELD_HANDLES].v_uint32;
         if (index >=  numHandles) {
             status = ER_BUS_NO_SUCH_HANDLE;
@@ -536,7 +559,7 @@ QStatus _Message::UnmarshalArgs(const qcc::String& expectedSignature, const char
     const char* sig = GetSignature();
     QStatus status = ER_OK;
 
-    if (!bus.IsStarted()) {
+    if (!bus->IsStarted()) {
         return ER_BUS_BUS_NOT_STARTED;
     }
     if (msgHeader.msgType == MESSAGE_INVALID) {
@@ -557,7 +580,7 @@ QStatus _Message::UnmarshalArgs(const qcc::String& expectedSignature, const char
     if (msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED) {
         bool broadcast = (hdrFields.field[ALLJOYN_HDR_FIELD_DESTINATION].typeId == ALLJOYN_INVALID);
         size_t hdrLen = bodyPtr - (uint8_t*)msgBuf;
-        PeerState peerState = bus.GetInternal().GetPeerStateTable()->GetPeerState(GetSender());
+        PeerState peerState = bus->GetInternal().GetPeerStateTable()->GetPeerState(GetSender());
         KeyBlob key;
         status = peerState->GetKey(key, broadcast ? PEER_GROUP_KEY : PEER_SESSION_KEY);
         if (status != ER_OK) {
@@ -566,6 +589,13 @@ QStatus _Message::UnmarshalArgs(const qcc::String& expectedSignature, const char
              * This status triggers a call to the security failure handler.
              */
             status = ER_BUS_MESSAGE_DECRYPTION_FAILED;
+            goto ExitUnmarshalArgs;
+        }
+        /*
+         * Check remote peer is authorized to deliver us messagees of this message type.
+         */
+        if (!peerState->IsAuthorized((AllJoynMessageType)msgHeader.msgType, _PeerState::ALLOW_SECURE_RX)) {
+            status = ER_BUS_NOT_AUTHORIZED;
             goto ExitUnmarshalArgs;
         }
         QCC_DbgHLPrintf(("Decrypting messge from %s", GetSender()));
@@ -835,19 +865,19 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
     size_t maxFds = endpoint.GetFeatures().handlePassing ? ArraySize(fdList) : 0;
     MsgArg* senderField = &hdrFields.field[ALLJOYN_HDR_FIELD_SENDER];
     Source& source = endpoint.GetSource();
-    const qcc::String& endpointName = endpoint.GetUniqueName();
 
-    if (!bus.IsStarted()) {
+    if (!bus->IsStarted()) {
         return ER_BUS_BUS_NOT_STARTED;
     }
 
-    rcvEndpointName = endpointName;
+    rcvEndpointName = endpoint.GetUniqueName();
 
     /*
      * Clear out any stale message state
      */
-    delete [] msgBuf;
     msgBuf = NULL;
+    delete [] _msgBuf;
+    _msgBuf = NULL;
     ClearHeader();
     /*
      * Read the message header
@@ -886,9 +916,9 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
             QCC_LogError(status, ("Message header has invalid endian flag %d", msgHeader.endian));
             goto ExitUnmarshal;
         }
-        EndianSwap32(msgHeader.bodyLen);
-        EndianSwap32(msgHeader.serialNum);
-        EndianSwap32(msgHeader.headerLen);
+        msgHeader.bodyLen = EndianSwap32(msgHeader.bodyLen);
+        msgHeader.serialNum = EndianSwap32(msgHeader.serialNum);
+        msgHeader.headerLen = EndianSwap32(msgHeader.headerLen);
         QCC_DbgPrintf(("Incoming endianSwap"));
     }
     /*
@@ -917,11 +947,21 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
      * message reducing the places where we need to check for bufEOD when unmarshaling the body.
      */
     bufSize = sizeof(msgHeader) + ((pktSize + 7) & ~7) + sizeof(uint64_t);
-    msgBuf = new uint64_t[bufSize / 8];
+    _msgBuf = new uint8_t[bufSize + 7];
+    msgBuf = (uint64_t*)((uintptr_t)(_msgBuf + 7) & ~7); /* Align to 8 byte boundary */
     /*
      * Copy header into the buffer
      */
     memcpy(msgBuf, &msgHeader, sizeof(msgHeader));
+    /*
+     * Restore endianess in the buffered version of the message header.
+     */
+    if (endianSwap) {
+        MessageHeader* hdr = (MessageHeader*)msgBuf;
+        hdr->bodyLen = EndianSwap32(hdr->bodyLen);
+        hdr->serialNum = EndianSwap32(hdr->serialNum);
+        hdr->headerLen = EndianSwap32(hdr->headerLen);
+    }
     bufPos = (uint8_t*)msgBuf + sizeof(msgHeader);
     bufEOD = bufPos + pktSize;
     endOfHdr = bufPos + msgHeader.headerLen;
@@ -1004,7 +1044,7 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
             status = ER_BUS_MISSING_COMPRESSION_TOKEN;
             goto ExitUnmarshal;
         }
-        const HeaderFields* expFields = bus.GetInternal().GetCompressionRules().GetExpansion(token);
+        const HeaderFields* expFields = bus->GetInternal().GetCompressionRules()->GetExpansion(token);
         if (!expFields) {
             QCC_DbgPrintf(("No expansion for token %u", token));
             status = ER_BUS_CANNOT_EXPAND_MESSAGE;
@@ -1053,13 +1093,13 @@ QStatus _Message::Unmarshal(RemoteEndpoint& endpoint, bool checkSender, bool ped
          * If the message didn't specify a sender (unusual but unfortunately the spec allows it) or the
          * sender field is not the expected unique name we set the sender field.
          */
-        if ((senderField->typeId == ALLJOYN_INVALID) || (endpointName != senderField->v_string.str)) {
-            QCC_DbgHLPrintf(("Replacing missing or bad sender field %s by %s", senderField->ToString().c_str(), endpointName.c_str()));
-            status = ReMarshal(endpointName.c_str());
+        if ((senderField->typeId == ALLJOYN_INVALID) || (rcvEndpointName != senderField->v_string.str)) {
+            QCC_DbgHLPrintf(("Replacing missing or bad sender field %s by %s", senderField->ToString().c_str(), rcvEndpointName.c_str()));
+            status = ReMarshal(rcvEndpointName.c_str());
         }
     }
     if (senderField->typeId != ALLJOYN_INVALID) {
-        PeerState peerState = bus.GetInternal().GetPeerStateTable()->GetPeerState(senderField->v_string.str);
+        PeerState peerState = bus->GetInternal().GetPeerStateTable()->GetPeerState(senderField->v_string.str);
         bool unreliable = hdrFields.field[ALLJOYN_HDR_FIELD_TIME_TO_LIVE].typeId != ALLJOYN_INVALID;
         bool secure = (msgHeader.flags & ALLJOYN_FLAG_ENCRYPTED) != 0;
         /*
@@ -1113,7 +1153,7 @@ ExitUnmarshal:
     }
     switch (status) {
     case ER_OK:
-        QCC_DbgHLPrintf(("Received %s from %s", Description().c_str(), endpointName.c_str()));
+        QCC_DbgHLPrintf(("Received %s via endpoint %s", Description().c_str(), rcvEndpointName.c_str()));
         QCC_DbgPrintf(("\n%s", ToString().c_str()));
         break;
 
@@ -1123,7 +1163,7 @@ ExitUnmarshal:
          * up to the upper-layer code to decide what to do. In most cases the upper-layer will queue
          * the message while it calls to the sender to get the needed expansion information.
          */
-        QCC_DbgHLPrintf(("Received compressed message of len %d (endpoint %s)\n%s", pktSize, endpointName.c_str(), ToString().c_str()));
+        QCC_DbgHLPrintf(("Received compressed message of len %d (via endpoint %s)\n%s", pktSize, rcvEndpointName.c_str(), ToString().c_str()));
         break;
 
     case ER_BUS_TIME_TO_LIVE_EXPIRED:
@@ -1131,7 +1171,7 @@ ExitUnmarshal:
          * The message was succesfully unmarshalled but was stale so let the upper-layer decide
          * whether the error is recoverable or not.
          */
-        QCC_DbgHLPrintf(("Time to live expired for (endpoint %s) message:\n%s", endpointName.c_str(), ToString().c_str()));
+        QCC_DbgHLPrintf(("Time to live expired for (via endpoint %s) message:\n%s", rcvEndpointName.c_str(), ToString().c_str()));
         break;
 
     case ER_BUS_INVALID_HEADER_SERIAL:
@@ -1139,15 +1179,16 @@ ExitUnmarshal:
          * The message was succesfully unmarshalled but was out-of-order so let the upper-layer
          * decide whether the error is recoverable or not.
          */
-        QCC_DbgHLPrintf(("Serial number was invalid for (endpoint %s) message:\n%s", endpointName.c_str(), ToString().c_str()));
+        QCC_DbgHLPrintf(("Serial number was invalid for (via endpoint %s) message:\n%s", rcvEndpointName.c_str(), ToString().c_str()));
         break;
 
     default:
         /*
          * There was an unrecoverable failure while unmarshaling the message, cleanup before we return.
          */
-        delete [] msgBuf;
         msgBuf = NULL;
+        delete [] _msgBuf;
+        _msgBuf = NULL;
         ClearHeader();
         if (status != ER_SOCK_OTHER_END_CLOSED) {
             QCC_LogError(status, ("Failed to unmarshal message received on %s", endpoint.GetUniqueName().c_str()));
@@ -1158,7 +1199,6 @@ ExitUnmarshal:
 
 QStatus _Message::AddExpansionRule(uint32_t token, const MsgArg* expansionArg)
 {
-    CompressionRules& compressionRules = bus.GetInternal().GetCompressionRules();
     /*
      * Validate the expansion response.
      */
@@ -1226,7 +1266,7 @@ QStatus _Message::AddExpansionRule(uint32_t token, const MsgArg* expansionArg)
     /*
      * Add the expansion to the compression engine.
      */
-    compressionRules.AddExpansion(expFields, token);
+    bus->GetInternal().GetCompressionRules()->AddExpansion(expFields, token);
     return ER_OK;
 
 ExitAddExpansion:
